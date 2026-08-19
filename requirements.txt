@@ -1,5 +1,6 @@
 Flask>=3.0,<4.0
 gunicorn>=22,<24
 requests>=2.31
-websocket-client==0.56
-git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+git+https://github.com/victalejo/iqoptionapi.git
+aiohttp>=3.9
+websockets>=12
