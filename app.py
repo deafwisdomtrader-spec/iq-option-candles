@@ -1,74 +1,150 @@
+import asyncio
 import os
 import time
+
 from flask import Flask, jsonify, request
-from iqoptionapi.stable_api import IQ_Option
+from iqoptionapi.aio import AsyncIQOption
 
 app = Flask(__name__)
 
 TIMEFRAME = 60
 CANDLE_COUNT = 100
 
+# Ativos OTC conhecidos pelo cliente atualizado.
+# Podemos acrescentar outros depois, conforme a IQ Option disponibilizar.
 PARES = [
-    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURJPY-OTC",
-    "AUDUSD-OTC", "USDCAD-OTC", "GBPJPY-OTC", "EURGBP-OTC",
-    "USDCHF-OTC", "AUDJPY-OTC", "NZDUSD-OTC", "EURCAD-OTC",
-    "GBPAUD-OTC", "CADJPY-OTC", "EURAUD-OTC", "XAUUSD-OTC",
+    "EURUSD-OTC",
+    "GBPUSD-OTC",
+    "USDJPY-OTC",
+    "EURJPY-OTC",
+    "NZDUSD-OTC",
+    "EURGBP-OTC",
+    "USDCHF-OTC",
+    "GBPJPY-OTC",
+    "USDSGD-OTC",
+    "USDHKD-OTC",
+    "USDINR-OTC",
 ]
-
-_iq = None
-_ultima_conexao = 0
 
 
 def normalizar_candle(candle):
+    """
+    Converte o formato recebido da IQ Option
+    para o formato usado pela Academy.
+    """
+
     return {
         "from": int(candle.get("from", 0)),
+        "to": int(candle.get("to", 0)),
         "open": float(candle.get("open", 0)),
-        "high": float(candle.get("max", 0)),
-        "low": float(candle.get("min", 0)),
+        "high": float(
+            candle.get(
+                "max",
+                candle.get("high", 0)
+            )
+        ),
+        "low": float(
+            candle.get(
+                "min",
+                candle.get("low", 0)
+            )
+        ),
         "close": float(candle.get("close", 0)),
         "volume": float(candle.get("volume", 0)),
     }
 
 
-def conectar():
-    global _iq, _ultima_conexao
-
+def obter_credenciais():
     email = os.getenv("IQ_EMAIL")
     password = os.getenv("IQ_PASSWORD")
 
-    if not email or not password:
-        raise RuntimeError("IQ_EMAIL e IQ_PASSWORD não configurados no Render.")
+    if not email:
+        raise RuntimeError(
+            "IQ_EMAIL não configurado no Render."
+        )
 
-    if _iq is not None and getattr(_iq, "check_connect", False):
-        return _iq
+    if not password:
+        raise RuntimeError(
+            "IQ_PASSWORD não configurado no Render."
+        )
 
-    _iq = IQ_Option(email, password)
-    conectado, motivo = _iq.connect()
-
-    if not conectado:
-        _iq = None
-        raise RuntimeError(f"Não foi possível conectar à IQ Option: {motivo}")
-
-    _ultima_conexao = int(time.time())
-    return _iq
+    return email, password
 
 
-def buscar_candles(iq, par):
-    timestamp = iq.get_server_timestamp()
+async def buscar_par(email, password, par):
+    """
+    Conecta somente para leitura, busca candles M1
+    e encerra a conexão.
 
-    candles = iq.get_candles(
-        par,
-        TIMEFRAME,
-        CANDLE_COUNT,
-        timestamp
+    Nenhuma função de compra/venda é utilizada.
+    """
+
+    cliente = AsyncIQOption(
+        email,
+        password
     )
 
-    if not candles:
-        return []
+    try:
+        await cliente.connect()
 
-    resultado = [normalizar_candle(c) for c in candles]
-    resultado.sort(key=lambda x: x["from"])
-    return resultado
+        candles = await cliente.get_candles(
+            active=par,
+            size=TIMEFRAME,
+            count=CANDLE_COUNT,
+            endtime=int(time.time()),
+            timeout=15.0,
+        )
+
+        resultado = [
+            normalizar_candle(candle)
+            for candle in candles
+        ]
+
+        resultado.sort(
+            key=lambda candle: candle["from"]
+        )
+
+        return resultado
+
+    finally:
+        await cliente.close()
+
+
+async def buscar_todos(email, password, pares):
+    """
+    Busca os pares sequencialmente para não sobrecarregar
+    o serviço gratuito do Render.
+    """
+
+    resultados = []
+
+    for par in pares:
+        try:
+            dados = await buscar_par(
+                email,
+                password,
+                par
+            )
+
+            resultados.append({
+                "par": par,
+                "timeframe": "M1",
+                "candles": dados,
+                "quantidade": len(dados),
+                "ok": True,
+            })
+
+        except Exception as erro:
+            resultados.append({
+                "par": par,
+                "timeframe": "M1",
+                "candles": [],
+                "quantidade": 0,
+                "ok": False,
+                "erro": str(erro),
+            })
+
+    return resultados
 
 
 @app.get("/")
@@ -77,7 +153,8 @@ def inicio():
         "ok": True,
         "servico": "Academy Trading - IQ Option Candles",
         "somente_dados": True,
-        "operacao": False
+        "operacao": False,
+        "timeframe": "M1",
     })
 
 
@@ -86,16 +163,21 @@ def health():
     return jsonify({
         "ok": True,
         "servico": "iq-option-candles",
-        "timestamp": int(time.time())
+        "somente_dados": True,
+        "operacao": False,
+        "timestamp": int(time.time()),
     })
 
 
 @app.get("/candles")
 def candles():
     try:
-        iq = conectar()
+        email, password = obter_credenciais()
 
-        pares_param = request.args.get("pares", "").strip()
+        pares_param = request.args.get(
+            "pares",
+            ""
+        ).strip()
 
         if pares_param:
             pares = [
@@ -106,51 +188,101 @@ def candles():
         else:
             pares = PARES
 
-        # Limite para evitar requisições exageradas no serviço gratuito.
-        pares = pares[:20]
+        # Limita para proteger o Render Free.
+        pares = pares[:15]
 
-        resultados = []
+        resultados = asyncio.run(
+            buscar_todos(
+                email,
+                password,
+                pares
+            )
+        )
 
-        for par in pares:
-            try:
-                dados = buscar_candles(iq, par)
-
-                resultados.append({
-                    "par": par,
-                    "timeframe": "M1",
-                    "candles": dados,
-                    "quantidade": len(dados)
-                })
-
-            except Exception as erro:
-                resultados.append({
-                    "par": par,
-                    "timeframe": "M1",
-                    "candles": [],
-                    "quantidade": 0,
-                    "erro": str(erro)
-                })
+        quantidade_total = sum(
+            item["quantidade"]
+            for item in resultados
+        )
 
         return jsonify({
             "ok": True,
             "fonte": "IQ Option",
+            "servico": "Academy Trading",
             "somente_dados": True,
             "operacao": False,
             "timeframe": "M1",
             "timestamp": int(time.time()),
-            "resultados": resultados
+            "pares_solicitados": len(pares),
+            "candles_total": quantidade_total,
+            "resultados": resultados,
         })
 
     except Exception as erro:
         return jsonify({
             "ok": False,
             "fonte": "IQ Option",
+            "servico": "Academy Trading",
             "somente_dados": True,
             "operacao": False,
-            "erro": str(erro)
+            "erro": str(erro),
+        }), 503
+
+
+@app.get("/candles/<par>")
+def candles_par(par):
+    """
+    Consulta somente um par.
+    Exemplo:
+    /candles/EURUSD-OTC
+    """
+
+    try:
+        email, password = obter_credenciais()
+
+        par = par.strip().upper()
+
+        dados = asyncio.run(
+            buscar_par(
+                email,
+                password,
+                par
+            )
+        )
+
+        return jsonify({
+            "ok": True,
+            "fonte": "IQ Option",
+            "servico": "Academy Trading",
+            "somente_dados": True,
+            "operacao": False,
+            "par": par,
+            "timeframe": "M1",
+            "quantidade": len(dados),
+            "candles": dados,
+            "timestamp": int(time.time()),
+        })
+
+    except Exception as erro:
+        return jsonify({
+            "ok": False,
+            "fonte": "IQ Option",
+            "servico": "Academy Trading",
+            "somente_dados": True,
+            "operacao": False,
+            "par": par,
+            "erro": str(erro),
         }), 503
 
 
 if __name__ == "__main__":
-    porta = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=porta)
+    porta = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=porta
+    )
