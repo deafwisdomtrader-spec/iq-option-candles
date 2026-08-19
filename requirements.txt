@@ -1,6 +1,4 @@
 Flask>=3.0,<4.0
 gunicorn>=22,<24
 requests>=2.31
-git+https://github.com/victalejo/iqoptionapi.git
-aiohttp>=3.9
-websockets>=12
+iqoptionapi[aio] @ git+https://github.com/victalejo/iqoptionapi.git
