@@ -1,107 +1,181 @@
-import asyncio
+import json
+import math
 import os
+import subprocess
+import sys
 import time
-from statistics import mean
 
 from flask import Flask, jsonify, request
-from iqoptionapi.aio import AsyncIQOption
 
 app = Flask(__name__)
 
 TIMEFRAME = 60
 CANDLE_COUNT = 100
 
-EMA_RAPIDA = 21
-EMA_LENTA = 50
-RSI_PERIODO = 14
-MHI_PERIODO = 5
-
-# Para o primeiro teste:
-VALIDADE_MINUTOS = 1
-
-# Quantidade mínima de confirmações.
-MIN_CONFIRMACOES = 5
-
 PARES = [
     "EURUSD-OTC",
-    "GBPUSD-OTC",
-    "USDJPY-OTC",
-    "EURJPY-OTC",
-    "NZDUSD-OTC",
-    "EURGBP-OTC",
-    "USDCHF-OTC",
-    "GBPJPY-OTC",
-    "USDSGD-OTC",
-    "USDHKD-OTC",
-    "USDINR-OTC",
 ]
 
+ESTRATEGIA = (
+    "MHI + RSI + EMA21/50 + Rompimento + Pullback + Tendência"
+)
+
 
 # ============================================================
-# CANDLE
+# CORS
 # ============================================================
 
-def normalizar_candle(candle):
-    return {
-        "from": int(candle.get("from", 0)),
-        "to": int(candle.get("to", 0)),
-        "open": float(candle.get("open", 0)),
-        "high": float(
-            candle.get("max", candle.get("high", 0))
-        ),
-        "low": float(
-            candle.get("min", candle.get("low", 0))
-        ),
-        "close": float(candle.get("close", 0)),
-        "volume": float(candle.get("volume", 0)),
+@app.after_request
+def adicionar_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# ============================================================
+# RESPOSTAS
+# ============================================================
+
+def resposta_erro(mensagem, par=None, etapa=None, tipo=None):
+    dados = {
+        "ok": False,
+        "fonte": "IQ Option",
+        "servico": "Academy Trading - IQ Option Candles",
+        "somente_dados": True,
+        "operacao": False,
+        "erro": mensagem,
     }
 
+    if par:
+        dados["par"] = par
+
+    if etapa:
+        dados["etapa"] = etapa
+
+    if tipo:
+        dados["tipo_erro"] = tipo
+
+    return jsonify(dados), 503
+
 
 # ============================================================
-# CREDENCIAIS
+# EXECUTA O IQ-OPTION.PY
 # ============================================================
 
-def obter_credenciais():
-    email = os.getenv("IQ_EMAIL")
-    password = os.getenv("IQ_PASSWORD")
+def buscar_candles_python(par):
+    """
+    Executa iq-option.py em um processo separado.
 
-    if not email:
-        raise RuntimeError(
-            "IQ_EMAIL não configurado no Render."
+    Isso é importante no Render porque, se a conexão
+    da IQ Option travar, podemos encerrar o processo
+    sem derrubar o Flask.
+    """
+
+    ambiente = os.environ.copy()
+
+    ambiente["IQ_EMAIL"] = os.getenv("IQ_EMAIL", "")
+    ambiente["IQ_PASSWORD"] = os.getenv("IQ_PASSWORD", "")
+
+    comando = [
+        sys.executable,
+        "iq-option.py",
+        par,
+        str(TIMEFRAME),
+        str(CANDLE_COUNT),
+    ]
+
+    try:
+
+        processo = subprocess.run(
+            comando,
+            capture_output=True,
+            text=True,
+            timeout=35,
+            env=ambiente,
         )
 
-    if not password:
-        raise RuntimeError(
-            "IQ_PASSWORD não configurado no Render."
-        )
+    except subprocess.TimeoutExpired:
 
-    return email, password
+        return None, {
+            "erro": "Tempo limite ao conectar ou buscar candles na IQ Option.",
+            "etapa": "conectando na IQ Option",
+            "tipo_erro": "TimeoutError",
+        }
+
+    except Exception as erro:
+
+        return None, {
+            "erro": str(erro),
+            "etapa": "executando iq-option.py",
+            "tipo_erro": type(erro).__name__,
+        }
+
+    saida = (processo.stdout or "").strip()
+    erro_saida = (processo.stderr or "").strip()
+
+    if not saida:
+
+        return None, {
+            "erro": erro_saida or "O iq-option.py não retornou dados.",
+            "etapa": "resposta da IQ Option",
+            "tipo_erro": "EmptyResponse",
+        }
+
+    try:
+
+        dados = json.loads(saida)
+
+    except json.JSONDecodeError:
+
+        return None, {
+            "erro": "Resposta do iq-option.py não é JSON válido.",
+            "etapa": "interpretando resposta",
+            "tipo_erro": "JSONDecodeError",
+            "saida": saida[-2000:],
+        }
+
+    if not dados.get("ok"):
+
+        return None, dados
+
+    return dados.get("candles", []), None
 
 
 # ============================================================
-# EMA
+# INDICADORES
 # ============================================================
+
+def fechar(candles):
+    return [
+        float(c["close"])
+        for c in candles
+        if c.get("close") is not None
+    ]
+
 
 def calcular_ema(valores, periodo):
+    if not valores:
+        return None
+
     if len(valores) < periodo:
         return None
 
-    ema = mean(valores[:periodo])
     multiplicador = 2 / (periodo + 1)
 
-    for preco in valores[periodo:]:
+    ema = sum(valores[:periodo]) / periodo
+
+    for valor in valores[periodo:]:
         ema = (
-            (preco - ema) * multiplicador
+            (valor - ema) * multiplicador
         ) + ema
 
     return ema
 
 
-# ============================================================
-# RSI
-# ============================================================
-
 def calcular_rsi(valores, periodo=14):
+
     if len(valores) < periodo + 1:
         return None
 
@@ -109,567 +183,306 @@ def calcular_rsi(valores, periodo=14):
     perdas = []
 
     for i in range(1, len(valores)):
+
         diferenca = valores[i] - valores[i - 1]
 
         if diferenca > 0:
             ganhos.append(diferenca)
             perdas.append(0)
 
-        elif diferenca < 0:
+        else:
             ganhos.append(0)
             perdas.append(abs(diferenca))
 
-        else:
-            ganhos.append(0)
-            perdas.append(0)
+    ganho_medio = sum(
+        ganhos[:periodo]
+    ) / periodo
 
-    ganhos = ganhos[-periodo:]
-    perdas = perdas[-periodo:]
+    perda_media = sum(
+        perdas[:periodo]
+    ) / periodo
 
-    media_ganho = sum(ganhos) / periodo
-    media_perda = sum(perdas) / periodo
+    for i in range(periodo, len(ganhos)):
 
-    if media_perda == 0:
-        if media_ganho == 0:
-            return 50.0
+        ganho_medio = (
+            (ganho_medio * (periodo - 1))
+            + ganhos[i]
+        ) / periodo
 
+        perda_media = (
+            (perda_media * (periodo - 1))
+            + perdas[i]
+        ) / periodo
+
+    if perda_media == 0:
         return 100.0
 
-    rs = media_ganho / media_perda
+    rs = ganho_medio / perda_media
 
     return 100 - (100 / (1 + rs))
 
 
+def calcular_pivo(candle):
+
+    maxima = float(candle["high"])
+    minima = float(candle["low"])
+    fechamento = float(candle["close"])
+
+    return (
+        maxima +
+        minima +
+        fechamento
+    ) / 3
+
+
 # ============================================================
-# MHI
+# ANÁLISE
 # ============================================================
 
-def analisar_mhi(candles):
-    ultimas = candles[-MHI_PERIODO:]
+def analisar(candles, par):
 
-    if len(ultimas) < MHI_PERIODO:
+    if len(candles) < 50:
+
         return {
+            "par": par,
+            "hora": "--:--",
             "sinal": "AGUARDANDO",
-            "confirmado": False,
-            "altas": 0,
-            "baixas": 0,
-            "neutras": 0,
+            "status": "POUCOS DADOS",
+            "rsi": None,
+            "mm": None,
+            "pivo": None,
+            "preco": None,
         }
 
-    altas = 0
-    baixas = 0
-    neutras = 0
+    valores = fechar(candles)
 
-    for candle in ultimas:
-        abertura = candle["open"]
-        fechamento = candle["close"]
-
-        if fechamento > abertura:
-            altas += 1
-
-        elif fechamento < abertura:
-            baixas += 1
-
-        else:
-            neutras += 1
-
-    if altas > baixas:
-        sinal = "PUT"
-
-    elif baixas > altas:
-        sinal = "CALL"
-
-    else:
-        sinal = "AGUARDANDO"
-
-    return {
-        "sinal": sinal,
-        "confirmado": sinal != "AGUARDANDO",
-        "altas": altas,
-        "baixas": baixas,
-        "neutras": neutras,
-    }
-
-
-# ============================================================
-# TENDÊNCIA / EMA 21/50
-# ============================================================
-
-def analisar_tendencia(candles):
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    if len(closes) < EMA_LENTA:
-        return {
-            "direcao": "NEUTRA",
-            "ema21": None,
-            "ema50": None,
-        }
+    preco = valores[-1]
 
     ema21 = calcular_ema(
-        closes,
-        EMA_RAPIDA
+        valores,
+        21
     )
 
     ema50 = calcular_ema(
-        closes,
-        EMA_LENTA
+        valores,
+        50
     )
-
-    if ema21 is None or ema50 is None:
-        return {
-            "direcao": "NEUTRA",
-            "ema21": ema21,
-            "ema50": ema50,
-        }
-
-    if ema21 > ema50:
-        direcao = "ALTA"
-
-    elif ema21 < ema50:
-        direcao = "BAIXA"
-
-    else:
-        direcao = "NEUTRA"
-
-    return {
-        "direcao": direcao,
-        "ema21": round(ema21, 6),
-        "ema50": round(ema50, 6),
-    }
-
-
-# ============================================================
-# ROMPIMENTO
-# ============================================================
-
-def analisar_rompimento(candles):
-    if len(candles) < 21:
-        return {
-            "direcao": "NEUTRO",
-            "rompimento": False,
-        }
-
-    atual = candles[-1]
-    anteriores = candles[-21:-1]
-
-    resistencia = max(
-        candle["high"]
-        for candle in anteriores
-    )
-
-    suporte = min(
-        candle["low"]
-        for candle in anteriores
-    )
-
-    if atual["close"] > resistencia:
-        return {
-            "direcao": "ALTA",
-            "rompimento": True,
-            "resistencia": round(resistencia, 6),
-            "suporte": round(suporte, 6),
-        }
-
-    if atual["close"] < suporte:
-        return {
-            "direcao": "BAIXA",
-            "rompimento": True,
-            "resistencia": round(resistencia, 6),
-            "suporte": round(suporte, 6),
-        }
-
-    return {
-        "direcao": "NEUTRO",
-        "rompimento": False,
-        "resistencia": round(resistencia, 6),
-        "suporte": round(suporte, 6),
-    }
-
-
-# ============================================================
-# PULLBACK
-# ============================================================
-
-def analisar_pullback(candles):
-    if len(candles) < EMA_RAPIDA + 2:
-        return {
-            "direcao": "NEUTRO",
-            "pullback": False,
-        }
-
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    ema21 = calcular_ema(
-        closes,
-        EMA_RAPIDA
-    )
-
-    if ema21 is None:
-        return {
-            "direcao": "NEUTRO",
-            "pullback": False,
-        }
-
-    atual = candles[-1]
-
-    distancia = abs(
-        atual["close"] - ema21
-    )
-
-    tolerancia = abs(ema21) * 0.0015
-
-    perto_da_ema = distancia <= tolerancia
-
-    if not perto_da_ema:
-        return {
-            "direcao": "NEUTRO",
-            "pullback": False,
-            "ema21": round(ema21, 6),
-        }
-
-    if atual["close"] > ema21:
-        return {
-            "direcao": "ALTA",
-            "pullback": True,
-            "ema21": round(ema21, 6),
-        }
-
-    if atual["close"] < ema21:
-        return {
-            "direcao": "BAIXA",
-            "pullback": True,
-            "ema21": round(ema21, 6),
-        }
-
-    return {
-        "direcao": "NEUTRO",
-        "pullback": False,
-        "ema21": round(ema21, 6),
-    }
-
-
-# ============================================================
-# LINHA DE TENDÊNCIA
-# ============================================================
-
-def analisar_linha_tendencia(candles):
-    if len(candles) < 10:
-        return {
-            "direcao": "NEUTRA"
-        }
-
-    fechamentos = [
-        candle["close"]
-        for candle in candles[-10:]
-    ]
-
-    primeira = fechamentos[0]
-    ultima = fechamentos[-1]
-
-    if ultima > primeira:
-        direcao = "ALTA"
-
-    elif ultima < primeira:
-        direcao = "BAIXA"
-
-    else:
-        direcao = "NEUTRA"
-
-    return {
-        "direcao": direcao
-    }
-
-
-# ============================================================
-# ANÁLISE COMPLETA
-# ============================================================
-
-def analisar_sinal(candles):
-
-    agora = int(time.time())
-
-    # Somente velas fechadas.
-    fechadas = [
-        candle
-        for candle in candles
-        if candle["to"] <= agora
-    ]
-
-    fechadas.sort(
-        key=lambda candle: candle["from"]
-    )
-
-    if len(fechadas) < EMA_LENTA + 5:
-        return {
-            "sinal": "AGUARDANDO",
-            "confirmado": False,
-            "motivo": "Histórico insuficiente.",
-            "velas_disponiveis": len(fechadas),
-            "minimo_necessario": EMA_LENTA + 5,
-        }
-
-    closes = [
-        candle["close"]
-        for candle in fechadas
-    ]
 
     rsi = calcular_rsi(
-        closes,
-        RSI_PERIODO
+        valores,
+        14
     )
 
-    tendencia = analisar_tendencia(
-        fechadas
+    candle_atual = candles[-1]
+
+    candle_anterior = candles[-2]
+
+    pivo = calcular_pivo(
+        candle_anterior
     )
 
-    mhi = analisar_mhi(
-        fechadas
+    # --------------------------------------------------------
+    # TENDÊNCIA
+    # --------------------------------------------------------
+
+    tendencia_alta = (
+        ema21 is not None
+        and ema50 is not None
+        and ema21 > ema50
+        and preco > ema21
     )
 
-    rompimento = analisar_rompimento(
-        fechadas
+    tendencia_baixa = (
+        ema21 is not None
+        and ema50 is not None
+        and ema21 < ema50
+        and preco < ema21
     )
-
-    pullback = analisar_pullback(
-        fechadas
-    )
-
-    linha = analisar_linha_tendencia(
-        fechadas
-    )
-
-    pontos_call = 0
-    pontos_put = 0
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    if rsi is not None:
-
-        if rsi > 50:
-            pontos_call += 1
-
-        elif rsi < 50:
-            pontos_put += 1
-
-    # --------------------------------------------------------
-    # EMA 21 / 50
-    # --------------------------------------------------------
-
-    if tendencia["direcao"] == "BAIXA":
-        pontos_call += 1
-
-    elif tendencia["direcao"] == "ALTA":
-        pontos_put += 1
-
-    # --------------------------------------------------------
-    # MHI
-    # --------------------------------------------------------
-
-    if mhi["sinal"] == "CALL":
-        pontos_call += 1
-
-    elif mhi["sinal"] == "PUT":
-        pontos_put += 1
 
     # --------------------------------------------------------
     # ROMPIMENTO
     # --------------------------------------------------------
 
-    if rompimento["direcao"] == "BAIXA":
-        pontos_call += 1
+    ultimos = candles[-6:-1]
 
-    elif rompimento["direcao"] == "ALTA":
-        pontos_put += 1
+    resistencia = max(
+        float(c["high"])
+        for c in ultimos
+    )
+
+    suporte = min(
+        float(c["low"])
+        for c in ultimos
+    )
+
+    fechamento_atual = float(
+        candle_atual["close"]
+    )
+
+    rompimento_alta = (
+        fechamento_atual > resistencia
+    )
+
+    rompimento_baixa = (
+        fechamento_atual < suporte
+    )
 
     # --------------------------------------------------------
     # PULLBACK
     # --------------------------------------------------------
 
-    if pullback["direcao"] == "BAIXA":
+    margem = (
+        abs(ema21) * 0.0003
+        if ema21
+        else 0
+    )
+
+    pullback_alta = (
+        ema21 is not None
+        and candle_atual["low"]
+        <= ema21 + margem
+        and fechamento_atual > ema21
+    )
+
+    pullback_baixa = (
+        ema21 is not None
+        and candle_atual["high"]
+        >= ema21 - margem
+        and fechamento_atual < ema21
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi_call = (
+        rsi is not None
+        and 50 <= rsi <= 70
+    )
+
+    rsi_put = (
+        rsi is not None
+        and 30 <= rsi <= 50
+    )
+
+    # --------------------------------------------------------
+    # PONTUAÇÃO
+    # --------------------------------------------------------
+
+    pontos_call = 0
+    pontos_put = 0
+
+    if tendencia_alta:
+        pontos_call += 2
+
+    if tendencia_baixa:
+        pontos_put += 2
+
+    if rsi_call:
         pontos_call += 1
 
-    elif pullback["direcao"] == "ALTA":
+    if rsi_put:
         pontos_put += 1
 
+    if rompimento_alta:
+        pontos_call += 2
+
+    if rompimento_baixa:
+        pontos_put += 2
+
+    if pullback_alta:
+        pontos_call += 2
+
+    if pullback_baixa:
+        pontos_put += 2
+
     # --------------------------------------------------------
-    # LINHA DE TENDÊNCIA
+    # SINAL
     # --------------------------------------------------------
 
-    if linha["direcao"] == "BAIXA":
-        pontos_call += 1
+    sinal = "AGUARDANDO"
+    status = "AGUARDANDO CONFIRMAÇÃO"
 
-    elif linha["direcao"] == "ALTA":
-        pontos_put += 1
+    if pontos_call >= 5 and pontos_call > pontos_put:
 
-    # --------------------------------------------------------
-    # DECISÃO
-    # --------------------------------------------------------
-
-    if (
-        pontos_call >= MIN_CONFIRMACOES
-        and pontos_call > pontos_put
-    ):
         sinal = "CALL"
+        status = "CONFIRMAÇÃO DE ALTA"
 
-    elif (
-        pontos_put >= MIN_CONFIRMACOES
-        and pontos_put > pontos_call
-    ):
+    elif pontos_put >= 5 and pontos_put > pontos_call:
+
         sinal = "PUT"
+        status = "CONFIRMAÇÃO DE BAIXA"
+
+    # --------------------------------------------------------
+    # MM
+    # --------------------------------------------------------
+
+    if ema21 is not None and ema50 is not None:
+
+        if ema21 > ema50:
+            mm = "EMA21 > EMA50"
+
+        elif ema21 < ema50:
+            mm = "EMA21 < EMA50"
+
+        else:
+            mm = "NEUTRA"
 
     else:
-        sinal = "AGUARDANDO"
+        mm = "--"
 
-    proxima_vela = (
-        (agora // TIMEFRAME) + 1
-    ) * TIMEFRAME
+    # --------------------------------------------------------
+    # PIVÔ
+    # --------------------------------------------------------
 
-    segundos_restantes = max(
-        0,
-        proxima_vela - agora
+    if rompimento_alta:
+        texto_pivo = "ROMPIMENTO ALTA"
+
+    elif rompimento_baixa:
+        texto_pivo = "ROMPIMENTO BAIXA"
+
+    elif pullback_alta:
+        texto_pivo = "PULLBACK ALTA"
+
+    elif pullback_baixa:
+        texto_pivo = "PULLBACK BAIXA"
+
+    else:
+        texto_pivo = round(
+            pivo,
+            6
+        )
+
+    # --------------------------------------------------------
+    # HORA
+    # --------------------------------------------------------
+
+    hora = time.strftime(
+        "%H:%M",
+        time.localtime(
+            int(candle_atual["from"])
+        )
     )
 
     return {
+        "par": par,
+        "hora": hora,
         "sinal": sinal,
-        "confirmado": sinal != "AGUARDANDO",
-        "estrategia": (
-            "MHI + RSI + EMA21/50 + "
-            "Rompimento + Pullback + Tendência"
-        ),
-        "periodo": "M1",
-        "validade": "1 minuto",
-        "validade_segundos": segundos_restantes,
-
-        "pontuacao": {
-            "CALL": pontos_call,
-            "PUT": pontos_put,
-            "minimo": MIN_CONFIRMACOES,
-        },
-
-        "indicadores": {
-            "rsi": (
-                round(rsi, 2)
-                if rsi is not None
-                else None
-            ),
-            "ema21": tendencia["ema21"],
-            "ema50": tendencia["ema50"],
-            "tendencia": tendencia["direcao"],
-            "mhi": mhi,
-            "rompimento": rompimento,
-            "pullback": pullback,
-            "linha_tendencia": linha,
-        },
-
-        "timestamp": agora,
-        "proxima_vela": proxima_vela,
-
-        "aviso": (
-            "Sinal educacional. "
-            "Não executa operações e não garante resultado."
-        ),
+        "status": status,
+        "rsi": round(rsi, 2) if rsi is not None else None,
+        "mm": mm,
+        "pivo": texto_pivo,
+        "preco": round(preco, 6),
+        "ema21": round(ema21, 6) if ema21 else None,
+        "ema50": round(ema50, 6) if ema50 else None,
+        "pontos_call": pontos_call,
+        "pontos_put": pontos_put,
+        "estrategia": ESTRATEGIA,
     }
 
 
 # ============================================================
-# IQ OPTION
-# ============================================================
-
-async def buscar_par(email, password, par):
-
-    cliente = AsyncIQOption(
-        email,
-        password
-    )
-
-    try:
-
-        await cliente.connect()
-
-        candles = await cliente.get_candles(
-            active=par,
-            size=TIMEFRAME,
-            count=CANDLE_COUNT,
-            endtime=int(time.time()),
-            timeout=15.0,
-        )
-
-        resultado = [
-            normalizar_candle(candle)
-            for candle in candles
-        ]
-
-        resultado.sort(
-            key=lambda candle: candle["from"]
-        )
-
-        return resultado
-
-    finally:
-
-        await cliente.close()
-
-
-async def buscar_todos(email, password, pares):
-
-    resultados = []
-
-    for par in pares:
-
-        try:
-
-            dados = await buscar_par(
-                email,
-                password,
-                par
-            )
-
-            sinal = analisar_sinal(
-                dados
-            )
-
-            resultados.append({
-                "par": par,
-                "timeframe": "M1",
-                "candles": dados,
-                "quantidade": len(dados),
-                "ok": True,
-                "sinal": sinal,
-            })
-
-        except Exception as erro:
-
-            resultados.append({
-                "par": par,
-                "timeframe": "M1",
-                "candles": [],
-                "quantidade": 0,
-                "ok": False,
-                "erro": (
-                    str(erro)
-                    or repr(erro)
-                    or type(erro).__name__
-                ),
-                "tipo_erro": type(erro).__name__,
-                "sinal": {
-                    "sinal": "AGUARDANDO",
-                    "confirmado": False,
-                },
-            })
-
-    return resultados
-
-
-# ============================================================
-# HOME
+# ROTAS
 # ============================================================
 
 @app.get("/")
@@ -681,17 +494,10 @@ def inicio():
         "somente_dados": True,
         "operacao": False,
         "timeframe": "M1",
-        "estrategia": (
-            "MHI + RSI + EMA21/50 + "
-            "Rompimento + Pullback + Tendência"
-        ),
+        "estrategia": ESTRATEGIA,
         "validade_teste": "1 minuto",
     })
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health():
@@ -699,184 +505,82 @@ def health():
     return jsonify({
         "ok": True,
         "servico": "iq-option-candles",
-        "somente_dados": True,
-        "operacao": False,
+        "status": "online",
         "timestamp": int(time.time()),
     })
 
 
-# ============================================================
-# TODOS OS PARES
-# ============================================================
+@app.route("/candles/<par>", methods=["GET", "OPTIONS"])
+def candles_par(par):
+
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+
+    par = par.strip().upper()
+
+    if not par.endswith("-OTC"):
+        return resposta_erro(
+            "Somente ativos OTC são permitidos neste teste.",
+            par=par,
+            etapa="validando ativo",
+            tipo="InvalidPair",
+        )
+
+    candles, erro = buscar_candles_python(par)
+
+    if erro is not None:
+
+        return resposta_erro(
+            erro.get(
+                "erro",
+                "Erro ao obter candles."
+            ),
+            par=par,
+            etapa=erro.get("etapa"),
+            tipo=erro.get("tipo_erro"),
+        )
+
+    if not candles:
+
+        return resposta_erro(
+            "A IQ Option não retornou candles.",
+            par=par,
+            etapa="recebendo candles",
+            tipo="EmptyCandles",
+        )
+
+    analise = analisar(
+        candles,
+        par
+    )
+
+    return jsonify({
+        "ok": True,
+        "fonte": "IQ Option",
+        "servico": "Academy Trading",
+        "somente_dados": True,
+        "operacao": False,
+        "par": par,
+        "timeframe": "M1",
+        "quantidade": len(candles),
+        "candles": candles,
+        "analise": analise,
+        "resultados": [analise],
+        "estrategia": ESTRATEGIA,
+        "timestamp": int(time.time()),
+    })
+
 
 @app.get("/candles")
 def candles():
 
-    etapa = "iniciando"
+    par = request.args.get(
+        "par",
+        "EURUSD-OTC"
+    ).strip().upper()
 
-    try:
+    return candles_par(par)
 
-        etapa = "obtendo credenciais"
-
-        email, password = obter_credenciais()
-
-        etapa = "lendo parâmetros"
-
-        pares_param = request.args.get(
-            "pares",
-            ""
-        ).strip()
-
-        if pares_param:
-
-            pares = [
-                p.strip().upper()
-                for p in pares_param.split(",")
-                if p.strip()
-            ]
-
-        else:
-
-            pares = PARES
-
-        pares = pares[:15]
-
-        etapa = "buscando candles"
-
-        resultados = asyncio.run(
-            buscar_todos(
-                email,
-                password,
-                pares
-            )
-        )
-
-        quantidade_total = sum(
-            item["quantidade"]
-            for item in resultados
-        )
-
-        return jsonify({
-            "ok": True,
-            "fonte": "IQ Option",
-            "servico": "Academy Trading",
-            "somente_dados": True,
-            "operacao": False,
-            "timeframe": "M1",
-            "estrategia": (
-                "MHI + RSI + EMA21/50 + "
-                "Rompimento + Pullback + Tendência"
-            ),
-            "validade_teste": "1 minuto",
-            "timestamp": int(time.time()),
-            "pares_solicitados": len(pares),
-            "candles_total": quantidade_total,
-            "resultados": resultados,
-        })
-
-    except Exception as erro:
-
-        return jsonify({
-            "ok": False,
-            "fonte": "IQ Option",
-            "servico": "Academy Trading",
-            "somente_dados": True,
-            "operacao": False,
-            "etapa": etapa,
-            "tipo_erro": type(erro).__name__,
-            "erro": (
-                str(erro)
-                or repr(erro)
-                or type(erro).__name__
-            ),
-        }), 503
-
-
-# ============================================================
-# UM PAR
-# ============================================================
-
-@app.get("/candles/<par>")
-def candles_par(par):
-
-    etapa = "iniciando"
-
-    try:
-
-        etapa = "obtendo credenciais"
-
-        email, password = obter_credenciais()
-
-        etapa = "preparando par"
-
-        par = par.strip().upper()
-
-        if not par:
-            raise ValueError(
-                "Par não informado."
-            )
-
-        etapa = "conectando na IQ Option"
-
-        dados = asyncio.run(
-            buscar_par(
-                email,
-                password,
-                par
-            )
-        )
-
-        etapa = "recebendo candles"
-
-        if not dados:
-            raise RuntimeError(
-                "A IQ Option não retornou candles."
-            )
-
-        etapa = "analisando indicadores"
-
-        sinal = analisar_sinal(
-            dados
-        )
-
-        etapa = "montando resposta"
-
-        return jsonify({
-            "ok": True,
-            "fonte": "IQ Option",
-            "servico": "Academy Trading",
-            "somente_dados": True,
-            "operacao": False,
-            "par": par,
-            "timeframe": "M1",
-            "quantidade": len(dados),
-            "candles": dados,
-            "sinal": sinal,
-            "timestamp": int(time.time()),
-        })
-
-    except Exception as erro:
-
-        return jsonify({
-            "ok": False,
-            "fonte": "IQ Option",
-            "servico": "Academy Trading",
-            "somente_dados": True,
-            "operacao": False,
-            "par": par,
-            "etapa": etapa,
-            "tipo_erro": type(erro).__name__,
-            "erro": (
-                str(erro)
-                or repr(erro)
-                or type(erro).__name__
-            ),
-        }), 503
-
-
-# ============================================================
-# EXECUÇÃO
-# ============================================================
 
 if __name__ == "__main__":
 
