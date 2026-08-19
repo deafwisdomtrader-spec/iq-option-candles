@@ -11,14 +11,16 @@ app = Flask(__name__)
 TIMEFRAME = 60
 CANDLE_COUNT = 100
 
-# Quantidade mínima de confirmações para liberar sinal.
-MIN_CONFIRMACOES = 5
-
-# Indicadores
 EMA_RAPIDA = 21
 EMA_LENTA = 50
 RSI_PERIODO = 14
 MHI_PERIODO = 5
+
+# Para o primeiro teste:
+VALIDADE_MINUTOS = 1
+
+# Quantidade mínima de confirmações.
+MIN_CONFIRMACOES = 5
 
 PARES = [
     "EURUSD-OTC",
@@ -84,9 +86,8 @@ def calcular_ema(valores, periodo):
     if len(valores) < periodo:
         return None
 
-    multiplicador = 2 / (periodo + 1)
-
     ema = mean(valores[:periodo])
+    multiplicador = 2 / (periodo + 1)
 
     for preco in valores[periodo:]:
         ema = (
@@ -114,9 +115,13 @@ def calcular_rsi(valores, periodo=14):
             ganhos.append(diferenca)
             perdas.append(0)
 
-        else:
+        elif diferenca < 0:
             ganhos.append(0)
             perdas.append(abs(diferenca))
+
+        else:
+            ganhos.append(0)
+            perdas.append(0)
 
     ganhos = ganhos[-periodo:]
     perdas = perdas[-periodo:]
@@ -125,6 +130,9 @@ def calcular_rsi(valores, periodo=14):
     media_perda = sum(perdas) / periodo
 
     if media_perda == 0:
+        if media_ganho == 0:
+            return 50.0
+
         return 100.0
 
     rs = media_ganho / media_perda
@@ -145,37 +153,46 @@ def analisar_mhi(candles):
             "confirmado": False,
             "altas": 0,
             "baixas": 0,
+            "neutras": 0,
         }
 
     altas = 0
     baixas = 0
+    neutras = 0
 
     for candle in ultimas:
-        if candle["close"] > candle["open"]:
+        abertura = candle["open"]
+        fechamento = candle["close"]
+
+        if fechamento > abertura:
             altas += 1
 
-        elif candle["close"] < candle["open"]:
+        elif fechamento < abertura:
             baixas += 1
 
+        else:
+            neutras += 1
+
     if altas > baixas:
-        direcao = "PUT"
+        sinal = "PUT"
 
     elif baixas > altas:
-        direcao = "CALL"
+        sinal = "CALL"
 
     else:
-        direcao = "AGUARDANDO"
+        sinal = "AGUARDANDO"
 
     return {
-        "sinal": direcao,
-        "confirmado": direcao != "AGUARDANDO",
+        "sinal": sinal,
+        "confirmado": sinal != "AGUARDANDO",
         "altas": altas,
         "baixas": baixas,
+        "neutras": neutras,
     }
 
 
 # ============================================================
-# TENDÊNCIA
+# TENDÊNCIA / EMA 21/50
 # ============================================================
 
 def analisar_tendencia(candles):
@@ -236,7 +253,6 @@ def analisar_rompimento(candles):
         }
 
     atual = candles[-1]
-
     anteriores = candles[-21:-1]
 
     resistencia = max(
@@ -253,23 +269,23 @@ def analisar_rompimento(candles):
         return {
             "direcao": "ALTA",
             "rompimento": True,
-            "resistencia": resistencia,
-            "suporte": suporte,
+            "resistencia": round(resistencia, 6),
+            "suporte": round(suporte, 6),
         }
 
     if atual["close"] < suporte:
         return {
             "direcao": "BAIXA",
             "rompimento": True,
-            "resistencia": resistencia,
-            "suporte": suporte,
+            "resistencia": round(resistencia, 6),
+            "suporte": round(suporte, 6),
         }
 
     return {
         "direcao": "NEUTRO",
         "rompimento": False,
-        "resistencia": resistencia,
-        "suporte": suporte,
+        "resistencia": round(resistencia, 6),
+        "suporte": round(suporte, 6),
     }
 
 
@@ -278,7 +294,7 @@ def analisar_rompimento(candles):
 # ============================================================
 
 def analisar_pullback(candles):
-    if len(candles) < 25:
+    if len(candles) < EMA_RAPIDA + 2:
         return {
             "direcao": "NEUTRO",
             "pullback": False,
@@ -306,9 +322,7 @@ def analisar_pullback(candles):
         atual["close"] - ema21
     )
 
-    tolerancia = abs(
-        ema21
-    ) * 0.0015
+    tolerancia = abs(ema21) * 0.0015
 
     perto_da_ema = distancia <= tolerancia
 
@@ -319,7 +333,6 @@ def analisar_pullback(candles):
             "ema21": round(ema21, 6),
         }
 
-    # Retoma para cima da EMA
     if atual["close"] > ema21:
         return {
             "direcao": "ALTA",
@@ -327,7 +340,6 @@ def analisar_pullback(candles):
             "ema21": round(ema21, 6),
         }
 
-    # Retoma para baixo da EMA
     if atual["close"] < ema21:
         return {
             "direcao": "BAIXA",
@@ -379,24 +391,27 @@ def analisar_linha_tendencia(candles):
 # ============================================================
 
 def analisar_sinal(candles):
-    if len(candles) < EMA_LENTA + 5:
-        return {
-            "sinal": "AGUARDANDO",
-            "confirmado": False,
-            "motivo": "Aguardando histórico suficiente.",
-        }
 
+    agora = int(time.time())
+
+    # Somente velas fechadas.
     fechadas = [
         candle
         for candle in candles
-        if candle["to"] <= int(time.time())
+        if candle["to"] <= agora
     ]
 
-    if len(fechadas) < EMA_LENTA:
+    fechadas.sort(
+        key=lambda candle: candle["from"]
+    )
+
+    if len(fechadas) < EMA_LENTA + 5:
         return {
             "sinal": "AGUARDANDO",
             "confirmado": False,
-            "motivo": "Aguardando velas fechadas.",
+            "motivo": "Histórico insuficiente.",
+            "velas_disponiveis": len(fechadas),
+            "minimo_necessario": EMA_LENTA + 5,
         }
 
     closes = [
@@ -436,30 +451,22 @@ def analisar_sinal(candles):
     # RSI
     # --------------------------------------------------------
 
-    rsi_call = False
-    rsi_put = False
-
     if rsi is not None:
 
         if rsi > 50:
             pontos_call += 1
-            rsi_call = True
 
         elif rsi < 50:
             pontos_put += 1
-            rsi_put = True
 
     # --------------------------------------------------------
     # EMA 21 / 50
     # --------------------------------------------------------
 
-    ema_call = tendencia["direcao"] == "BAIXA"
-    ema_put = tendencia["direcao"] == "ALTA"
-
-    if ema_call:
+    if tendencia["direcao"] == "BAIXA":
         pontos_call += 1
 
-    if ema_put:
+    elif tendencia["direcao"] == "ALTA":
         pontos_put += 1
 
     # --------------------------------------------------------
@@ -476,54 +483,30 @@ def analisar_sinal(candles):
     # ROMPIMENTO
     # --------------------------------------------------------
 
-    rompimento_call = (
-        rompimento["direcao"] == "BAIXA"
-    )
-
-    rompimento_put = (
-        rompimento["direcao"] == "ALTA"
-    )
-
-    if rompimento_call:
+    if rompimento["direcao"] == "BAIXA":
         pontos_call += 1
 
-    if rompimento_put:
+    elif rompimento["direcao"] == "ALTA":
         pontos_put += 1
 
     # --------------------------------------------------------
     # PULLBACK
     # --------------------------------------------------------
 
-    pullback_call = (
-        pullback["direcao"] == "BAIXA"
-    )
-
-    pullback_put = (
-        pullback["direcao"] == "ALTA"
-    )
-
-    if pullback_call:
+    if pullback["direcao"] == "BAIXA":
         pontos_call += 1
 
-    if pullback_put:
+    elif pullback["direcao"] == "ALTA":
         pontos_put += 1
 
     # --------------------------------------------------------
     # LINHA DE TENDÊNCIA
     # --------------------------------------------------------
 
-    linha_call = (
-        linha["direcao"] == "BAIXA"
-    )
-
-    linha_put = (
-        linha["direcao"] == "ALTA"
-    )
-
-    if linha_call:
+    if linha["direcao"] == "BAIXA":
         pontos_call += 1
 
-    if linha_put:
+    elif linha["direcao"] == "ALTA":
         pontos_put += 1
 
     # --------------------------------------------------------
@@ -545,13 +528,11 @@ def analisar_sinal(candles):
     else:
         sinal = "AGUARDANDO"
 
-    agora = int(time.time())
-
     proxima_vela = (
         (agora // TIMEFRAME) + 1
     ) * TIMEFRAME
 
-    segundos = max(
+    segundos_restantes = max(
         0,
         proxima_vela - agora
     )
@@ -559,10 +540,13 @@ def analisar_sinal(candles):
     return {
         "sinal": sinal,
         "confirmado": sinal != "AGUARDANDO",
-        "estrategia": "MHI + RSI + EMA + Rompimento + Pullback + Tendência",
+        "estrategia": (
+            "MHI + RSI + EMA21/50 + "
+            "Rompimento + Pullback + Tendência"
+        ),
         "periodo": "M1",
         "validade": "1 minuto",
-        "validade_segundos": segundos,
+        "validade_segundos": segundos_restantes,
 
         "pontuacao": {
             "CALL": pontos_call,
@@ -571,7 +555,11 @@ def analisar_sinal(candles):
         },
 
         "indicadores": {
-            "rsi": round(rsi, 2) if rsi is not None else None,
+            "rsi": (
+                round(rsi, 2)
+                if rsi is not None
+                else None
+            ),
             "ema21": tendencia["ema21"],
             "ema50": tendencia["ema50"],
             "tendencia": tendencia["direcao"],
@@ -592,7 +580,7 @@ def analisar_sinal(candles):
 
 
 # ============================================================
-# CONEXÃO IQ OPTION
+# IQ OPTION
 # ============================================================
 
 async def buscar_par(email, password, par):
@@ -665,7 +653,12 @@ async def buscar_todos(email, password, pares):
                 "candles": [],
                 "quantidade": 0,
                 "ok": False,
-                "erro": str(erro),
+                "erro": (
+                    str(erro)
+                    or repr(erro)
+                    or type(erro).__name__
+                ),
+                "tipo_erro": type(erro).__name__,
                 "sinal": {
                     "sinal": "AGUARDANDO",
                     "confirmado": False,
@@ -676,7 +669,7 @@ async def buscar_todos(email, password, pares):
 
 
 # ============================================================
-# ROTAS
+# HOME
 # ============================================================
 
 @app.get("/")
@@ -696,6 +689,10 @@ def inicio():
     })
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.get("/health")
 def health():
 
@@ -708,12 +705,22 @@ def health():
     })
 
 
+# ============================================================
+# TODOS OS PARES
+# ============================================================
+
 @app.get("/candles")
 def candles():
 
+    etapa = "iniciando"
+
     try:
 
+        etapa = "obtendo credenciais"
+
         email, password = obter_credenciais()
+
+        etapa = "lendo parâmetros"
 
         pares_param = request.args.get(
             "pares",
@@ -733,6 +740,8 @@ def candles():
             pares = PARES
 
         pares = pares[:15]
+
+        etapa = "buscando candles"
 
         resultados = asyncio.run(
             buscar_todos(
@@ -773,18 +782,41 @@ def candles():
             "servico": "Academy Trading",
             "somente_dados": True,
             "operacao": False,
-            "erro": str(erro),
+            "etapa": etapa,
+            "tipo_erro": type(erro).__name__,
+            "erro": (
+                str(erro)
+                or repr(erro)
+                or type(erro).__name__
+            ),
         }), 503
 
+
+# ============================================================
+# UM PAR
+# ============================================================
 
 @app.get("/candles/<par>")
 def candles_par(par):
 
+    etapa = "iniciando"
+
     try:
+
+        etapa = "obtendo credenciais"
 
         email, password = obter_credenciais()
 
+        etapa = "preparando par"
+
         par = par.strip().upper()
+
+        if not par:
+            raise ValueError(
+                "Par não informado."
+            )
+
+        etapa = "conectando na IQ Option"
 
         dados = asyncio.run(
             buscar_par(
@@ -794,9 +826,20 @@ def candles_par(par):
             )
         )
 
+        etapa = "recebendo candles"
+
+        if not dados:
+            raise RuntimeError(
+                "A IQ Option não retornou candles."
+            )
+
+        etapa = "analisando indicadores"
+
         sinal = analisar_sinal(
             dados
         )
+
+        etapa = "montando resposta"
 
         return jsonify({
             "ok": True,
@@ -821,12 +864,18 @@ def candles_par(par):
             "somente_dados": True,
             "operacao": False,
             "par": par,
-            "erro": str(erro),
+            "etapa": etapa,
+            "tipo_erro": type(erro).__name__,
+            "erro": (
+                str(erro)
+                or repr(erro)
+                or type(erro).__name__
+            ),
         }), 503
 
 
 # ============================================================
-# EXECUÇÃO LOCAL
+# EXECUÇÃO
 # ============================================================
 
 if __name__ == "__main__":
