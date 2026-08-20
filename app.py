@@ -1,7 +1,12 @@
 import os
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# Brasil não tem mais horário de verão desde 2019,
+# então um offset fixo de UTC-3 é sempre correto
+# (evita depender de tzdata instalado no servidor do Render).
+FUSO_BR = timezone(timedelta(hours=-3))
 
 from flask import Flask, jsonify, request
 from iqoptionapi.stable_api import IQ_Option
@@ -861,7 +866,8 @@ def analisar_sinal(candles):
     if candles:
 
         hora = datetime.fromtimestamp(
-            candles[-1]["from"]
+            candles[-1]["from"],
+            tz=FUSO_BR,
         ).strftime(
             "%H:%M"
         )
