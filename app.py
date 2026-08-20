@@ -25,10 +25,18 @@ PARES = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "NZDUSD-OTC",
+    "AUDUSD-OTC",
+    "USDCAD-OTC",
+    "GBPJPY-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "GBPJPY-OTC",
+    "AUDJPY-OTC",
+    "NZDUSD-OTC",
+    "EURCAD-OTC",
+    "GBPAUD-OTC",
+    "CADJPY-OTC",
+    "EURAUD-OTC",
+    "XAUUSD-OTC",
 ]
 
 ESTRATEGIA = (
@@ -1452,10 +1460,11 @@ def candles():
 
             pares = PARES
 
-        # Primeiro teste:
-        # máximo 5 pares.
+        # Máximo de pares por chamada.
+        # Buscar muitos pares em série pode demorar —
+        # ajuste esse número se começar a dar timeout.
 
-        pares = pares[:5]
+        pares = pares[:16]
 
         resultados = []
 
