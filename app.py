@@ -872,9 +872,15 @@ def analisar_sinal(candles):
             "%H:%M"
         )
 
+        # timestamp UNIX (UTC) de fechamento do candle atual,
+        # usado pelo front-end para montar o timer regressivo
+        expira_em = candles[-1]["to"]
+
     else:
 
         hora = "--:--"
+
+        expira_em = None
 
     # --------------------------------------------------------
     # RESULTADO
@@ -889,6 +895,8 @@ def analisar_sinal(candles):
         "confianca": confianca,
 
         "hora": hora,
+
+        "expira_em": expira_em,
 
         "preco": round(
             preco,
@@ -1202,6 +1210,9 @@ def candles_par(par):
             "hora":
                 analise["hora"],
 
+            "expira_em":
+                analise["expira_em"],
+
             "preco":
                 analise["preco"],
 
@@ -1482,6 +1493,9 @@ def candles():
 
                     "hora":
                         analise["hora"],
+
+                    "expira_em":
+                        analise["expira_em"],
 
                     "rsi":
                         analise["rsi"],
