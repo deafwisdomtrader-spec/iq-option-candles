@@ -780,8 +780,13 @@ def analisar_sinal(candles):
 
     confianca = 0
 
+    # Pontuação mínima para confirmar CALL/PUT.
+    # Antes era 5 (mais raro, mais seletivo).
+    # Agora 4 (sinais mais frequentes, um pouco menos filtrados).
+    PONTUACAO_MINIMA = 4
+
     if (
-        pontos_call >= 5
+        pontos_call >= PONTUACAO_MINIMA
         and pontos_call > pontos_put
     ):
 
@@ -797,7 +802,7 @@ def analisar_sinal(candles):
         )
 
     elif (
-        pontos_put >= 5
+        pontos_put >= PONTUACAO_MINIMA
         and pontos_put > pontos_call
     ):
 
