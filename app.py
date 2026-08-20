@@ -25,18 +25,10 @@ PARES = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "AUDUSD-OTC",
-    "USDCAD-OTC",
-    "GBPJPY-OTC",
+    "NZDUSD-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "AUDJPY-OTC",
-    "NZDUSD-OTC",
-    "EURCAD-OTC",
-    "GBPAUD-OTC",
-    "CADJPY-OTC",
-    "EURAUD-OTC",
-    "XAUUSD-OTC",
+    "GBPJPY-OTC",
 ]
 
 ESTRATEGIA = (
@@ -204,6 +196,42 @@ def buscar_candles(
         timestamp = int(
             time.time()
         )
+
+    # Alguns pares podem não existir no dicionário interno
+    # da biblioteca iqoptionapi (ex: nome diferente, ativo
+    # removido, etc). Quando isso acontece, a biblioteca às
+    # vezes tenta reconectar internamente e trava por muito
+    # tempo, o que pode derrubar o worker inteiro do Render.
+    # Por isso validamos ANTES de chamar get_candles.
+
+    try:
+
+        ativos_abertos = iq.get_all_open_time()
+
+        par_existe = (
+            par in ativos_abertos.get("turbo", {})
+            or par in ativos_abertos.get("binary", {})
+            or par in ativos_abertos.get("digital", {})
+        )
+
+        if not par_existe:
+
+            raise ValueError(
+                f"Par '{par}' não reconhecido pela "
+                "IQ Option (nome inválido ou indisponível)."
+            )
+
+    except ValueError:
+
+        raise
+
+    except Exception:
+
+        # Se a checagem em si falhar, seguimos em frente
+        # e deixamos o get_candles tentar normalmente —
+        # não queremos bloquear pares válidos por causa
+        # de uma falha na checagem de disponibilidade.
+        pass
 
     candles = iq.get_candles(
         par,
