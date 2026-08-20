@@ -935,6 +935,115 @@ def analisar_sinal(candles):
 
 
 # ============================================================
+# ABRIR POSIÇÃO (CALL / PUT)
+# ============================================================
+
+def abrir_posicao(iq, par, direcao, valor, duracao=1):
+    """
+    Abre uma posição de CALL ou PUT.
+
+    Tenta primeiro a opção binária/turbo clássica (iq.buy).
+    Muitos pares -OTC não aceitam mais binária, então cai
+    automaticamente para a opção digital (iq.buy_digital_spot),
+    que é o que a maioria dos pares OTC usa hoje em dia.
+    """
+
+    direcao = direcao.strip().lower()
+
+    if direcao not in ("call", "put"):
+        raise ValueError(
+            "Direção inválida. Use 'call' ou 'put'."
+        )
+
+    # ---- Tentativa 1: binária / turbo ----
+    try:
+
+        status, order_id = iq.buy(
+            valor,
+            par,
+            direcao,
+            duracao,
+        )
+
+        if status:
+
+            return {
+                "tipo": "binary",
+                "id": order_id,
+            }
+
+    except Exception:
+
+        pass
+
+    # ---- Tentativa 2: opção digital ----
+    status, order_id = iq.buy_digital_spot(
+        par,
+        valor,
+        direcao,
+        duracao,
+    )
+
+    if not status:
+
+        raise RuntimeError(
+            "A corretora recusou a ordem "
+            f"(binária e digital falharam) para {par}. "
+            f"Retorno: {order_id}"
+        )
+
+    return {
+        "tipo": "digital",
+        "id": order_id,
+    }
+
+
+def verificar_resultado(iq, tipo, order_id, timeout=180):
+    """
+    Fica escutando o resultado da ordem até ela fechar
+    ou até estourar o timeout (em segundos).
+    """
+
+    inicio = time.time()
+
+    while time.time() - inicio < timeout:
+
+        try:
+
+            if tipo == "digital":
+
+                finalizada, lucro = iq.check_win_digital_v2(
+                    order_id
+                )
+
+            else:
+
+                lucro = iq.check_win_v4(order_id)
+
+                finalizada = lucro is not None
+
+            if finalizada:
+
+                return {
+                    "finalizado": True,
+                    "lucro": lucro,
+                }
+
+        except Exception:
+
+            pass
+
+        time.sleep(1)
+
+    return {
+        "finalizado": False,
+        "lucro": None,
+        "aviso": "Tempo de espera esgotado, "
+        "consulte o resultado depois pelo painel da IQ Option.",
+    }
+
+
+# ============================================================
 # HOME
 # ============================================================
 
@@ -1173,6 +1282,121 @@ def candles_par(par):
 
             "etapa":
                 "conexão/candles/análise",
+
+        }), 503
+
+
+# ============================================================
+# OPERAR (CALL / PUT) — EXECUÇÃO REAL DE ORDEM
+# ============================================================
+
+@app.get("/operar/<par>")
+def operar(par):
+
+    par = par.strip().upper()
+
+    direcao = request.args.get(
+        "direcao",
+        ""
+    ).strip().lower()
+
+    if direcao not in ("call", "put"):
+
+        return jsonify({
+
+            "ok": False,
+
+            "erro":
+                "Parâmetro 'direcao' obrigatório: "
+                "use ?direcao=call ou ?direcao=put",
+
+        }), 400
+
+    try:
+
+        valor = float(
+            request.args.get("valor", "1")
+        )
+
+    except ValueError:
+
+        valor = 1.0
+
+    try:
+
+        duracao = int(
+            request.args.get("duracao", "1")
+        )
+
+    except ValueError:
+
+        duracao = 1
+
+    try:
+
+        iq = conectar()
+
+        posicao = abrir_posicao(
+            iq,
+            par,
+            direcao,
+            valor,
+            duracao,
+        )
+
+        resultado = verificar_resultado(
+            iq,
+            posicao["tipo"],
+            posicao["id"],
+        )
+
+        return jsonify({
+
+            "ok": True,
+
+            "fonte": "IQ Option",
+
+            "operacao": True,
+
+            "par": par,
+
+            "direcao": direcao,
+
+            "valor": valor,
+
+            "duracao_min": duracao,
+
+            "tipo_operacao": posicao["tipo"],
+
+            "id_ordem": posicao["id"],
+
+            "timestamp": int(time.time()),
+
+            **resultado,
+
+        })
+
+    except Exception as erro:
+
+        global _iq
+
+        _iq = None
+
+        return jsonify({
+
+            "ok": False,
+
+            "fonte": "IQ Option",
+
+            "operacao": True,
+
+            "par": par,
+
+            "erro": str(erro),
+
+            "tipo_erro": type(erro).__name__,
+
+            "etapa": "abrindo ordem",
 
         }), 503
 
