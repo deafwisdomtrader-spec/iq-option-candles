@@ -1229,6 +1229,118 @@ def health():
 
 
 # ============================================================
+# CONFERIR RESULTADO DE UM SINAL
+# ============================================================
+#
+# Recebe o par e o timestamp de ABERTURA do candle de entrada.
+# Procura esse candle no histórico e compara abertura x
+# fechamento para dizer se um CALL ou um PUT teria acertado.
+#
+# Isso confere o SINAL, não a operação real da pessoa. Serve
+# para medir a estratégia sem depender de anotação manual.
+#
+# Uso: /resultado/EURUSD?inicio=1755792060&sinal=PUT
+# ============================================================
+
+@app.get("/resultado/<par>")
+def resultado_sinal(par):
+
+    par = par.strip().upper()
+
+    try:
+        inicio_candle = int(
+            request.args.get("inicio", 0)
+        )
+    except (TypeError, ValueError):
+        inicio_candle = 0
+
+    sinal = (
+        request.args.get("sinal", "")
+        .strip()
+        .upper()
+    )
+
+    if inicio_candle <= 0 or sinal not in ("CALL", "PUT"):
+
+        return jsonify({
+            "erro": "parametros invalidos",
+            "esperado": "?inicio=UNIX&sinal=CALL|PUT",
+        }), 400
+
+    # O candle precisa ter fechado antes de conferir.
+    if time.time() < inicio_candle + TIMEFRAME:
+
+        return jsonify({
+            "par": par,
+            "status": "AGUARDANDO",
+            "mensagem": "candle ainda nao fechou",
+        })
+
+    try:
+
+        iq = conectar()
+
+        candles = buscar_candles_com_timeout(
+            iq,
+            par,
+            CANDLE_COUNT
+        )
+
+    except Exception as erro:
+
+        return jsonify({
+            "par": par,
+            "status": "ERRO",
+            "mensagem": str(erro)[:120],
+        }), 502
+
+    alvo = None
+
+    for candle in candles:
+
+        if candle.get("from") == inicio_candle:
+            alvo = candle
+            break
+
+    if alvo is None:
+
+        return jsonify({
+            "par": par,
+            "status": "NAO_ENCONTRADO",
+            "mensagem": "candle fora do historico disponivel",
+        })
+
+    abertura = alvo["open"]
+    fechamento = alvo["close"]
+
+    if fechamento > abertura:
+        direcao = "ALTA"
+    elif fechamento < abertura:
+        direcao = "BAIXA"
+    else:
+        direcao = "DOJI"
+
+    if direcao == "DOJI":
+        status = "EMPATE"
+    elif sinal == "CALL" and direcao == "ALTA":
+        status = "WIN"
+    elif sinal == "PUT" and direcao == "BAIXA":
+        status = "WIN"
+    else:
+        status = "LOSS"
+
+    return jsonify({
+        "par": par,
+        "sinal": sinal,
+        "status": status,
+        "abertura": abertura,
+        "fechamento": fechamento,
+        "direcao_candle": direcao,
+        "inicio": inicio_candle,
+    })
+
+
+# ============================================================
 # UM PAR
 # ============================================================
 
