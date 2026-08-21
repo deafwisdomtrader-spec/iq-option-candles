@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 
 # Brasil não tem mais horário de verão desde 2019,
@@ -25,10 +26,17 @@ PARES = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "NZDUSD-OTC",
+    "AUDUSD-OTC",
+    "USDCAD-OTC",
+    "GBPJPY-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "GBPJPY-OTC",
+    "AUDJPY-OTC",
+    "NZDUSD-OTC",
+    "EURCAD-OTC",
+    "GBPAUD-OTC",
+    "CADJPY-OTC",
+    "EURAUD-OTC",
 ]
 
 ESTRATEGIA = (
@@ -197,42 +205,6 @@ def buscar_candles(
             time.time()
         )
 
-    # Alguns pares podem não existir no dicionário interno
-    # da biblioteca iqoptionapi (ex: nome diferente, ativo
-    # removido, etc). Quando isso acontece, a biblioteca às
-    # vezes tenta reconectar internamente e trava por muito
-    # tempo, o que pode derrubar o worker inteiro do Render.
-    # Por isso validamos ANTES de chamar get_candles.
-
-    try:
-
-        ativos_abertos = iq.get_all_open_time()
-
-        par_existe = (
-            par in ativos_abertos.get("turbo", {})
-            or par in ativos_abertos.get("binary", {})
-            or par in ativos_abertos.get("digital", {})
-        )
-
-        if not par_existe:
-
-            raise ValueError(
-                f"Par '{par}' não reconhecido pela "
-                "IQ Option (nome inválido ou indisponível)."
-            )
-
-    except ValueError:
-
-        raise
-
-    except Exception:
-
-        # Se a checagem em si falhar, seguimos em frente
-        # e deixamos o get_candles tentar normalmente —
-        # não queremos bloquear pares válidos por causa
-        # de uma falha na checagem de disponibilidade.
-        pass
-
     candles = iq.get_candles(
         par,
         TIMEFRAME,
@@ -265,6 +237,54 @@ def buscar_candles(
     )
 
     return resultado
+
+
+# ============================================================
+# BUSCAR CANDLES COM TIMEOUT REAL (por thread)
+# ============================================================
+#
+# Alguns pares podem fazer a biblioteca iqoptionapi travar
+# internamente (ex: tentando reconectar sem sucesso). Isso pode
+# derrubar o worker inteiro do Render, mesmo com try/except,
+# porque o timeout do gunicorn mata o processo via sinal
+# (SystemExit), que não é capturado por "except Exception".
+#
+# Rodando cada busca numa thread separada com timeout real,
+# se um par travar, a gente simplesmente ABANDONA aquela thread
+# (ela continua rodando sozinha em segundo plano, mas o pedido
+# HTTP não fica preso esperando) e marca esse par como falho.
+
+_executor_candles = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16
+)
+
+def buscar_candles_com_timeout(
+    iq,
+    par,
+    quantidade=CANDLE_COUNT,
+    timeout_segundos=15
+):
+
+    future = _executor_candles.submit(
+        buscar_candles,
+        iq,
+        par,
+        quantidade
+    )
+
+    try:
+
+        return future.result(
+            timeout=timeout_segundos
+        )
+
+    except concurrent.futures.TimeoutError:
+
+        raise TimeoutError(
+            f"Busca de candles para {par} "
+            f"demorou mais de {timeout_segundos}s "
+            "e foi abandonada."
+        )
 
 
 # ============================================================
@@ -1187,7 +1207,7 @@ def candles_par(par):
 
         iq = conectar()
 
-        candles = buscar_candles(
+        candles = buscar_candles_com_timeout(
             iq,
             par,
             CANDLE_COUNT
@@ -1486,13 +1506,32 @@ def candles():
 
         else:
 
-            pares = PARES
+            # Sem par específico: alterna automaticamente
+            # qual grupo de pares mostrar, pra nunca buscar
+            # mais que TAMANHO_GRUPO de uma vez só (mais rápido
+            # e seguro), cobrindo todos os pares ao longo de
+            # algumas atualizações.
 
-        # Máximo de pares por chamada.
-        # Buscar muitos pares em série pode demorar —
-        # ajuste esse número se começar a dar timeout.
+            TAMANHO_GRUPO = 5
 
-        pares = pares[:16]
+            # Muda de grupo a cada 2 minutos (bate com o
+            # intervalo de atualização do front-end).
+            indice_rotativo = int(
+                time.time() // 120
+            ) % len(PARES)
+
+            pares = [
+                PARES[(indice_rotativo + i) % len(PARES)]
+                for i in range(
+                    min(TAMANHO_GRUPO, len(PARES))
+                )
+            ]
+
+        # Segurança extra: nunca busca mais que 5 pares
+        # numa chamada só, mesmo se pedirem explicitamente
+        # mais que isso via ?pares=.
+
+        pares = pares[:5]
 
         resultados = []
 
@@ -1500,10 +1539,11 @@ def candles():
 
             try:
 
-                dados = buscar_candles(
+                dados = buscar_candles_com_timeout(
                     iq,
                     par,
-                    CANDLE_COUNT
+                    CANDLE_COUNT,
+                    timeout_segundos=15
                 )
 
                 analise = analisar_sinal(
