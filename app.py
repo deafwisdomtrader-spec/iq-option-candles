@@ -1568,12 +1568,14 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # Muda de grupo a cada 1 minuto. O front-end congela
-            # os cards que ainda estão em contagem, então trocar
-            # o grupo mais rápido não atrapalha quem já está
-            # esperando para entrar.
+            # ROTAÇÃO DOS PARES: 180 segundos (3 minutos).
+            # Isso é SEPARADO da atualização dos dados, que
+            # continua de 60 em 60 segundos no front-end.
+            # Ou seja: os mesmos pares ficam na tela por 3
+            # minutos, e durante esse tempo os sinais deles
+            # são recalculados 3 vezes. Card parado, dado fresco.
             indice_rotativo = int(
-                time.time() // 60
+                time.time() // 180
             ) % len(lista_base)
 
             pares = [
