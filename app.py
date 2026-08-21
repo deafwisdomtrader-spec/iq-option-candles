@@ -32,6 +32,27 @@ PARES = [
     "GBPJPY-OTC",
 ]
 
+# Forex "normal" (mercado aberto, sem ser OTC).
+# Só retorna dado quando o mercado real está aberto
+# (dias úteis, fora do horário OTC-only).
+PARES_FOREX = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "EURJPY",
+    "AUDUSD",
+    "USDCAD",
+    "GBPJPY",
+    "EURGBP",
+    "USDCHF",
+    "AUDJPY",
+    "NZDUSD",
+    "EURCAD",
+    "GBPAUD",
+    "CADJPY",
+    "EURAUD",
+]
+
 ESTRATEGIA = (
     "MHI + RSI + EMA21/50 + "
     "Rompimento + Pullback + Tendência"
@@ -1505,6 +1526,21 @@ def candles():
             ""
         ).strip()
 
+        # Qual mercado usar quando NÃO vier ?pares= explícito.
+        # "otc" (padrão) = pares sintéticos, roda sempre.
+        # "forex" = mercado real, só funciona em horário de
+        # mercado aberto (dias úteis).
+        mercado = request.args.get(
+            "mercado",
+            "otc"
+        ).strip().lower()
+
+        lista_base = (
+            PARES_FOREX
+            if mercado == "forex"
+            else PARES
+        )
+
         if pares_param:
 
             pares = [
@@ -1528,12 +1564,12 @@ def candles():
             # intervalo de atualização do front-end).
             indice_rotativo = int(
                 time.time() // 120
-            ) % len(PARES)
+            ) % len(lista_base)
 
             pares = [
-                PARES[(indice_rotativo + i) % len(PARES)]
+                lista_base[(indice_rotativo + i) % len(lista_base)]
                 for i in range(
-                    min(TAMANHO_GRUPO, len(PARES))
+                    min(TAMANHO_GRUPO, len(lista_base))
                 )
             ]
 
