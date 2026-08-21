@@ -1568,11 +1568,12 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # Muda de grupo a cada 2 minutos, batendo com o
-            # intervalo de atualização do painel. Assim os cards
-            # não ficam trocando de par no meio do contador.
+            # Muda de grupo a cada 1 minuto. O front-end congela
+            # os cards que ainda estão em contagem, então trocar
+            # o grupo mais rápido não atrapalha quem já está
+            # esperando para entrar.
             indice_rotativo = int(
-                time.time() // 120
+                time.time() // 60
             ) % len(lista_base)
 
             pares = [
