@@ -1562,12 +1562,11 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # Muda de grupo a cada 1 minuto, para bater com o
-            # fechamento do candle M1 (TIMEFRAME = 60).
-            # Antes era 120 (2 minutos), o que fazia o sinal
-            # chegar velho na tela.
+            # Muda de grupo a cada 2 minutos, batendo com o
+            # intervalo de atualização do painel. Assim os cards
+            # não ficam trocando de par no meio do contador.
             indice_rotativo = int(
-                time.time() // 60
+                time.time() // 120
             ) % len(lista_base)
 
             pares = [
