@@ -26,17 +26,10 @@ PARES = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "AUDUSD-OTC",
-    "USDCAD-OTC",
-    "GBPJPY-OTC",
+    "NZDUSD-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "AUDJPY-OTC",
-    "NZDUSD-OTC",
-    "EURCAD-OTC",
-    "GBPAUD-OTC",
-    "CADJPY-OTC",
-    "EURAUD-OTC",
+    "GBPJPY-OTC",
 ]
 
 ESTRATEGIA = (
@@ -255,7 +248,7 @@ def buscar_candles(
 # HTTP não fica preso esperando) e marca esse par como falho.
 
 _executor_candles = concurrent.futures.ThreadPoolExecutor(
-    max_workers=16
+    max_workers=3
 )
 
 def buscar_candles_com_timeout(
