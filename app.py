@@ -851,13 +851,19 @@ def analisar_sinal(candles):
     confianca = 0
 
     # Pontuação mínima para confirmar CALL/PUT.
-    # Antes era 5 (mais raro, mais seletivo).
-    # Agora 4 (sinais mais frequentes, um pouco menos filtrados).
-    PONTUACAO_MINIMA = 4
+    # Subiu para 6 (o máximo possível é 8). Sinais fracos do
+    # tipo "4 a 3" eram quase cara ou coroa e apareciam com o
+    # mesmo botão colorido dos sinais bons.
+    PONTUACAO_MINIMA = 6
+
+    # Além do mínimo, o lado vencedor precisa ganhar por uma
+    # margem folgada. "6 a 5" passa no mínimo mas é discordância,
+    # não confirmação.
+    DIFERENCA_MINIMA = 4
 
     if (
         pontos_call >= PONTUACAO_MINIMA
-        and pontos_call > pontos_put
+        and pontos_call - pontos_put >= DIFERENCA_MINIMA
     ):
 
         sinal = "CALL"
@@ -873,7 +879,7 @@ def analisar_sinal(candles):
 
     elif (
         pontos_put >= PONTUACAO_MINIMA
-        and pontos_put > pontos_call
+        and pontos_put - pontos_call >= DIFERENCA_MINIMA
     ):
 
         sinal = "PUT"
