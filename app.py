@@ -951,11 +951,12 @@ def analisar_sinal(candles):
         # usado pelo front-end para montar o timer regressivo
         expira_em = candles[-1]["to"]
 
-        # Horário sugerido de ENTRADA: 2 minutos à frente do
-        # horário do candle atual — dá tempo da pessoa se
-        # preparar e entrar no próximo candle após a atualização.
+        # Horário sugerido de ENTRADA: o PRÓXIMO candle (M1).
+        # Antes era +120 (pulava um candle inteiro), o que fazia
+        # a entrada acontecer depois que o movimento já tinha
+        # passado. Agora entra no candle seguinte ao analisado.
         entrada = datetime.fromtimestamp(
-            candles[-1]["from"] + 120,
+            candles[-1]["from"] + 60,
             tz=FUSO_BR,
         ).strftime(
             "%H:%M"
