@@ -850,16 +850,15 @@ def analisar_sinal(candles):
 
     confianca = 0
 
-    # Pontuação mínima para confirmar CALL/PUT.
-    # Subiu para 6 (o máximo possível é 8). Sinais fracos do
-    # tipo "4 a 3" eram quase cara ou coroa e apareciam com o
-    # mesmo botão colorido dos sinais bons.
-    PONTUACAO_MINIMA = 6
+    # Pontuação mínima para confirmar CALL/PUT (máximo é 8).
+    # Histórico: era 4 (muito sinal fraco), subiu para 6 (quase
+    # nenhum sinal aparecia), agora 5 como meio-termo.
+    PONTUACAO_MINIMA = 5
 
-    # Além do mínimo, o lado vencedor precisa ganhar por uma
-    # margem folgada. "6 a 5" passa no mínimo mas é discordância,
-    # não confirmação.
-    DIFERENCA_MINIMA = 4
+    # O lado vencedor também precisa ganhar por esta margem.
+    # Isso é o que barra o "4 a 3", que é discordância
+    # disfarçada de sinal.
+    DIFERENCA_MINIMA = 3
 
     if (
         pontos_call >= PONTUACAO_MINIMA
