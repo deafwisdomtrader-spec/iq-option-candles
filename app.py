@@ -951,12 +951,13 @@ def analisar_sinal(candles):
         # usado pelo front-end para montar o timer regressivo
         expira_em = candles[-1]["to"]
 
-        # Horário sugerido de ENTRADA: o PRÓXIMO candle (M1).
-        # Antes era +120 (pulava um candle inteiro), o que fazia
-        # a entrada acontecer depois que o movimento já tinha
-        # passado. Agora entra no candle seguinte ao analisado.
+        # Horário sugerido de ENTRADA.
+        # +120 = dois candles à frente do início do analisado.
+        # Isso dá 1 minuto INTEIRO de preparação para a pessoa
+        # abrir o par na corretora antes de operar. O painel
+        # mostra "PREPARE" nesse minuto e "ENTRAR AGORA" depois.
         entrada = datetime.fromtimestamp(
-            candles[-1]["from"] + 60,
+            candles[-1]["from"] + 120,
             tz=FUSO_BR,
         ).strftime(
             "%H:%M"
