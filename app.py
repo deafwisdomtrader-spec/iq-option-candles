@@ -1449,7 +1449,8 @@ def resultado_sinal(par):
             "esperado": "?inicio=UNIX&sinal=CALL|PUT",
         }), 400
 
-    # O candle precisa ter fechado antes de conferir.
+    # Espera o candle de entrada fechar. As durações maiores
+    # (M2 e M3) voltam como null até que fechem também.
     if time.time() < inicio_candle + TIMEFRAME:
 
         return jsonify({
@@ -1476,13 +1477,12 @@ def resultado_sinal(par):
             "mensagem": str(erro)[:120],
         }), 502
 
-    alvo = None
+    por_inicio = {
+        c.get("from"): c
+        for c in candles
+    }
 
-    for candle in candles:
-
-        if candle.get("from") == inicio_candle:
-            alvo = candle
-            break
+    alvo = por_inicio.get(inicio_candle)
 
     if alvo is None:
 
@@ -1492,32 +1492,63 @@ def resultado_sinal(par):
             "mensagem": "candle fora do historico disponivel",
         })
 
+    # A ABERTURA é sempre a do candle de entrada. O que muda
+    # entre M1, M2 e M3 é qual FECHAMENTO usamos:
+    #
+    #   M1 -> fecha no próprio candle de entrada
+    #   M2 -> fecha um candle depois
+    #   M3 -> fecha dois candles depois
+    #
+    # Assim medimos as três durações da MESMA entrada, sem
+    # precisar de sinais diferentes.
+
     abertura = alvo["open"]
-    fechamento = alvo["close"]
 
-    if fechamento > abertura:
-        direcao = "ALTA"
-    elif fechamento < abertura:
-        direcao = "BAIXA"
-    else:
-        direcao = "DOJI"
+    def avaliar(velas):
 
-    if direcao == "DOJI":
-        status = "EMPATE"
-    elif sinal == "CALL" and direcao == "ALTA":
-        status = "WIN"
-    elif sinal == "PUT" and direcao == "BAIXA":
-        status = "WIN"
-    else:
-        status = "LOSS"
+        ultimo = por_inicio.get(
+            inicio_candle + (velas - 1) * TIMEFRAME
+        )
+
+        if ultimo is None:
+            return None
+
+        # Ainda não fechou.
+        if time.time() < ultimo["from"] + TIMEFRAME:
+            return None
+
+        fechamento = ultimo["close"]
+
+        if fechamento > abertura:
+            direcao = "ALTA"
+        elif fechamento < abertura:
+            direcao = "BAIXA"
+        else:
+            direcao = "DOJI"
+
+        if direcao == "DOJI":
+            return "EMPATE"
+
+        if sinal == "CALL" and direcao == "ALTA":
+            return "WIN"
+
+        if sinal == "PUT" and direcao == "BAIXA":
+            return "WIN"
+
+        return "LOSS"
+
+    m1 = avaliar(1)
+    m2 = avaliar(2)
+    m3 = avaliar(3)
 
     return jsonify({
         "par": par,
         "sinal": sinal,
-        "status": status,
+        "status": m1 or "AGUARDANDO",
+        "m1": m1,
+        "m2": m2,
+        "m3": m3,
         "abertura": abertura,
-        "fechamento": fechamento,
-        "direcao_candle": direcao,
         "inicio": inicio_candle,
     })
 
