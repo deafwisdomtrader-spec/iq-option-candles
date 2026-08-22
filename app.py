@@ -31,15 +31,10 @@ PARES = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "GBPJPY-OTC",
+    "NZDUSD-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "AUDJPY-OTC",
-    "NZDUSD-OTC",
-    "EURCAD-OTC",
-    "GBPAUD-OTC",
-    "CADJPY-OTC",
-    "EURAUD-OTC",
+    "GBPJPY-OTC",
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
@@ -102,6 +97,25 @@ def obter_credenciais():
 # ============================================================
 # CONECTAR
 # ============================================================
+
+def invalidar_conexao():
+    """Marca a conexão atual como inutilizável.
+
+    check_connect() só olha se o socket está aberto. A sessão
+    da IQ Option pode estar morta mesmo com o socket vivo — é
+    aí que aparece o erro "get_candles need reconnect" em loop,
+    porque conectar() continua devolvendo o mesmo cliente
+    quebrado para sempre.
+
+    Chamando isto após uma falha de busca, a próxima chamada é
+    obrigada a abrir uma conexão nova.
+    """
+
+    global _iq
+
+    with _lock:
+        _iq = None
+
 
 def conectar():
 
@@ -278,8 +292,12 @@ def buscar_candles(
 # (ela continua rodando sozinha em segundo plano, mas o pedido
 # HTTP não fica preso esperando) e marca esse par como falho.
 
+# Threads que travam na biblioteca da IQ Option são
+# abandonadas, mas continuam ocupando uma vaga do pool. Com
+# apenas 3 vagas, três travamentos deixavam o serviço inteiro
+# sem conseguir buscar mais nada.
 _executor_candles = concurrent.futures.ThreadPoolExecutor(
-    max_workers=3
+    max_workers=12
 )
 
 def buscar_candles_com_timeout(
@@ -1969,7 +1987,45 @@ def candles():
 
         resultados = []
 
+        # ORÇAMENTO DE TEMPO
+        #
+        # O gunicorn mata o worker por volta dos 30 segundos.
+        # Com 5 pares a 15s cada, a soma podia chegar a 75s e
+        # a requisição inteira voltava como 502, derrubando
+        # todos os pares — inclusive os que já tinham
+        # respondido bem.
+        #
+        # Agora cada par tem 7s, e existe um teto total de 22s
+        # para a chamada inteira. Quando o teto estoura, os
+        # pares restantes voltam com status PULADO em vez de
+        # arriscar o 502.
+
+        ORCAMENTO_TOTAL = 22
+        TIMEOUT_POR_PAR = 7
+
+        inicio_lote = time.time()
+
         for par in pares:
+
+            gasto = time.time() - inicio_lote
+            restante = ORCAMENTO_TOTAL - gasto
+
+            if restante < 3:
+
+                resultados.append({
+                    "par": par,
+                    "timeframe": "M1",
+                    "candles": [],
+                    "quantidade": 0,
+                    "sinal": "AGUARDANDO",
+                    "status": "PULADO",
+                    "erro": (
+                        "Tempo da requisicao esgotado. "
+                        "Este par entra na proxima atualizacao."
+                    ),
+                })
+
+                continue
 
             try:
 
@@ -1977,7 +2033,10 @@ def candles():
                     iq,
                     par,
                     CANDLE_COUNT,
-                    timeout_segundos=15
+                    timeout_segundos=min(
+                        TIMEOUT_POR_PAR,
+                        int(restante)
+                    )
                 )
 
                 analise = analisar_sinal(
@@ -2062,6 +2121,31 @@ def candles():
 
             except Exception as erro:
 
+                texto_erro = str(erro)
+
+                # Sinais de sessão morta. Sem invalidar aqui, o
+                # conectar() continua devolvendo o mesmo cliente
+                # quebrado e o erro se repete para sempre.
+                sintomas = (
+                    "need reconnect",
+                    "is_ssl",
+                    "EOF occurred",
+                    "not connected",
+                    "Connection",
+                )
+
+                if any(
+                    marca.lower() in texto_erro.lower()
+                    for marca in sintomas
+                ):
+
+                    invalidar_conexao()
+
+                    try:
+                        iq = conectar()
+                    except Exception:
+                        iq = None
+
                 resultados.append({
 
                     "par":
@@ -2083,7 +2167,7 @@ def candles():
                         "ERRO",
 
                     "erro":
-                        str(erro),
+                        texto_erro,
 
                 })
 
