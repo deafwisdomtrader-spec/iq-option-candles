@@ -1576,7 +1576,29 @@ def listar_ativos():
 
         iq = conectar()
 
-        todos = iq.get_all_open_time()
+        # get_all_open_time() pode ficar 30s parada dentro da
+        # biblioteca esperando a lista de opções digitais. Isso
+        # estoura o limite do gunicorn e MATA o worker, o que
+        # derruba também o painel de forex que estava saudável.
+        #
+        # Rodando numa thread com timeout curto, se travar a
+        # gente abandona a thread e responde normalmente.
+        futuro = _executor_candles.submit(
+            iq.get_all_open_time
+        )
+
+        todos = futuro.result(timeout=12)
+
+    except concurrent.futures.TimeoutError:
+
+        return jsonify({
+            "ok": False,
+            "etapa": "listagem",
+            "erro": (
+                "A corretora demorou mais de 12s para "
+                "devolver a lista de ativos. Tente de novo."
+            ),
+        }), 200
 
     except Exception as erro:
 
