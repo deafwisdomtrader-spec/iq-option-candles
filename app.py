@@ -1969,14 +1969,14 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # ROTAÇÃO DOS PARES: 180 segundos (3 minutos).
+            # ROTAÇÃO DOS PARES: 240 segundos (4 minutos).
             # Isso é SEPARADO da atualização dos dados, que
             # continua de 60 em 60 segundos no front-end.
             # Ou seja: os mesmos pares ficam na tela por 3
             # minutos, e durante esse tempo os sinais deles
             # são recalculados 3 vezes. Card parado, dado fresco.
             indice_rotativo = int(
-                time.time() // 180
+                time.time() // 240
             ) % len(lista_base)
 
             pares = [
