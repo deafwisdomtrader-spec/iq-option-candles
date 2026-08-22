@@ -856,10 +856,37 @@ def analisar_sinal(candles):
 
     if len(candles) < 50:
 
+        # ATENÇÃO: este retorno precisa ter TODAS as chaves que
+        # as rotas leem. Se faltar uma, o Flask levanta KeyError
+        # e a requisição inteira devolve 500 — derrubando todos
+        # os pares do grupo, não só este.
         return {
             "sinal": "AGUARDANDO",
             "status": "POUCOS DADOS",
             "confianca": 0,
+            "hora": "--:--",
+            "expira_em": None,
+            "entrada_em": None,
+            "entrada": "--:--",
+            "preco": None,
+            "rsi": None,
+            "mm": "--",
+            "pivo": "--",
+            "ema21": None,
+            "ema50": None,
+            "tendencia": "NEUTRA",
+            "rompimento": "NÃO",
+            "pullback": "NÃO",
+            "fibo": "SEM DADOS",
+            "fibo_nivel": None,
+            "mhi": {
+                "direcao": "NEUTRO",
+                "altas": 0,
+                "baixas": 0,
+            },
+            "pontos_call": 0,
+            "pontos_put": 0,
+            "validade": "1 minuto",
         }
 
     fechamentos = [
@@ -1638,67 +1665,67 @@ def candles_par(par):
                 int(time.time()),
 
             "sinal":
-                analise["sinal"],
+                analise.get("sinal"),
 
             "status":
-                analise["status"],
+                analise.get("status"),
 
             "confianca":
-                analise["confianca"],
+                analise.get("confianca"),
 
             "hora":
-                analise["hora"],
+                analise.get("hora"),
 
             "expira_em":
-                analise["expira_em"],
+                analise.get("expira_em"),
 
             "entrada":
-                analise["entrada"],
+                analise.get("entrada"),
 
             "entrada_em":
-                analise["entrada_em"],
+                analise.get("entrada_em"),
 
             "preco":
-                analise["preco"],
+                analise.get("preco"),
 
             "rsi":
-                analise["rsi"],
+                analise.get("rsi"),
 
             "mm":
-                analise["mm"],
+                analise.get("mm"),
 
             "pivo":
-                analise["pivo"],
+                analise.get("pivo"),
 
             "ema21":
-                analise["ema21"],
+                analise.get("ema21"),
 
             "ema50":
-                analise["ema50"],
+                analise.get("ema50"),
 
             "tendencia":
-                analise["tendencia"],
+                analise.get("tendencia"),
 
             "rompimento":
-                analise["rompimento"],
+                analise.get("rompimento"),
 
             "pullback":
-                analise["pullback"],
+                analise.get("pullback"),
 
             "mhi":
-                analise["mhi"],
+                analise.get("mhi"),
 
             "fibo":
-                analise["fibo"],
+                analise.get("fibo"),
 
             "fibo_nivel":
-                analise["fibo_nivel"],
+                analise.get("fibo_nivel"),
 
             "pontos_call":
-                analise["pontos_call"],
+                analise.get("pontos_call"),
 
             "pontos_put":
-                analise["pontos_put"],
+                analise.get("pontos_put"),
 
             "validade":
                 "1 minuto",
@@ -1974,64 +2001,64 @@ def candles():
                         len(dados),
 
                     "sinal":
-                        analise["sinal"],
+                        analise.get("sinal"),
 
                     "status":
-                        analise["status"],
+                        analise.get("status"),
 
                     "confianca":
-                        analise["confianca"],
+                        analise.get("confianca"),
 
                     "hora":
-                        analise["hora"],
+                        analise.get("hora"),
 
                     "expira_em":
-                        analise["expira_em"],
+                        analise.get("expira_em"),
 
                     "entrada":
-                        analise["entrada"],
+                        analise.get("entrada"),
 
                     "entrada_em":
-                        analise["entrada_em"],
+                        analise.get("entrada_em"),
 
                     "rsi":
-                        analise["rsi"],
+                        analise.get("rsi"),
 
                     "mm":
-                        analise["mm"],
+                        analise.get("mm"),
 
                     "pivo":
-                        analise["pivo"],
+                        analise.get("pivo"),
 
                     "preco":
-                        analise["preco"],
+                        analise.get("preco"),
 
                     "ema21":
-                        analise["ema21"],
+                        analise.get("ema21"),
 
                     "ema50":
-                        analise["ema50"],
+                        analise.get("ema50"),
 
                     "tendencia":
-                        analise["tendencia"],
+                        analise.get("tendencia"),
 
                     "rompimento":
-                        analise["rompimento"],
+                        analise.get("rompimento"),
 
                     "pullback":
-                        analise["pullback"],
+                        analise.get("pullback"),
 
                     "fibo":
-                        analise["fibo"],
+                        analise.get("fibo"),
 
                     "fibo_nivel":
-                        analise["fibo_nivel"],
+                        analise.get("fibo_nivel"),
 
                     "pontos_call":
-                        analise["pontos_call"],
+                        analise.get("pontos_call"),
 
                     "pontos_put":
-                        analise["pontos_put"],
+                        analise.get("pontos_put"),
 
                 })
 
