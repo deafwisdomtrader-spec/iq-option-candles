@@ -2140,6 +2140,28 @@ def candles():
         else:
             lista_base = PARES
 
+        # Mercado sem nenhum ativo configurado. Precisa ser
+        # verificado ANTES da rotação, porque ela faz
+        # "% len(lista_base)" e dividir por zero derruba a rota.
+        if not lista_base and not pares_param:
+
+            return jsonify({
+                "ok": True,
+                "fonte": "IQ Option",
+                "servico": "Academy Trading",
+                "somente_dados": True,
+                "operacao": False,
+                "timeframe": "M1",
+                "mercado": mercado,
+                "aviso": (
+                    "Nenhum ativo configurado para este "
+                    "mercado. Use /ativos para descobrir os "
+                    "nomes corretos."
+                ),
+                "resultados": [],
+                "timestamp": int(time.time()),
+            })
+
         if pares_param:
 
             pares = [
