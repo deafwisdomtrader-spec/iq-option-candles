@@ -63,18 +63,34 @@ PARES_FOREX = [
 # reais da corretora podem ser diferentes (com ou sem -OTC).
 # Use a rota /ativos para ver a lista exata do que está aberto
 # e ajuste esta lista com os nomes que aparecerem lá.
-# AÇÕES — listas VAZIAS de propósito.
+# AÇÕES (pregão da bolsa, dias úteis).
 #
-# Os nomes anteriores vieram do simulador educacional do site
-# (gerados por Math.random), não da corretora. Como não existem
-# na IQ Option, cada busca falhava e forçava reconexão, o que
-# atrapalhava até o Forex OTC, que estava funcionando bem.
+# Confirmados por teste direto em /candles/<nome>:
+#   APPLE, FACEBOOK, TESLA  -> responderam ok:true
 #
-# Preencha usando os nomes EXATOS devolvidos por /ativos.
-# Com a lista vazia, o painel de ações simplesmente não busca
-# nada e não atrapalha o resto.
-PARES_ACOES = []
+# Os demais são o mesmo padrão de nome (sem sufixo) e ainda
+# precisam ser confirmados. Se algum der ERRO na segunda-feira,
+# basta apagar a linha dele.
+#
+# IMPORTANTE: não existe versão -OTC para ações. Fora do
+# pregão elas retornam MERCADO FECHADO, o que é o correto.
+PARES_ACOES = [
+    "APPLE",
+    "FACEBOOK",
+    "TESLA",
+    "AMAZON",
+    "GOOGLE",
+    "MICROSOFT",
+    "NETFLIX",
+    "INTEL",
+    "ALIBABA",
+    "COCA-COLA",
+    "MCDON",
+    "VISA",
+]
 
+# Sem ações OTC na corretora. Lista vazia de propósito: o
+# painel simplesmente não busca nada.
 PARES_ACOES_OTC = []
 
 ESTRATEGIA = (
