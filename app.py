@@ -21,15 +21,27 @@ app = Flask(__name__)
 TIMEFRAME = 60
 CANDLE_COUNT = 100
 
+# OTC (funciona 24h, inclusive fim de semana).
+# Espelha a lista do Forex normal, com o sufixo -OTC.
+# Se algum par não existir na corretora, ele simplesmente
+# falha na busca e aparece como erro no card — os outros
+# continuam funcionando normalmente.
 PARES = [
     "EURUSD-OTC",
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "NZDUSD-OTC",
+    "AUDUSD-OTC",
+    "USDCAD-OTC",
+    "GBPJPY-OTC",
     "EURGBP-OTC",
     "USDCHF-OTC",
-    "GBPJPY-OTC",
+    "AUDJPY-OTC",
+    "NZDUSD-OTC",
+    "EURCAD-OTC",
+    "GBPAUD-OTC",
+    "CADJPY-OTC",
+    "EURAUD-OTC",
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
@@ -1021,9 +1033,14 @@ def analisar_sinal(candles):
     PONTUACAO_MINIMA = 5
 
     # O lado vencedor também precisa ganhar por esta margem.
-    # Isso é o que barra o "4 a 3", que é discordância
-    # disfarçada de sinal.
-    DIFERENCA_MINIMA = 3
+    #
+    # Histórico: 3 deixava passar os sinais "fracos" (diferença
+    # de 3 a 4 pontos). Agora 5, para só aparecerem os sinais
+    # classificados como MÉDIO (5-6) e FORTE (7+) no painel.
+    #
+    # Efeito: menos sinal na tela, todos com concordância
+    # folgada entre os indicadores.
+    DIFERENCA_MINIMA = 5
 
     if (
         pontos_call >= PONTUACAO_MINIMA
