@@ -961,64 +961,54 @@ def analisar_sinal(candles):
     pontos_put = 0
 
     # --------------------------------------------------------
-    # PONTUAÇÃO DE QUALIDADE
-    # --------------------------------------------------------
-    #
-    # Objetivo desta versão:
-    # - não gerar sinal só porque a soma chegou ao mínimo;
-    # - exigir tendência definida;
-    # - dar mais peso ao MHI quando ele concorda com a direção;
-    # - valorizar pullback/rompimento/Fibonacci como confirmação;
-    # - rejeitar conflitos fortes entre os filtros.
-    #
-    # Isto NÃO transforma a pontuação em probabilidade.
-    # A pontuação continua sendo apenas força técnica.
-
-    pontos_call = 0
-    pontos_put = 0
-
-    confirmacoes_call = []
-    confirmacoes_put = []
-
-    # --------------------------------------------------------
-    # TENDÊNCIA — filtro principal
+    # TENDÊNCIA
     # --------------------------------------------------------
 
     if tendencia == "ALTA":
+
         pontos_call += 2
-        confirmacoes_call.append("TENDENCIA")
 
     elif tendencia == "BAIXA":
+
         pontos_put += 2
-        confirmacoes_put.append("TENDENCIA")
 
     # --------------------------------------------------------
-    # RSI — confirmação, não sinal isolado
+    # RSI
     # --------------------------------------------------------
 
     if rsi is not None:
 
-        if tendencia == "ALTA" and 50 <= rsi <= 70:
-            pontos_call += 1
-            confirmacoes_call.append("RSI")
+        if (
+            tendencia == "ALTA"
+            and 50 <= rsi <= 70
+        ):
 
-        elif tendencia == "BAIXA" and 30 <= rsi <= 50:
+            pontos_call += 1
+
+        elif (
+            tendencia == "BAIXA"
+            and 30 <= rsi <= 50
+        ):
+
             pontos_put += 1
-            confirmacoes_put.append("RSI")
 
     # --------------------------------------------------------
     # ROMPIMENTO
     # --------------------------------------------------------
 
-    if rompimento["rompimento"]:
+    if (
+        rompimento["rompimento"]
+        and rompimento["direcao"] == "ALTA"
+    ):
 
-        if rompimento["direcao"] == "ALTA":
-            pontos_call += 2
-            confirmacoes_call.append("ROMPIMENTO")
+        pontos_call += 2
 
-        elif rompimento["direcao"] == "BAIXA":
-            pontos_put += 2
-            confirmacoes_put.append("ROMPIMENTO")
+    elif (
+        rompimento["rompimento"]
+        and rompimento["direcao"] == "BAIXA"
+    ):
+
+        pontos_put += 2
 
     # --------------------------------------------------------
     # PULLBACK
@@ -1026,142 +1016,104 @@ def analisar_sinal(candles):
 
     if pullback["pullback"]:
 
-        if pullback["direcao"] == "ALTA":
-            pontos_call += 2
-            confirmacoes_call.append("PULLBACK")
+        if (
+            pullback["direcao"]
+            == "ALTA"
+        ):
 
-        elif pullback["direcao"] == "BAIXA":
+            pontos_call += 2
+
+        elif (
+            pullback["direcao"]
+            == "BAIXA"
+        ):
+
             pontos_put += 2
-            confirmacoes_put.append("PULLBACK")
 
     # --------------------------------------------------------
     # MHI
     # --------------------------------------------------------
-    #
-    # MHI continua contrarian.
-    # Ele ganha peso quando a direção do MHI coincide com
-    # a tendência. Se MHI estiver contra uma tendência forte,
-    # não usamos esse conflito para criar uma entrada.
 
     if mhi["direcao"] == "CALL":
 
-        if tendencia == "ALTA":
-            pontos_call += 2
-            confirmacoes_call.append("MHI")
-        elif tendencia == "NEUTRA":
-            pontos_call += 1
-            confirmacoes_call.append("MHI")
-        else:
-            # MHI contra tendência de baixa: não soma.
-            pass
+        pontos_call += 1
 
     elif mhi["direcao"] == "PUT":
 
-        if tendencia == "BAIXA":
-            pontos_put += 2
-            confirmacoes_put.append("MHI")
-        elif tendencia == "NEUTRA":
-            pontos_put += 1
-            confirmacoes_put.append("MHI")
-        else:
-            # MHI contra tendência de alta: não soma.
-            pass
+        pontos_put += 1
 
     # --------------------------------------------------------
     # FIBONACCI
     # --------------------------------------------------------
     #
-    # Só reforça a tendência. Nunca cria sinal sozinho.
+    # Vale 2 pontos, e só pontua A FAVOR da tendência. Ele não
+    # cria sinal sozinho: reforça a entrada quando o preço
+    # recuou até a zona de ouro e está pronto para retomar.
 
     if fibo["na_zona"]:
 
         if tendencia == "ALTA":
+
             pontos_call += 2
-            confirmacoes_call.append("FIBO")
 
         elif tendencia == "BAIXA":
+
             pontos_put += 2
-            confirmacoes_put.append("FIBO")
 
     # --------------------------------------------------------
-    # REGRAS DE QUALIDADE
+    # SINAL
     # --------------------------------------------------------
 
     sinal = "AGUARDANDO"
+
     status = "SEM CONFIRMAÇÃO"
+
     confianca = 0
 
-    # Aumentamos o mínimo para evitar sinais com poucas confirmações.
-    PONTUACAO_MINIMA = 6
+    # Pontuação mínima para confirmar CALL/PUT (máximo é 8).
+    # Histórico: era 4 (muito sinal fraco), subiu para 6 (quase
+    # nenhum sinal aparecia), agora 5 como meio-termo.
+    PONTUACAO_MINIMA = 5
 
-    # Não exigimos diferença absurda de 5 pontos.
-    # Exigimos vantagem real de pelo menos 3 pontos.
-    DIFERENCA_MINIMA = 3
-
-    # Pelo menos duas confirmações independentes.
-    MIN_CONFIRMACOES = 2
-
-    # Sem tendência definida, não entra.
-    tendencia_definida = tendencia in ("ALTA", "BAIXA")
-
-    # Confirmações de contexto.
-    contexto_call = any(
-        item in confirmacoes_call
-        for item in ("PULLBACK", "ROMPIMENTO", "FIBO")
-    )
-
-    contexto_put = any(
-        item in confirmacoes_put
-        for item in ("PULLBACK", "ROMPIMENTO", "FIBO")
-    )
+    # O lado vencedor também precisa ganhar por esta margem.
+    #
+    # Histórico: 3 deixava passar os sinais "fracos" (diferença
+    # de 3 a 4 pontos). Agora 5, para só aparecerem os sinais
+    # classificados como MÉDIO (5-6) e FORTE (7+) no painel.
+    #
+    # Efeito: menos sinal na tela, todos com concordância
+    # folgada entre os indicadores.
+    DIFERENCA_MINIMA = 5
 
     if (
-        tendencia_definida
-        and pontos_call >= PONTUACAO_MINIMA
+        pontos_call >= PONTUACAO_MINIMA
         and pontos_call - pontos_put >= DIFERENCA_MINIMA
-        and len(confirmacoes_call) >= MIN_CONFIRMACOES
-        and contexto_call
     ):
 
         sinal = "CALL"
-        status = "CONFIRMAÇÃO DE ALTA"
+
+        status = (
+            "CONFIRMAÇÃO DE ALTA"
+        )
+
+        # NÃO é probabilidade de acerto. É apenas a soma
+        # técnica dos indicadores que concordaram.
         confianca = pontos_call
 
     elif (
-        tendencia_definida
-        and pontos_put >= PONTUACAO_MINIMA
+        pontos_put >= PONTUACAO_MINIMA
         and pontos_put - pontos_call >= DIFERENCA_MINIMA
-        and len(confirmacoes_put) >= MIN_CONFIRMACOES
-        and contexto_put
     ):
 
         sinal = "PUT"
-        status = "CONFIRMAÇÃO DE BAIXA"
+
+        status = (
+            "CONFIRMAÇÃO DE BAIXA"
+        )
+
+        # NÃO é probabilidade de acerto. É apenas a soma
+        # técnica dos indicadores que concordaram.
         confianca = pontos_put
-
-    # Se houver empate/choque entre as direções, não força sinal.
-    if (
-        sinal != "AGUARDANDO"
-        and abs(pontos_call - pontos_put) < DIFERENCA_MINIMA
-    ):
-        sinal = "AGUARDANDO"
-        status = "CONFLITO ENTRE INDICADORES"
-        confianca = 0
-
-    # Se não houve sinal, deixa explícito o motivo.
-    if sinal == "AGUARDANDO":
-
-        if not tendencia_definida:
-            status = "SEM TENDÊNCIA"
-
-        elif (
-            max(pontos_call, pontos_put)
-            >= PONTUACAO_MINIMA
-        ):
-            status = "CONFLITO / SEM CONFIRMAÇÃO"
-
-        else:
-            status = "AGUARDANDO CONFIRMAÇÃO"
 
     # --------------------------------------------------------
     # MM
@@ -1321,24 +1273,6 @@ def analisar_sinal(candles):
 
         "pontos_put":
             pontos_put,
-
-        "confirmacoes_call":
-            confirmacoes_call,
-
-        "confirmacoes_put":
-            confirmacoes_put,
-
-        "qualidade_sinal":
-            (
-                "ALTA"
-                if sinal in ("CALL", "PUT")
-                and confianca >= 8
-                else (
-                    "MEDIA"
-                    if sinal in ("CALL", "PUT")
-                    else "AGUARDANDO"
-                )
-            ),
 
         "validade":
             "1 minuto",
@@ -1822,15 +1756,6 @@ def candles_par(par):
             "pontos_put":
                 analise.get("pontos_put"),
 
-            "confirmacoes_call":
-                analise.get("confirmacoes_call", []),
-
-            "confirmacoes_put":
-                analise.get("confirmacoes_put", []),
-
-            "qualidade_sinal":
-                analise.get("qualidade_sinal", "AGUARDANDO"),
-
             "validade":
                 "1 minuto",
 
@@ -2204,15 +2129,6 @@ def candles():
 
                     "pontos_put":
                         analise.get("pontos_put"),
-
-                    "confirmacoes_call":
-                        analise.get("confirmacoes_call", []),
-
-                    "confirmacoes_put":
-                        analise.get("confirmacoes_put", []),
-
-                    "qualidade_sinal":
-                        analise.get("qualidade_sinal", "AGUARDANDO"),
 
                 })
 
