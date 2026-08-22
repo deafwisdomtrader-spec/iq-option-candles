@@ -461,6 +461,102 @@ def calcular_pivo(candles):
 
 
 # ============================================================
+# FIBONACCI (retração dentro da tendência)
+# ============================================================
+#
+# Ideia: numa tendência de ALTA, o preço não sobe em linha
+# reta. Ele sobe, recua um pouco e sobe de novo. Fibonacci
+# mede QUANTO ele recuou do último movimento.
+#
+#   0%     = topo do movimento
+#   38,2%  \
+#   50,0%   > zona boa para entrar a favor da tendência
+#   61,8%  /
+#   100%   = fundo do movimento
+#
+# Recuo pequeno demais (menos de 23,6%): ainda não recuou,
+# entrar aqui é comprar no topo.
+#
+# Recuo grande demais (mais de 78,6%): não foi recuo, foi
+# reversão. A tendência provavelmente acabou.
+#
+# A zona entre 38,2% e 61,8% é a clássica "zona de ouro".
+# ============================================================
+
+JANELA_FIBO = 30
+
+FIBO_ZONA_INICIO = 0.382
+FIBO_ZONA_FIM = 0.618
+FIBO_LIMITE_REVERSAO = 0.786
+
+
+def analisar_fibonacci(candles, tendencia):
+
+    vazio = {
+        "na_zona": False,
+        "nivel": None,
+        "texto": "SEM DADOS",
+    }
+
+    if not candles or len(candles) < JANELA_FIBO:
+        return vazio
+
+    if tendencia not in ("ALTA", "BAIXA"):
+
+        return {
+            "na_zona": False,
+            "nivel": None,
+            "texto": "SEM TENDÊNCIA",
+        }
+
+    janela = candles[-JANELA_FIBO:]
+
+    topo = max(c["high"] for c in janela)
+    fundo = min(c["low"] for c in janela)
+
+    amplitude = topo - fundo
+
+    if amplitude <= 0:
+        return vazio
+
+    preco = candles[-1]["close"]
+
+    if tendencia == "ALTA":
+
+        # Quanto o preço recuou a partir do topo.
+        recuo = (topo - preco) / amplitude
+
+    else:
+
+        # Quanto o preço subiu a partir do fundo.
+        recuo = (preco - fundo) / amplitude
+
+    percentual = round(recuo * 100, 1)
+
+    if recuo > FIBO_LIMITE_REVERSAO:
+
+        return {
+            "na_zona": False,
+            "nivel": percentual,
+            "texto": "RECUO FUNDO " + str(percentual) + "%",
+        }
+
+    if FIBO_ZONA_INICIO <= recuo <= FIBO_ZONA_FIM:
+
+        return {
+            "na_zona": True,
+            "nivel": percentual,
+            "texto": "ZONA OURO " + str(percentual) + "%",
+        }
+
+    return {
+        "na_zona": False,
+        "nivel": percentual,
+        "texto": "FORA DA ZONA " + str(percentual) + "%",
+    }
+
+
+# ============================================================
 # TENDÊNCIA
 # ============================================================
 
@@ -751,6 +847,11 @@ def analisar_sinal(candles):
         candles
     )
 
+    fibo = analisar_fibonacci(
+        candles,
+        tendencia
+    )
+
     pivo = calcular_pivo(
         candles
     )
@@ -839,6 +940,24 @@ def analisar_sinal(candles):
     elif mhi["direcao"] == "PUT":
 
         pontos_put += 1
+
+    # --------------------------------------------------------
+    # FIBONACCI
+    # --------------------------------------------------------
+    #
+    # Vale 2 pontos, e só pontua A FAVOR da tendência. Ele não
+    # cria sinal sozinho: reforça a entrada quando o preço
+    # recuou até a zona de ouro e está pronto para retomar.
+
+    if fibo["na_zona"]:
+
+        if tendencia == "ALTA":
+
+            pontos_call += 2
+
+        elif tendencia == "BAIXA":
+
+            pontos_put += 2
 
     # --------------------------------------------------------
     # SINAL
@@ -1024,6 +1143,10 @@ def analisar_sinal(candles):
         ),
 
         "mhi": mhi,
+
+        "fibo": fibo["texto"],
+
+        "fibo_nivel": fibo["nivel"],
 
         "pontos_call":
             pontos_call,
@@ -1454,6 +1577,12 @@ def candles_par(par):
             "mhi":
                 analise["mhi"],
 
+            "fibo":
+                analise["fibo"],
+
+            "fibo_nivel":
+                analise["fibo_nivel"],
+
             "pontos_call":
                 analise["pontos_call"],
 
@@ -1777,6 +1906,12 @@ def candles():
 
                     "pullback":
                         analise["pullback"],
+
+                    "fibo":
+                        analise["fibo"],
+
+                    "fibo_nivel":
+                        analise["fibo_nivel"],
 
                     "pontos_call":
                         analise["pontos_call"],
