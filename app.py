@@ -89,9 +89,7 @@ PARES_ACOES = [
     "VISA",
 ]
 
-# Sem ações OTC na corretora. Lista vazia de propósito: o
-# painel simplesmente não busca nada.
-PARES_ACOES_OTC = []
+
 
 ESTRATEGIA = (
     "MHI + RSI + EMA21/50 + "
@@ -1672,7 +1670,7 @@ def listar_ativos():
             "dica": (
                 "Use estes nomes exatos nas listas "
                 "PARES, PARES_FOREX, PARES_ACOES ou "
-                "PARES_ACOES_OTC do app.py."
+                "PARES_ACOES do app.py."
             ),
             "filtro": filtro or None,
             "total_abertos": total,
@@ -2173,8 +2171,6 @@ def candles():
             lista_base = PARES_FOREX
         elif mercado == "acoes":
             lista_base = PARES_ACOES
-        elif mercado == "acoes_otc":
-            lista_base = PARES_ACOES_OTC
         else:
             lista_base = PARES
 
