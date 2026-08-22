@@ -58,6 +58,22 @@ PARES_FOREX = [
     "EURAUD",
 ]
 
+# AÇÕES.
+# ATENÇÃO: os nomes abaixo são um PALPITE inicial. Os códigos
+# reais da corretora podem ser diferentes (com ou sem -OTC).
+# Use a rota /ativos para ver a lista exata do que está aberto
+# e ajuste esta lista com os nomes que aparecerem lá.
+PARES_ACOES = [
+    "APPLE",
+    "AMAZON",
+    "GOOGLE",
+    "MICROSOFT",
+    "TESLA",
+    "NETFLIX",
+    "INTEL",
+    "ALIBABA",
+]
+
 ESTRATEGIA = (
     "MHI + RSI + EMA21/50 + "
     "Rompimento + Pullback + Tendência"
@@ -1471,6 +1487,76 @@ def health():
 
 
 # ============================================================
+# LISTAR ATIVOS DISPONÍVEIS
+# ============================================================
+#
+# Devolve os nomes EXATOS dos ativos que a corretora está
+# oferecendo agora, já separados por tipo. Serve para descobrir
+# como cada ação se chama de verdade (APPLE? APPLE-OTC?) sem
+# precisar adivinhar par por par.
+#
+# Uso:  /ativos            -> tudo que está aberto
+#       /ativos?filtro=app -> só os que contêm "app" no nome
+# ============================================================
+
+@app.get("/ativos")
+def listar_ativos():
+
+    filtro = (
+        request.args.get("filtro", "")
+        .strip()
+        .upper()
+    )
+
+    try:
+
+        iq = conectar()
+
+        todos = iq.get_all_open_time()
+
+    except Exception as erro:
+
+        invalidar_conexao()
+
+        return jsonify({
+            "ok": False,
+            "erro": str(erro)[:200],
+        }), 200
+
+    abertos = {}
+
+    for tipo, ativos in (todos or {}).items():
+
+        nomes = []
+
+        for nome, info in (ativos or {}).items():
+
+            try:
+                if not info.get("open"):
+                    continue
+            except Exception:
+                continue
+
+            if filtro and filtro not in nome.upper():
+                continue
+
+            nomes.append(nome)
+
+        if nomes:
+            abertos[tipo] = sorted(nomes)
+
+    return jsonify({
+        "ok": True,
+        "dica": (
+            "Use estes nomes exatos nas listas PARES_ACOES, "
+            "PARES ou PARES_FOREX do app.py."
+        ),
+        "filtro": filtro or None,
+        "abertos": abertos,
+    })
+
+
+# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
@@ -1950,11 +2036,12 @@ def candles():
             "otc"
         ).strip().lower()
 
-        lista_base = (
-            PARES_FOREX
-            if mercado == "forex"
-            else PARES
-        )
+        if mercado == "forex":
+            lista_base = PARES_FOREX
+        elif mercado == "acoes":
+            lista_base = PARES_ACOES
+        else:
+            lista_base = PARES
 
         if pares_param:
 
@@ -1975,14 +2062,13 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # ROTAÇÃO DOS PARES: 240 segundos (4 minutos).
-            # Isso é SEPARADO da atualização dos dados, que
-            # continua de 60 em 60 segundos no front-end.
-            # Ou seja: os mesmos pares ficam na tela por 3
-            # minutos, e durante esse tempo os sinais deles
-            # são recalculados 3 vezes. Card parado, dado fresco.
+            # ROTAÇÃO DOS PARES: 120 segundos (2 minutos).
+            # Isso é SEPARADO da busca de dados, que roda a
+            # cada 120s no front-end. Com os dois em 120s,
+            # cada grupo de pares recebe uma busca antes de
+            # dar lugar ao próximo.
             indice_rotativo = int(
-                time.time() // 240
+                time.time() // 120
             ) % len(lista_base)
 
             pares = [
