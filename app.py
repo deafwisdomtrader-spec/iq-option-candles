@@ -35,13 +35,6 @@ PARES = [
     "EURGBP-OTC",
     "USDCHF-OTC",
     "GBPJPY-OTC",
-    # --- em teste ---
-    # Os 8 acima são conhecidos e estáveis. Estes dois estão
-    # sendo testados. Se aparecerem sempre com status ERRO ou
-    # PULADO, é porque a corretora não tem esse par no OTC:
-    # basta apagar as duas linhas abaixo.
-    "AUDJPY-OTC",
-    "EURAUD-OTC",
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
@@ -1530,19 +1523,32 @@ def resultado_sinal(par):
 
         iq = conectar()
 
+        # Timeout curto: esta rota é chamada em segundo plano
+        # e não pode competir com a busca dos cards, que é o
+        # que o usuário está esperando na tela.
         candles = buscar_candles_com_timeout(
             iq,
             par,
-            CANDLE_COUNT
+            CANDLE_COUNT,
+            timeout_segundos=8
         )
 
     except Exception as erro:
 
+        invalidar_conexao()
+
+        # Devolve 200, não 502.
+        #
+        # O 502 fazia o PHP responder "Falha ao consultar o
+        # servidor", sem status nenhum, e o painel repetia a
+        # mesma consulta indefinidamente. Com 200 + status
+        # INDISPONIVEL o front entende que houve falha
+        # temporária e passa para o próximo pendente.
         return jsonify({
             "par": par,
-            "status": "ERRO",
+            "status": "INDISPONIVEL",
             "mensagem": str(erro)[:120],
-        }), 502
+        }), 200
 
     por_inicio = {
         c.get("from"): c
