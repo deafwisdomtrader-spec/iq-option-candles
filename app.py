@@ -35,6 +35,13 @@ PARES = [
     "EURGBP-OTC",
     "USDCHF-OTC",
     "GBPJPY-OTC",
+    # --- em teste ---
+    # Os 8 acima são conhecidos e estáveis. Estes dois estão
+    # sendo testados. Se aparecerem sempre com status ERRO ou
+    # PULADO, é porque a corretora não tem esse par no OTC:
+    # basta apagar as duas linhas abaixo.
+    "AUDJPY-OTC",
+    "EURAUD-OTC",
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
