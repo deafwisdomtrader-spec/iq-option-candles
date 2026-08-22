@@ -63,48 +63,19 @@ PARES_FOREX = [
 # reais da corretora podem ser diferentes (com ou sem -OTC).
 # Use a rota /ativos para ver a lista exata do que está aberto
 # e ajuste esta lista com os nomes que aparecerem lá.
-# Ações do mercado aberto (pregão da bolsa, dias úteis).
-PARES_ACOES = [
-    "APPLE",
-    "AMAZON",
-    "GOOGLE",
-    "MICROSOFT",
-    "TESLA",
-    "CASINO",
-    "NETFLIX",
-    "INTEL",
-    "VISA",
-    "MC-DONALDS",
-    "COCA-COLA",
-    "MAGNIFICENT 7",
-    "DISNEY",
-    "ALIBABA",
-    "SAMSUNG",
-    "AIRLINES",
-    "PEPSI",
-]
+# AÇÕES — listas VAZIAS de propósito.
+#
+# Os nomes anteriores vieram do simulador educacional do site
+# (gerados por Math.random), não da corretora. Como não existem
+# na IQ Option, cada busca falhava e forçava reconexão, o que
+# atrapalhava até o Forex OTC, que estava funcionando bem.
+#
+# Preencha usando os nomes EXATOS devolvidos por /ativos.
+# Com a lista vazia, o painel de ações simplesmente não busca
+# nada e não atrapalha o resto.
+PARES_ACOES = []
 
-# Ações OTC (sintéticas, funcionam 24h como o forex OTC).
-# Nomes retirados do painel da corretora.
-PARES_ACOES_OTC = [
-    "APPLE-OTC",
-    "AMAZON-OTC",
-    "GOOGLE-OTC",
-    "MICROSOFT-OTC",
-    "TESLA-OTC",
-    "CASINO-OTC",
-    "NETFLIX-OTC",
-    "INTEL-OTC",
-    "VISA-OTC",
-    "MC-DONALDS-OTC",
-    "COCA-COLA-OTC",
-    "MAGNIFICENT 7-OTC",
-    "DISNEY-OTC",
-    "ALIBABA-OTC",
-    "SAMSUNG-OTC",
-    "AIRLINES-OTC",
-    "PEPSI-OTC",
-]
+PARES_ACOES_OTC = []
 
 ESTRATEGIA = (
     "MHI + RSI + EMA21/50 + "
@@ -1613,40 +1584,71 @@ def listar_ativos():
 
         return jsonify({
             "ok": False,
+            "etapa": "conexao",
             "erro": str(erro)[:200],
         }), 200
 
-    abertos = {}
+    # A partir daqui, tudo dentro de try: a estrutura devolvida
+    # pela biblioteca varia entre versões, e um formato
+    # inesperado não pode virar Internal Server Error.
 
-    for tipo, ativos in (todos or {}).items():
+    try:
 
-        nomes = []
+        abertos = {}
+        total = 0
 
-        for nome, info in (ativos or {}).items():
+        if isinstance(todos, dict):
 
-            try:
-                if not info.get("open"):
+            for tipo, ativos in todos.items():
+
+                if not isinstance(ativos, dict):
                     continue
-            except Exception:
-                continue
 
-            if filtro and filtro not in nome.upper():
-                continue
+                nomes = []
 
-            nomes.append(nome)
+                for nome, info in ativos.items():
 
-        if nomes:
-            abertos[tipo] = sorted(nomes)
+                    aberto = False
 
-    return jsonify({
-        "ok": True,
-        "dica": (
-            "Use estes nomes exatos nas listas PARES_ACOES, "
-            "PARES ou PARES_FOREX do app.py."
-        ),
-        "filtro": filtro or None,
-        "abertos": abertos,
-    })
+                    if isinstance(info, dict):
+                        aberto = bool(info.get("open"))
+                    else:
+                        aberto = bool(info)
+
+                    if not aberto:
+                        continue
+
+                    texto = str(nome)
+
+                    if filtro and filtro not in texto.upper():
+                        continue
+
+                    nomes.append(texto)
+
+                if nomes:
+                    abertos[str(tipo)] = sorted(nomes)
+                    total += len(nomes)
+
+        return jsonify({
+            "ok": True,
+            "dica": (
+                "Use estes nomes exatos nas listas "
+                "PARES, PARES_FOREX, PARES_ACOES ou "
+                "PARES_ACOES_OTC do app.py."
+            ),
+            "filtro": filtro or None,
+            "total_abertos": total,
+            "abertos": abertos,
+        })
+
+    except Exception as erro:
+
+        return jsonify({
+            "ok": False,
+            "etapa": "leitura da lista",
+            "erro": str(erro)[:200],
+            "tipo_recebido": type(todos).__name__,
+        }), 200
 
 
 # ============================================================
@@ -2178,6 +2180,28 @@ def candles():
         # mais que isso via ?pares=.
 
         pares = pares[:5]
+
+        # Lista de pares vazia (ex.: mercado de ações ainda não
+        # configurado). Devolve resposta vazia em vez de tentar
+        # buscar e derrubar a conexão.
+        if not pares:
+
+            return jsonify({
+                "ok": True,
+                "fonte": "IQ Option",
+                "servico": "Academy Trading",
+                "somente_dados": True,
+                "operacao": False,
+                "timeframe": "M1",
+                "mercado": mercado,
+                "aviso": (
+                    "Nenhum ativo configurado para este "
+                    "mercado. Use /ativos para descobrir os "
+                    "nomes corretos."
+                ),
+                "resultados": [],
+                "timestamp": int(time.time()),
+            })
 
         resultados = []
 
