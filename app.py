@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import concurrent.futures
+import json
 from datetime import datetime, timezone, timedelta
 
 # Brasil não tem mais horário de verão desde 2019,
@@ -360,6 +361,197 @@ def buscar_candles_com_timeout(
             f"demorou mais de {timeout_segundos}s "
             "e foi abandonada."
         )
+
+
+# ============================================================
+# APRENDIZADO DOS RESULTADOS - SOMENTE PARA SINAIS FUTUROS
+# ============================================================
+#
+# O sistema NÃO altera resultados passados e NÃO promete WIN.
+# Ele registra o contexto do sinal, espera o M1 fechar e usa o
+# histórico para ajustar levemente a pontuação dos próximos sinais.
+#
+# O aprendizado é conservador:
+# - exige uma amostra mínima;
+# - usa taxa suavizada para evitar extremos com poucos dados;
+# - limita o ajuste a +/- 2 pontos;
+# - não faz martingale e não força CALL/PUT.
+#
+# Em Render, o disco local pode ser efêmero. O arquivo abaixo é um
+# cache persistente enquanto a instância permanecer disponível.
+# Se o serviço reiniciar, o sistema volta a aprender do zero.
+# ============================================================
+
+APRENDIZADO_ATIVO = True
+APRENDIZADO_MINIMO = 8
+APRENDIZADO_MAX_REGISTROS = 2000
+APRENDIZADO_MAX_AJUSTE = 2
+
+ARQUIVO_APRENDIZADO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "historico_aprendizado.json",
+)
+
+ARQUIVO_PENDENTES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "sinais_pendentes.json",
+)
+
+_lock_aprendizado = threading.Lock()
+
+
+def _ler_json_seguro(caminho, padrao):
+    try:
+        if not os.path.isfile(caminho):
+            return padrao.copy() if isinstance(padrao, dict) else list(padrao)
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return dados if isinstance(dados, type(padrao)) else padrao.copy() if isinstance(padrao, dict) else list(padrao)
+    except Exception:
+        return padrao.copy() if isinstance(padrao, dict) else list(padrao)
+
+
+def _salvar_json_seguro(caminho, dados):
+    temporario = caminho + ".tmp"
+    try:
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            json.dump(dados, arquivo, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporario, caminho)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(temporario):
+                os.remove(temporario)
+        except Exception:
+            pass
+        return False
+
+
+def _faixa_rsi(rsi):
+    if rsi is None:
+        return "SEM_RSI"
+    try:
+        valor = float(rsi)
+    except (TypeError, ValueError):
+        return "SEM_RSI"
+    if valor < 30:
+        return "RSI_<30"
+    if valor < 45:
+        return "RSI_30_45"
+    if valor < 55:
+        return "RSI_45_55"
+    if valor < 70:
+        return "RSI_55_70"
+    return "RSI_>=70"
+
+
+def _contexto_direcao(direcao, tendencia, rsi, rompimento, pullback, mhi, fibo):
+    return "|".join([
+        str(direcao),
+        str(tendencia),
+        _faixa_rsi(rsi),
+        str(rompimento),
+        str(pullback),
+        str(mhi),
+        "FIBO_ZONA" if str(fibo).startswith("ZONA OURO") else "FIBO_FORA",
+    ])
+
+
+def _estatistica_contexto(contexto):
+    historico = _ler_json_seguro(ARQUIVO_APRENDIZADO, [])
+    registros = [
+        item for item in historico
+        if isinstance(item, dict) and item.get("contexto") == contexto
+    ]
+    wins = sum(1 for item in registros if item.get("resultado") == "WIN")
+    losses = sum(1 for item in registros if item.get("resultado") == "LOSS")
+    total = wins + losses
+    taxa = ((wins + 3.0) / (total + 6.0) * 100.0) if total else None
+    return total, wins, losses, taxa
+
+
+def _ajuste_contexto(contexto):
+    if not APRENDIZADO_ATIVO:
+        return 0, {"amostra": 0, "wins": 0, "loss": 0, "taxa": None, "ajuste": 0}
+    total, wins, losses, taxa = _estatistica_contexto(contexto)
+    if total < APRENDIZADO_MINIMO or taxa is None:
+        return 0, {"amostra": total, "wins": wins, "loss": losses, "taxa": taxa, "ajuste": 0}
+    ajuste = round((taxa - 50.0) / 10.0)
+    ajuste = max(-APRENDIZADO_MAX_AJUSTE, min(APRENDIZADO_MAX_AJUSTE, ajuste))
+    return ajuste, {
+        "amostra": total,
+        "wins": wins,
+        "loss": losses,
+        "taxa": round(taxa, 2),
+        "ajuste": ajuste,
+    }
+
+
+def registrar_sinal_pendente(par, analise):
+    if not analise or analise.get("sinal") not in ("CALL", "PUT"):
+        return
+    entrada_em = analise.get("entrada_em")
+    if not entrada_em:
+        return
+    chave = f"{str(par).upper()}|{int(entrada_em)}"
+    registro = {
+        "par": str(par).upper(),
+        "entrada_em": int(entrada_em),
+        "sinal": analise.get("sinal"),
+        "pontos_call": analise.get("pontos_call", 0),
+        "pontos_put": analise.get("pontos_put", 0),
+        "contexto_call": analise.get("contexto_call"),
+        "contexto_put": analise.get("contexto_put"),
+        "criado_em": int(time.time()),
+        "registrado": False,
+    }
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+        pendentes[chave] = registro
+        if len(pendentes) > APRENDIZADO_MAX_REGISTROS:
+            ordenados = sorted(pendentes.items(), key=lambda par_item: par_item[1].get("criado_em", 0))
+            pendentes = dict(ordenados[-APRENDIZADO_MAX_REGISTROS:])
+        _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
+
+
+def registrar_resultado_aprendizado(par, inicio_candle, resultado):
+    if resultado not in ("WIN", "LOSS"):
+        return False
+    chave = f"{str(par).upper()}|{int(inicio_candle)}"
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+        pendente = pendentes.get(chave)
+        if not isinstance(pendente, dict) or pendente.get("registrado"):
+            return False
+        contexto = pendente.get("contexto_call") if pendente.get("sinal") == "CALL" else pendente.get("contexto_put")
+        if not contexto:
+            return False
+        historico = _ler_json_seguro(ARQUIVO_APRENDIZADO, [])
+        historico.append({
+            "par": pendente.get("par"),
+            "entrada_em": pendente.get("entrada_em"),
+            "sinal": pendente.get("sinal"),
+            "pontos_call": pendente.get("pontos_call", 0),
+            "pontos_put": pendente.get("pontos_put", 0),
+            "contexto": contexto,
+            "resultado": resultado,
+            "quando": int(time.time()),
+        })
+        historico = historico[-APRENDIZADO_MAX_REGISTROS:]
+        pendente["registrado"] = True
+        pendentes[chave] = pendente
+        _salvar_json_seguro(ARQUIVO_APRENDIZADO, historico)
+        _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
+        return True
+
+
+def resumo_aprendizado_futuro(analise):
+    return {
+        "ativo": APRENDIZADO_ATIVO,
+        "call": analise.get("aprendizado_call", {}),
+        "put": analise.get("aprendizado_put", {}),
+        "observacao": "Ajuste histórico conservador; não representa probabilidade de WIN.",
+    }
 
 
 # ============================================================
@@ -898,7 +1090,7 @@ def descartar_vela_aberta(candles):
     return fechados
 
 
-def analisar_sinal(candles):
+def analisar_sinal(candles, par=None):
 
     # SEMPRE descartar a vela aberta antes de qualquer cálculo.
     candles = descartar_vela_aberta(candles)
@@ -1155,6 +1347,42 @@ def analisar_sinal(candles):
             pontos_put += 2
 
     # --------------------------------------------------------
+    # APRENDIZADO - AJUSTE PEQUENO PARA O PRÓXIMO SINAL
+    # --------------------------------------------------------
+    # O histórico só pode ajustar a decisão futura. Nunca altera
+    # o resultado de uma entrada já encerrada.
+    contexto_call = _contexto_direcao(
+        "CALL",
+        tendencia,
+        rsi,
+        rompimento["direcao"] if rompimento["rompimento"] else "NÃO",
+        "SIM" if pullback["pullback"] else "NÃO",
+        mhi["direcao"],
+        fibo["texto"],
+    )
+    contexto_put = _contexto_direcao(
+        "PUT",
+        tendencia,
+        rsi,
+        rompimento["direcao"] if rompimento["rompimento"] else "NÃO",
+        "SIM" if pullback["pullback"] else "NÃO",
+        mhi["direcao"],
+        fibo["texto"],
+    )
+
+    ajuste_call, aprendizado_call = _ajuste_contexto(contexto_call)
+    ajuste_put, aprendizado_put = _ajuste_contexto(contexto_put)
+
+    pontos_call_base = pontos_call
+    pontos_put_base = pontos_put
+
+    pontos_call += ajuste_call
+    pontos_put += ajuste_put
+
+    pontos_call = max(0, pontos_call)
+    pontos_put = max(0, pontos_put)
+
+    # --------------------------------------------------------
     # SINAL
     # --------------------------------------------------------
 
@@ -1367,6 +1595,30 @@ def analisar_sinal(candles):
 
         "pontos_put":
             pontos_put,
+
+        "pontos_call_base":
+            pontos_call_base,
+
+        "pontos_put_base":
+            pontos_put_base,
+
+        "ajuste_aprendizado_call":
+            ajuste_call,
+
+        "ajuste_aprendizado_put":
+            ajuste_put,
+
+        "contexto_call":
+            contexto_call,
+
+        "contexto_put":
+            contexto_put,
+
+        "aprendizado_call":
+            aprendizado_call,
+
+        "aprendizado_put":
+            aprendizado_put,
 
         "validade":
             "1 minuto",
@@ -1831,6 +2083,16 @@ def resultado_sinal(par):
     m2 = avaliar(2)
     m3 = avaliar(3)
 
+    # Aprende SOMENTE com o M1 encerrado. M2/M3 são métricas extras
+    # da mesma entrada e não devem duplicar o treinamento.
+    aprendizado_registrado = False
+    if m1 in ("WIN", "LOSS"):
+        aprendizado_registrado = registrar_resultado_aprendizado(
+            par,
+            inicio_candle,
+            m1,
+        )
+
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
     # corretora. Sem isso não há como saber se uma divergência
@@ -1849,6 +2111,7 @@ def resultado_sinal(par):
         "candle_de": alvo["from"],
         "candle_ate": alvo["to"],
         "inicio": inicio_candle,
+        "aprendizado_registrado": aprendizado_registrado,
     })
 
 
@@ -1880,13 +2143,16 @@ def candles_par(par):
             )
 
         analise = analisar_sinal(
-            candles
+            candles,
+            par
         )
 
         tempo = round(
             time.time() - inicio,
             2
         )
+
+        registrar_sinal_pendente(par, analise)
 
         return jsonify({
 
@@ -1981,6 +2247,21 @@ def candles_par(par):
 
             "pontos_put":
                 analise.get("pontos_put"),
+
+            "pontos_call_base":
+                analise.get("pontos_call_base"),
+
+            "pontos_put_base":
+                analise.get("pontos_put_base"),
+
+            "ajuste_aprendizado_call":
+                analise.get("ajuste_aprendizado_call"),
+
+            "ajuste_aprendizado_put":
+                analise.get("ajuste_aprendizado_put"),
+
+            "aprendizado":
+                resumo_aprendizado_futuro(analise),
 
             "validade":
                 "1 minuto",
@@ -2323,8 +2604,11 @@ def candles():
                 )
 
                 analise = analisar_sinal(
-                    dados
+                    dados,
+                    par
                 )
+
+                registrar_sinal_pendente(par, analise)
 
                 resultados.append({
 
@@ -2399,6 +2683,21 @@ def candles():
 
                     "pontos_put":
                         analise.get("pontos_put"),
+
+                    "pontos_call_base":
+                        analise.get("pontos_call_base"),
+
+                    "pontos_put_base":
+                        analise.get("pontos_put_base"),
+
+                    "ajuste_aprendizado_call":
+                        analise.get("ajuste_aprendizado_call"),
+
+                    "ajuste_aprendizado_put":
+                        analise.get("ajuste_aprendizado_put"),
+
+                    "aprendizado":
+                        resumo_aprendizado_futuro(analise),
 
                 })
 
