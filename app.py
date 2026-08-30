@@ -1831,6 +1831,10 @@ def resultado_sinal(par):
     m2 = avaliar(2)
     m3 = avaliar(3)
 
+    # Devolve também os preços usados na conferência, para que
+    # o resultado possa ser auditado contra o gráfico da
+    # corretora. Sem isso não há como saber se uma divergência
+    # veio do cálculo ou do momento da entrada.
     return jsonify({
         "par": par,
         "sinal": sinal,
@@ -1839,6 +1843,11 @@ def resultado_sinal(par):
         "m2": m2,
         "m3": m3,
         "abertura": abertura,
+        "fechamento": alvo["close"],
+        "maxima": alvo["high"],
+        "minima": alvo["low"],
+        "candle_de": alvo["from"],
+        "candle_ate": alvo["to"],
         "inicio": inicio_candle,
     })
 
