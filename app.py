@@ -1,8 +1,9 @@
 import os
 import time
+import json
+import sqlite3
 import threading
 import concurrent.futures
-import json
 from datetime import datetime, timezone, timedelta
 
 # Brasil não tem mais horário de verão desde 2019,
@@ -104,6 +105,403 @@ ESTRATEGIA = (
 _iq = None
 _lock = threading.Lock()
 _ultima_conexao = 0
+
+
+# ============================================================
+# BANCO DE HISTÓRICO (SQLite)
+# ============================================================
+#
+# Guarda o CONTEXTO de cada sinal no momento em que ele nasce,
+# e depois grava o resultado quando o candle de entrada fecha.
+#
+# Por que SQLite e não JSON:
+#   - grava sem reescrever o arquivo inteiro
+#   - a chave única impede resultado duplicado
+#   - aguenta duas requisições ao mesmo tempo
+#
+# ATENÇÃO SOBRE PERSISTÊNCIA NO RENDER:
+#   No plano gratuito o disco é efêmero. O histórico sobrevive
+#   a reinícios do worker, mas é APAGADO a cada novo deploy.
+#   Para histórico permanente é preciso anexar um disco no
+#   Render e apontar HISTORICO_DB para dentro dele.
+#   Ex.: HISTORICO_DB=/var/data/historico.db
+# ============================================================
+
+CAMINHO_DB = os.getenv(
+    "HISTORICO_DB",
+    "historico_sinais.db"
+)
+
+_db_lock = threading.Lock()
+
+# Amostra mínima antes de o histórico poder influenciar.
+# Abaixo disso, a estratégia técnica decide sozinha.
+MINIMO_AMOSTRA = 15
+
+# Abaixo desta taxa, com amostra suficiente, o sinal é
+# bloqueado. 53,8% é o ponto de equilíbrio com pagamento
+# de 86%; 45% é uma margem tolerante abaixo disso.
+TAXA_BLOQUEIO = 45.0
+
+# Acima desta taxa a combinação recebe reforço.
+TAXA_REFORCO = 58.0
+
+# Teto do ajuste. O histórico ajuda ou atrapalha, nunca manda.
+AJUSTE_MAXIMO = 2
+
+# Quantos registros recentes entram na conta.
+JANELA_HISTORICO = 200
+
+# Registros mais novos que isto pesam o dobro.
+RECENTES_PESO_DOBRO = 50
+
+
+def _conectar_db():
+    """Abre a conexão do SQLite já configurada.
+
+    check_same_thread=False porque o Flask atende em threads
+    diferentes. O acesso é serializado por _db_lock.
+    """
+
+    conexao = sqlite3.connect(
+        CAMINHO_DB,
+        timeout=10,
+        check_same_thread=False,
+    )
+
+    conexao.row_factory = sqlite3.Row
+
+    return conexao
+
+
+def iniciar_db():
+    """Cria a tabela se ela ainda não existir.
+
+    Nunca levanta exceção: se o disco for somente leitura, o
+    sistema segue funcionando sem aprendizado.
+    """
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            conexao.execute("""
+                CREATE TABLE IF NOT EXISTS historico_sinais (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    par          TEXT    NOT NULL,
+                    entrada_em   INTEGER NOT NULL,
+                    sinal        TEXT    NOT NULL,
+                    pontos_call  INTEGER,
+                    pontos_put   INTEGER,
+                    diferenca    INTEGER,
+                    forca        TEXT,
+                    tendencia    TEXT,
+                    rsi          REAL,
+                    mhi          TEXT,
+                    rompimento   TEXT,
+                    pullback     TEXT,
+                    fibo         TEXT,
+                    pivo         TEXT,
+                    hora         TEXT,
+                    resultado    TEXT,
+                    criado_em    INTEGER,
+                    resolvido_em INTEGER,
+                    UNIQUE (par, entrada_em, sinal)
+                )
+            """)
+
+            conexao.execute("""
+                CREATE INDEX IF NOT EXISTS idx_combinacao
+                ON historico_sinais (par, sinal, forca, resultado)
+            """)
+
+            conexao.commit()
+            conexao.close()
+
+        return True
+
+    except Exception:
+
+        return False
+
+
+_DB_PRONTO = iniciar_db()
+
+
+def faixa_forca(pontos_call, pontos_put):
+    """Agrupa a diferença de pontos em faixas.
+
+    Sem isso cada placar (7x1, 8x2...) viraria uma combinação
+    diferente e nunca juntaria amostra suficiente.
+    """
+
+    try:
+        diferenca = abs(int(pontos_call) - int(pontos_put))
+    except Exception:
+        return "FRACA"
+
+    if diferenca >= 7:
+        return "MUITO_FORTE"
+
+    if diferenca >= 5:
+        return "FORTE"
+
+    if diferenca >= 3:
+        return "MEDIA"
+
+    return "FRACA"
+
+
+def registrar_sinal(par, analise):
+    """Guarda o contexto de um sinal recém-gerado.
+
+    Só grava CALL/PUT: AGUARDANDO não tem o que conferir.
+    A chave única (par, entrada_em, sinal) impede duplicata
+    quando o mesmo candle é buscado mais de uma vez.
+    """
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+
+        sinal = analise.get("sinal")
+        entrada_em = analise.get("entrada_em")
+
+        if sinal not in ("CALL", "PUT") or not entrada_em:
+            return False
+
+        mhi = analise.get("mhi") or {}
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            conexao.execute(
+                """
+                INSERT OR IGNORE INTO historico_sinais (
+                    par, entrada_em, sinal,
+                    pontos_call, pontos_put, diferenca, forca,
+                    tendencia, rsi, mhi, rompimento, pullback,
+                    fibo, pivo, hora, resultado, criado_em
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    NULL, ?
+                )
+                """,
+                (
+                    str(par),
+                    int(entrada_em),
+                    str(sinal),
+                    int(analise.get("pontos_call") or 0),
+                    int(analise.get("pontos_put") or 0),
+                    abs(
+                        int(analise.get("pontos_call") or 0)
+                        - int(analise.get("pontos_put") or 0)
+                    ),
+                    faixa_forca(
+                        analise.get("pontos_call"),
+                        analise.get("pontos_put"),
+                    ),
+                    str(analise.get("tendencia") or ""),
+                    (
+                        float(analise.get("rsi"))
+                        if analise.get("rsi") is not None
+                        else None
+                    ),
+                    str(mhi.get("direcao") or ""),
+                    str(analise.get("rompimento") or ""),
+                    str(analise.get("pullback") or ""),
+                    str(analise.get("fibo") or ""),
+                    str(analise.get("pivo") or ""),
+                    str(analise.get("hora") or ""),
+                    int(time.time()),
+                ),
+            )
+
+            conexao.commit()
+            conexao.close()
+
+        return True
+
+    except Exception:
+
+        # Falha no histórico nunca pode derrubar a rota.
+        return False
+
+
+def registrar_resultado_historico(par, entrada_em, sinal, resultado):
+    """Grava WIN/LOSS no sinal correspondente.
+
+    Regras:
+      - só atualiza linha cujo resultado ainda é NULL, então
+        um resultado antigo NUNCA é modificado;
+      - a linha é achada pela chave exata do sinal, então não
+        há como um resultado cair no sinal errado;
+      - consultar o mesmo resultado várias vezes não duplica.
+    """
+
+    if not _DB_PRONTO:
+        return False
+
+    if resultado not in ("WIN", "LOSS"):
+        return False
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            cursor = conexao.execute(
+                """
+                UPDATE historico_sinais
+                   SET resultado = ?, resolvido_em = ?
+                 WHERE par = ?
+                   AND entrada_em = ?
+                   AND sinal = ?
+                   AND resultado IS NULL
+                """,
+                (
+                    resultado,
+                    int(time.time()),
+                    str(par),
+                    int(entrada_em),
+                    str(sinal),
+                ),
+            )
+
+            conexao.commit()
+            alterou = cursor.rowcount > 0
+            conexao.close()
+
+        return alterou
+
+    except Exception:
+
+        return False
+
+
+def estatistica_combinacao(par, sinal, forca):
+    """Taxa histórica de uma combinação par + direção + força.
+
+    Os registros mais recentes pesam o dobro, para o sistema
+    acompanhar mudanças de mercado sem esquecer o passado.
+    """
+
+    vazio = {
+        "amostra": 0,
+        "wins": 0,
+        "losses": 0,
+        "taxa": None,
+    }
+
+    if not _DB_PRONTO:
+        return vazio
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            linhas = conexao.execute(
+                """
+                SELECT resultado FROM historico_sinais
+                 WHERE par = ? AND sinal = ? AND forca = ?
+                   AND resultado IN ('WIN', 'LOSS')
+              ORDER BY id DESC
+                 LIMIT ?
+                """,
+                (str(par), str(sinal), str(forca),
+                 int(JANELA_HISTORICO)),
+            ).fetchall()
+
+            conexao.close()
+
+    except Exception:
+
+        return vazio
+
+    if not linhas:
+        return vazio
+
+    wins = 0
+    losses = 0
+    peso_win = 0.0
+    peso_total = 0.0
+
+    for posicao, linha in enumerate(linhas):
+
+        # As primeiras linhas são as mais novas (ORDER BY DESC).
+        peso = 2.0 if posicao < RECENTES_PESO_DOBRO else 1.0
+
+        peso_total += peso
+
+        if linha["resultado"] == "WIN":
+            wins += 1
+            peso_win += peso
+        else:
+            losses += 1
+
+    taxa = (peso_win / peso_total) * 100 if peso_total else None
+
+    return {
+        "amostra": wins + losses,
+        "wins": wins,
+        "losses": losses,
+        "taxa": round(taxa, 1) if taxa is not None else None,
+    }
+
+
+def ajuste_historico(par, sinal, pontos_call, pontos_put):
+    """Quanto o histórico reforça ou enfraquece esta direção.
+
+    Devolve o ajuste em pontos (limitado por AJUSTE_MAXIMO),
+    a estatística usada e se a combinação deve ser bloqueada.
+
+    O ajuste NUNCA cria um sinal: ele é aplicado apenas depois
+    que a análise técnica já confirmou uma direção.
+    """
+
+    forca = faixa_forca(pontos_call, pontos_put)
+
+    est = estatistica_combinacao(par, sinal, forca)
+
+    resposta = {
+        "ajuste": 0,
+        "bloquear": False,
+        "forca": forca,
+        "amostra": est["amostra"],
+        "taxa": est["taxa"],
+        "motivo": "SEM_AMOSTRA",
+    }
+
+    if est["amostra"] < MINIMO_AMOSTRA or est["taxa"] is None:
+        return resposta
+
+    taxa = est["taxa"]
+
+    if taxa < TAXA_BLOQUEIO:
+        resposta["ajuste"] = -AJUSTE_MAXIMO
+        resposta["bloquear"] = True
+        resposta["motivo"] = "HISTORICO_RUIM"
+        return resposta
+
+    if taxa < 50.0:
+        resposta["ajuste"] = -1
+        resposta["motivo"] = "HISTORICO_ABAIXO_DA_MEDIA"
+        return resposta
+
+    if taxa >= TAXA_REFORCO:
+        resposta["ajuste"] = AJUSTE_MAXIMO
+        resposta["motivo"] = "HISTORICO_BOM"
+        return resposta
+
+    resposta["motivo"] = "HISTORICO_NEUTRO"
+    return resposta
 
 
 # ============================================================
@@ -361,197 +759,6 @@ def buscar_candles_com_timeout(
             f"demorou mais de {timeout_segundos}s "
             "e foi abandonada."
         )
-
-
-# ============================================================
-# APRENDIZADO DOS RESULTADOS - SOMENTE PARA SINAIS FUTUROS
-# ============================================================
-#
-# O sistema NÃO altera resultados passados e NÃO promete WIN.
-# Ele registra o contexto do sinal, espera o M1 fechar e usa o
-# histórico para ajustar levemente a pontuação dos próximos sinais.
-#
-# O aprendizado é conservador:
-# - exige uma amostra mínima;
-# - usa taxa suavizada para evitar extremos com poucos dados;
-# - limita o ajuste a +/- 2 pontos;
-# - não faz martingale e não força CALL/PUT.
-#
-# Em Render, o disco local pode ser efêmero. O arquivo abaixo é um
-# cache persistente enquanto a instância permanecer disponível.
-# Se o serviço reiniciar, o sistema volta a aprender do zero.
-# ============================================================
-
-APRENDIZADO_ATIVO = True
-APRENDIZADO_MINIMO = 8
-APRENDIZADO_MAX_REGISTROS = 2000
-APRENDIZADO_MAX_AJUSTE = 2
-
-ARQUIVO_APRENDIZADO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "historico_aprendizado.json",
-)
-
-ARQUIVO_PENDENTES = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "sinais_pendentes.json",
-)
-
-_lock_aprendizado = threading.Lock()
-
-
-def _ler_json_seguro(caminho, padrao):
-    try:
-        if not os.path.isfile(caminho):
-            return padrao.copy() if isinstance(padrao, dict) else list(padrao)
-        with open(caminho, "r", encoding="utf-8") as arquivo:
-            dados = json.load(arquivo)
-        return dados if isinstance(dados, type(padrao)) else padrao.copy() if isinstance(padrao, dict) else list(padrao)
-    except Exception:
-        return padrao.copy() if isinstance(padrao, dict) else list(padrao)
-
-
-def _salvar_json_seguro(caminho, dados):
-    temporario = caminho + ".tmp"
-    try:
-        with open(temporario, "w", encoding="utf-8") as arquivo:
-            json.dump(dados, arquivo, ensure_ascii=False, separators=(",", ":"))
-        os.replace(temporario, caminho)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(temporario):
-                os.remove(temporario)
-        except Exception:
-            pass
-        return False
-
-
-def _faixa_rsi(rsi):
-    if rsi is None:
-        return "SEM_RSI"
-    try:
-        valor = float(rsi)
-    except (TypeError, ValueError):
-        return "SEM_RSI"
-    if valor < 30:
-        return "RSI_<30"
-    if valor < 45:
-        return "RSI_30_45"
-    if valor < 55:
-        return "RSI_45_55"
-    if valor < 70:
-        return "RSI_55_70"
-    return "RSI_>=70"
-
-
-def _contexto_direcao(direcao, tendencia, rsi, rompimento, pullback, mhi, fibo):
-    return "|".join([
-        str(direcao),
-        str(tendencia),
-        _faixa_rsi(rsi),
-        str(rompimento),
-        str(pullback),
-        str(mhi),
-        "FIBO_ZONA" if str(fibo).startswith("ZONA OURO") else "FIBO_FORA",
-    ])
-
-
-def _estatistica_contexto(contexto):
-    historico = _ler_json_seguro(ARQUIVO_APRENDIZADO, [])
-    registros = [
-        item for item in historico
-        if isinstance(item, dict) and item.get("contexto") == contexto
-    ]
-    wins = sum(1 for item in registros if item.get("resultado") == "WIN")
-    losses = sum(1 for item in registros if item.get("resultado") == "LOSS")
-    total = wins + losses
-    taxa = ((wins + 3.0) / (total + 6.0) * 100.0) if total else None
-    return total, wins, losses, taxa
-
-
-def _ajuste_contexto(contexto):
-    if not APRENDIZADO_ATIVO:
-        return 0, {"amostra": 0, "wins": 0, "loss": 0, "taxa": None, "ajuste": 0}
-    total, wins, losses, taxa = _estatistica_contexto(contexto)
-    if total < APRENDIZADO_MINIMO or taxa is None:
-        return 0, {"amostra": total, "wins": wins, "loss": losses, "taxa": taxa, "ajuste": 0}
-    ajuste = round((taxa - 50.0) / 10.0)
-    ajuste = max(-APRENDIZADO_MAX_AJUSTE, min(APRENDIZADO_MAX_AJUSTE, ajuste))
-    return ajuste, {
-        "amostra": total,
-        "wins": wins,
-        "loss": losses,
-        "taxa": round(taxa, 2),
-        "ajuste": ajuste,
-    }
-
-
-def registrar_sinal_pendente(par, analise):
-    if not analise or analise.get("sinal") not in ("CALL", "PUT"):
-        return
-    entrada_em = analise.get("entrada_em")
-    if not entrada_em:
-        return
-    chave = f"{str(par).upper()}|{int(entrada_em)}"
-    registro = {
-        "par": str(par).upper(),
-        "entrada_em": int(entrada_em),
-        "sinal": analise.get("sinal"),
-        "pontos_call": analise.get("pontos_call", 0),
-        "pontos_put": analise.get("pontos_put", 0),
-        "contexto_call": analise.get("contexto_call"),
-        "contexto_put": analise.get("contexto_put"),
-        "criado_em": int(time.time()),
-        "registrado": False,
-    }
-    with _lock_aprendizado:
-        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
-        pendentes[chave] = registro
-        if len(pendentes) > APRENDIZADO_MAX_REGISTROS:
-            ordenados = sorted(pendentes.items(), key=lambda par_item: par_item[1].get("criado_em", 0))
-            pendentes = dict(ordenados[-APRENDIZADO_MAX_REGISTROS:])
-        _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
-
-
-def registrar_resultado_aprendizado(par, inicio_candle, resultado):
-    if resultado not in ("WIN", "LOSS"):
-        return False
-    chave = f"{str(par).upper()}|{int(inicio_candle)}"
-    with _lock_aprendizado:
-        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
-        pendente = pendentes.get(chave)
-        if not isinstance(pendente, dict) or pendente.get("registrado"):
-            return False
-        contexto = pendente.get("contexto_call") if pendente.get("sinal") == "CALL" else pendente.get("contexto_put")
-        if not contexto:
-            return False
-        historico = _ler_json_seguro(ARQUIVO_APRENDIZADO, [])
-        historico.append({
-            "par": pendente.get("par"),
-            "entrada_em": pendente.get("entrada_em"),
-            "sinal": pendente.get("sinal"),
-            "pontos_call": pendente.get("pontos_call", 0),
-            "pontos_put": pendente.get("pontos_put", 0),
-            "contexto": contexto,
-            "resultado": resultado,
-            "quando": int(time.time()),
-        })
-        historico = historico[-APRENDIZADO_MAX_REGISTROS:]
-        pendente["registrado"] = True
-        pendentes[chave] = pendente
-        _salvar_json_seguro(ARQUIVO_APRENDIZADO, historico)
-        _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
-        return True
-
-
-def resumo_aprendizado_futuro(analise):
-    return {
-        "ativo": APRENDIZADO_ATIVO,
-        "call": analise.get("aprendizado_call", {}),
-        "put": analise.get("aprendizado_put", {}),
-        "observacao": "Ajuste histórico conservador; não representa probabilidade de WIN.",
-    }
 
 
 # ============================================================
@@ -1091,6 +1298,12 @@ def descartar_vela_aberta(candles):
 
 
 def analisar_sinal(candles, par=None):
+    """Analisa os candles e devolve o sinal.
+
+    O parâmetro `par` é opcional e serve só para consultar o
+    histórico daquela combinação. Sem ele, a função se comporta
+    exatamente como antes, sem aprendizado.
+    """
 
     # SEMPRE descartar a vela aberta antes de qualquer cálculo.
     candles = descartar_vela_aberta(candles)
@@ -1127,6 +1340,12 @@ def analisar_sinal(candles, par=None):
             },
             "pontos_call": 0,
             "pontos_put": 0,
+            "ajuste_historico_call": 0,
+            "ajuste_historico_put": 0,
+            "taxa_historica": None,
+            "amostra_historica": 0,
+            "qualidade_sinal": "AGUARDANDO",
+            "motivo_filtro": "POUCOS_DADOS",
             "validade": "1 minuto",
         }
 
@@ -1179,9 +1398,14 @@ def analisar_sinal(candles, par=None):
             },
             "pontos_call": 0,
             "pontos_put": 0,
+            "ajuste_historico_call": 0,
+            "ajuste_historico_put": 0,
+            "taxa_historica": None,
+            "amostra_historica": 0,
             "confirmacoes_call": [],
             "confirmacoes_put": [],
             "qualidade_sinal": "AGUARDANDO",
+            "motivo_filtro": "MERCADO_FECHADO",
             "validade": "1 minuto",
             "estrategia": ESTRATEGIA,
             "aviso": (
@@ -1347,42 +1571,6 @@ def analisar_sinal(candles, par=None):
             pontos_put += 2
 
     # --------------------------------------------------------
-    # APRENDIZADO - AJUSTE PEQUENO PARA O PRÓXIMO SINAL
-    # --------------------------------------------------------
-    # O histórico só pode ajustar a decisão futura. Nunca altera
-    # o resultado de uma entrada já encerrada.
-    contexto_call = _contexto_direcao(
-        "CALL",
-        tendencia,
-        rsi,
-        rompimento["direcao"] if rompimento["rompimento"] else "NÃO",
-        "SIM" if pullback["pullback"] else "NÃO",
-        mhi["direcao"],
-        fibo["texto"],
-    )
-    contexto_put = _contexto_direcao(
-        "PUT",
-        tendencia,
-        rsi,
-        rompimento["direcao"] if rompimento["rompimento"] else "NÃO",
-        "SIM" if pullback["pullback"] else "NÃO",
-        mhi["direcao"],
-        fibo["texto"],
-    )
-
-    ajuste_call, aprendizado_call = _ajuste_contexto(contexto_call)
-    ajuste_put, aprendizado_put = _ajuste_contexto(contexto_put)
-
-    pontos_call_base = pontos_call
-    pontos_put_base = pontos_put
-
-    pontos_call += ajuste_call
-    pontos_put += ajuste_put
-
-    pontos_call = max(0, pontos_call)
-    pontos_put = max(0, pontos_put)
-
-    # --------------------------------------------------------
     # SINAL
     # --------------------------------------------------------
 
@@ -1407,35 +1595,138 @@ def analisar_sinal(candles, par=None):
     # folgada entre os indicadores.
     DIFERENCA_MINIMA = 5
 
+    # --------------------------------------------------------
+    # DECISÃO TÉCNICA (base, sem histórico)
+    # --------------------------------------------------------
+    #
+    # O histórico NÃO participa desta etapa. Ele só entra
+    # depois, para reforçar ou enfraquecer uma direção que a
+    # análise técnica já confirmou. Assim o aprendizado nunca
+    # cria um CALL ou PUT sozinho.
+
+    direcao_base = None
+
     if (
         pontos_call >= PONTUACAO_MINIMA
         and pontos_call - pontos_put >= DIFERENCA_MINIMA
     ):
-
-        sinal = "CALL"
-
-        status = (
-            "CONFIRMAÇÃO DE ALTA"
-        )
-
-        # NÃO é probabilidade de acerto. É apenas a soma
-        # técnica dos indicadores que concordaram.
-        confianca = pontos_call
+        direcao_base = "CALL"
 
     elif (
         pontos_put >= PONTUACAO_MINIMA
         and pontos_put - pontos_call >= DIFERENCA_MINIMA
     ):
+        direcao_base = "PUT"
 
-        sinal = "PUT"
+    # --------------------------------------------------------
+    # AJUSTE PELO HISTÓRICO
+    # --------------------------------------------------------
 
-        status = (
-            "CONFIRMAÇÃO DE BAIXA"
+    ajuste_call = 0
+    ajuste_put = 0
+    taxa_historica = None
+    amostra_historica = 0
+    motivo_filtro = "SEM_CONFIRMACAO_TECNICA"
+
+    if direcao_base and par:
+
+        try:
+            info = ajuste_historico(
+                par,
+                direcao_base,
+                pontos_call,
+                pontos_put,
+            )
+        except Exception:
+            info = {
+                "ajuste": 0,
+                "bloquear": False,
+                "amostra": 0,
+                "taxa": None,
+                "motivo": "ERRO_HISTORICO",
+            }
+
+        taxa_historica = info.get("taxa")
+        amostra_historica = info.get("amostra", 0)
+        motivo_filtro = info.get("motivo", "SEM_AMOSTRA")
+
+        if direcao_base == "CALL":
+            ajuste_call = info.get("ajuste", 0)
+        else:
+            ajuste_put = info.get("ajuste", 0)
+
+        if info.get("bloquear"):
+
+            # Combinação com histórico ruim e amostra
+            # suficiente: melhor não operar do que operar mal.
+            direcao_base = None
+            status = "AGUARDE — HISTÓRICO DESFAVORÁVEL"
+            motivo_filtro = "BLOQUEADO_HISTORICO_RUIM"
+
+    # Pontuação final, já com o ajuste aplicado.
+    pontos_call_final = max(0, pontos_call + ajuste_call)
+    pontos_put_final = max(0, pontos_put + ajuste_put)
+
+    # --------------------------------------------------------
+    # CONFIRMAÇÃO FINAL
+    # --------------------------------------------------------
+
+    if direcao_base == "CALL":
+
+        # O ajuste negativo pode derrubar um sinal fraco.
+        if (
+            pontos_call_final >= PONTUACAO_MINIMA
+            and pontos_call_final - pontos_put_final
+            >= DIFERENCA_MINIMA
+        ):
+
+            sinal = "CALL"
+            status = "CONFIRMAÇÃO DE ALTA"
+
+            # NÃO é probabilidade de acerto. É apenas a soma
+            # técnica dos indicadores que concordaram.
+            confianca = pontos_call_final
+
+        else:
+            status = "AGUARDE — ENFRAQUECIDO PELO HISTÓRICO"
+            motivo_filtro = "ENFRAQUECIDO_PELO_HISTORICO"
+
+    elif direcao_base == "PUT":
+
+        if (
+            pontos_put_final >= PONTUACAO_MINIMA
+            and pontos_put_final - pontos_call_final
+            >= DIFERENCA_MINIMA
+        ):
+
+            sinal = "PUT"
+            status = "CONFIRMAÇÃO DE BAIXA"
+
+            confianca = pontos_put_final
+
+        else:
+            status = "AGUARDE — ENFRAQUECIDO PELO HISTÓRICO"
+            motivo_filtro = "ENFRAQUECIDO_PELO_HISTORICO"
+
+    if sinal in ("CALL", "PUT"):
+        motivo_filtro = "APROVADO"
+
+    # Classificação de qualidade — descritiva, não é promessa.
+    if sinal in ("CALL", "PUT"):
+
+        diferenca_final = abs(
+            pontos_call_final - pontos_put_final
         )
 
-        # NÃO é probabilidade de acerto. É apenas a soma
-        # técnica dos indicadores que concordaram.
-        confianca = pontos_put
+        if diferenca_final >= 7:
+            qualidade_sinal = "ALTA"
+        elif diferenca_final >= 5:
+            qualidade_sinal = "MEDIA"
+        else:
+            qualidade_sinal = "BAIXA"
+
+    else:
+        qualidade_sinal = "AGUARDANDO"
 
     # --------------------------------------------------------
     # MM
@@ -1591,34 +1882,37 @@ def analisar_sinal(candles, par=None):
         "fibo_nivel": fibo["nivel"],
 
         "pontos_call":
-            pontos_call,
+            pontos_call_final,
 
         "pontos_put":
-            pontos_put,
+            pontos_put_final,
 
+        # Pontuação técnica pura, antes do histórico.
         "pontos_call_base":
-            pontos_call_base,
+            pontos_call,
 
         "pontos_put_base":
-            pontos_put_base,
+            pontos_put,
 
-        "ajuste_aprendizado_call":
+        "ajuste_historico_call":
             ajuste_call,
 
-        "ajuste_aprendizado_put":
+        "ajuste_historico_put":
             ajuste_put,
 
-        "contexto_call":
-            contexto_call,
+        # Frequência histórica desta combinação. NÃO é
+        # probabilidade garantida do próximo sinal.
+        "taxa_historica":
+            taxa_historica,
 
-        "contexto_put":
-            contexto_put,
+        "amostra_historica":
+            amostra_historica,
 
-        "aprendizado_call":
-            aprendizado_call,
+        "qualidade_sinal":
+            qualidade_sinal,
 
-        "aprendizado_put":
-            aprendizado_put,
+        "motivo_filtro":
+            motivo_filtro,
 
         "validade":
             "1 minuto",
@@ -1940,6 +2234,135 @@ def listar_ativos():
 
 
 # ============================================================
+# HISTÓRICO E APRENDIZADO
+# ============================================================
+#
+# Mostra o que o sistema aprendeu até agora. Útil para conferir
+# se o filtro está bloqueando alguma combinação e por quê.
+#
+# Uso:  /historico              -> resumo por combinação
+#       /historico?par=EURUSD-OTC
+# ============================================================
+
+@app.get("/historico")
+def ver_historico():
+
+    if not _DB_PRONTO:
+
+        return jsonify({
+            "ok": False,
+            "erro": (
+                "Banco de histórico indisponível "
+                "(disco somente leitura?)."
+            ),
+        }), 200
+
+    par_filtro = (
+        request.args.get("par", "")
+        .strip()
+        .upper()
+    )
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            if par_filtro:
+                linhas = conexao.execute(
+                    """
+                    SELECT par, sinal, forca,
+                           COUNT(*) AS total,
+                           SUM(resultado = 'WIN') AS wins,
+                           SUM(resultado = 'LOSS') AS losses
+                      FROM historico_sinais
+                     WHERE resultado IN ('WIN','LOSS')
+                       AND par = ?
+                  GROUP BY par, sinal, forca
+                  ORDER BY total DESC
+                    """,
+                    (par_filtro,),
+                ).fetchall()
+            else:
+                linhas = conexao.execute(
+                    """
+                    SELECT par, sinal, forca,
+                           COUNT(*) AS total,
+                           SUM(resultado = 'WIN') AS wins,
+                           SUM(resultado = 'LOSS') AS losses
+                      FROM historico_sinais
+                     WHERE resultado IN ('WIN','LOSS')
+                  GROUP BY par, sinal, forca
+                  ORDER BY total DESC
+                    """
+                ).fetchall()
+
+            pendentes = conexao.execute(
+                """
+                SELECT COUNT(*) AS n FROM historico_sinais
+                 WHERE resultado IS NULL
+                """
+            ).fetchone()
+
+            conexao.close()
+
+    except Exception as erro:
+
+        return jsonify({
+            "ok": False,
+            "erro": str(erro)[:200],
+        }), 200
+
+    combinacoes = []
+
+    for linha in linhas:
+
+        total = linha["total"] or 0
+        wins = linha["wins"] or 0
+
+        taxa = round((wins / total) * 100, 1) if total else None
+
+        combinacoes.append({
+            "par": linha["par"],
+            "sinal": linha["sinal"],
+            "forca": linha["forca"],
+            "amostra": total,
+            "wins": wins,
+            "losses": linha["losses"] or 0,
+            "taxa": taxa,
+            "influencia": (
+                "sem amostra suficiente"
+                if total < MINIMO_AMOSTRA
+                else "bloqueia"
+                if taxa is not None and taxa < TAXA_BLOQUEIO
+                else "reforça"
+                if taxa is not None and taxa >= TAXA_REFORCO
+                else "neutra"
+            ),
+        })
+
+    return jsonify({
+        "ok": True,
+        "aviso": (
+            "Taxa histórica é frequência do passado, "
+            "não probabilidade garantida do próximo sinal."
+        ),
+        "regras": {
+            "minimo_amostra": MINIMO_AMOSTRA,
+            "taxa_bloqueio": TAXA_BLOQUEIO,
+            "taxa_reforco": TAXA_REFORCO,
+            "ajuste_maximo": AJUSTE_MAXIMO,
+            "janela": JANELA_HISTORICO,
+        },
+        "aguardando_resultado": (
+            pendentes["n"] if pendentes else 0
+        ),
+        "combinacoes": combinacoes,
+    })
+
+
+# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
@@ -2083,15 +2506,25 @@ def resultado_sinal(par):
     m2 = avaliar(2)
     m3 = avaliar(3)
 
-    # Aprende SOMENTE com o M1 encerrado. M2/M3 são métricas extras
-    # da mesma entrada e não devem duplicar o treinamento.
-    aprendizado_registrado = False
+    # Grava o resultado no histórico.
+    #
+    # O UPDATE só atinge a linha daquele par + entrada + sinal,
+    # e só se ela ainda estiver sem resultado. Por isso:
+    #   - consultar várias vezes não duplica;
+    #   - um resultado antigo nunca é alterado;
+    #   - o resultado não cai no sinal errado.
+    gravado = False
+
     if m1 in ("WIN", "LOSS"):
-        aprendizado_registrado = registrar_resultado_aprendizado(
-            par,
-            inicio_candle,
-            m1,
-        )
+        try:
+            gravado = registrar_resultado_historico(
+                par,
+                inicio_candle,
+                sinal,
+                m1,
+            )
+        except Exception:
+            gravado = False
 
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
@@ -2111,7 +2544,7 @@ def resultado_sinal(par):
         "candle_de": alvo["from"],
         "candle_ate": alvo["to"],
         "inicio": inicio_candle,
-        "aprendizado_registrado": aprendizado_registrado,
+        "historico_gravado": gravado,
     })
 
 
@@ -2144,15 +2577,18 @@ def candles_par(par):
 
         analise = analisar_sinal(
             candles,
-            par
+            par=par
         )
+
+        try:
+            registrar_sinal(par, analise)
+        except Exception:
+            pass
 
         tempo = round(
             time.time() - inicio,
             2
         )
-
-        registrar_sinal_pendente(par, analise)
 
         return jsonify({
 
@@ -2248,20 +2684,23 @@ def candles_par(par):
             "pontos_put":
                 analise.get("pontos_put"),
 
-            "pontos_call_base":
-                analise.get("pontos_call_base"),
+            "ajuste_historico_call":
+                analise.get("ajuste_historico_call", 0),
 
-            "pontos_put_base":
-                analise.get("pontos_put_base"),
+            "ajuste_historico_put":
+                analise.get("ajuste_historico_put", 0),
 
-            "ajuste_aprendizado_call":
-                analise.get("ajuste_aprendizado_call"),
+            "taxa_historica":
+                analise.get("taxa_historica"),
 
-            "ajuste_aprendizado_put":
-                analise.get("ajuste_aprendizado_put"),
+            "amostra_historica":
+                analise.get("amostra_historica", 0),
 
-            "aprendizado":
-                resumo_aprendizado_futuro(analise),
+            "qualidade_sinal":
+                analise.get("qualidade_sinal", "AGUARDANDO"),
+
+            "motivo_filtro":
+                analise.get("motivo_filtro"),
 
             "validade":
                 "1 minuto",
@@ -2605,10 +3044,15 @@ def candles():
 
                 analise = analisar_sinal(
                     dados,
-                    par
+                    par=par
                 )
 
-                registrar_sinal_pendente(par, analise)
+                # Guarda o contexto do sinal para o histórico.
+                # Falhar aqui não pode derrubar a resposta.
+                try:
+                    registrar_sinal(par, analise)
+                except Exception:
+                    pass
 
                 resultados.append({
 
@@ -2684,20 +3128,23 @@ def candles():
                     "pontos_put":
                         analise.get("pontos_put"),
 
-                    "pontos_call_base":
-                        analise.get("pontos_call_base"),
+                    "ajuste_historico_call":
+                        analise.get("ajuste_historico_call", 0),
 
-                    "pontos_put_base":
-                        analise.get("pontos_put_base"),
+                    "ajuste_historico_put":
+                        analise.get("ajuste_historico_put", 0),
 
-                    "ajuste_aprendizado_call":
-                        analise.get("ajuste_aprendizado_call"),
+                    "taxa_historica":
+                        analise.get("taxa_historica"),
 
-                    "ajuste_aprendizado_put":
-                        analise.get("ajuste_aprendizado_put"),
+                    "amostra_historica":
+                        analise.get("amostra_historica", 0),
 
-                    "aprendizado":
-                        resumo_aprendizado_futuro(analise),
+                    "qualidade_sinal":
+                        analise.get("qualidade_sinal", "AGUARDANDO"),
+
+                    "motivo_filtro":
+                        analise.get("motivo_filtro"),
 
                 })
 
