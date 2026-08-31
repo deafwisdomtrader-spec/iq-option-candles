@@ -3,6 +3,7 @@ import time
 import threading
 import concurrent.futures
 import json
+import requests
 from datetime import datetime, timezone, timedelta
 
 # Brasil não tem mais horário de verão desde 2019,
