@@ -1902,7 +1902,7 @@ TELEGRAM_RESULTADOS_ATIVOS = (
 TELEGRAM_INTERVALO_RESULTADOS = 10
 
 
-def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
+def telegram_formatar_resultado(pendente, resultado, etapa=0):
     par = pendente.get("par", "--")
     sinal = str(pendente.get("sinal", "--")).upper()
     entrada_em = int(pendente.get("entrada_em", 0))
@@ -1916,40 +1916,48 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
         else "--:--"
     )
 
+    try:
+        etapa = int(etapa)
+    except (TypeError, ValueError):
+        etapa = 0
+
     if resultado == "WIN":
-        titulo = "WIN"
         emoji = "✅"
+        if etapa == 0:
+            titulo = "WIN"
+            rodape = "🔥 Entrada vencedora."
+        else:
+            titulo = f"WIN {etapa}G"
+            rodape = f"🔥 Recuperado no gale {etapa}."
     elif resultado == "LOSS":
-        titulo = "LOSS"
         emoji = "❌"
-    else:
-        titulo = "EMPATE"
-        emoji = "⚪"
-
-    # Abertura, fechamento e variação NÃO entram mais na
-    # mensagem — o aluno não usava esses números. Eles
-    # continuam gravados no arquivo de pendentes e aparecem em
-    # /telegram/pendentes, para conferir contra o gráfico da
-    # corretora se algum dia precisar auditar um resultado.
-
-    if resultado == "WIN":
-        rodape = "🔥 Entrada vencedora."
-    elif resultado == "LOSS":
-        # A orientação de gale vira UMA LINHA aqui, em vez de
-        # uma mensagem separada. Mensagem separada de G1 e G2
-        # enchia o grupo e atrapalhava a leitura.
+        titulo = "LOSS"
         rodape = (
-            "📉 Entrada encerrada.\n"
-            "🔁 Martingale: até G2 (opcional)"
+            f"📉 Encerrado após G{TELEGRAM_MAX_GALES}.\n"
+            "Sequência finalizada."
         )
     else:
+        emoji = "⚪"
+        titulo = "EMPATE"
         rodape = "➖ Vela fechou no mesmo preço."
+
+    # Linha da etapa: só aparece quando houve gale, para não
+    # poluir o resultado simples.
+    if etapa > 0 and resultado == "WIN":
+        linha_etapa = f"🔁 Recuperado em  <b>G{etapa}</b>\n"
+    elif resultado == "LOSS":
+        linha_etapa = (
+            f"🔁 Etapas  <b>entrada + G1 + G{TELEGRAM_MAX_GALES}</b>\n"
+        )
+    else:
+        linha_etapa = ""
 
     return (
         f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
         "─────────────\n"
         f"📌 Sinal  <b>{sinal}</b> · M1\n"
-        f"⏰ Entrada  <b>{hora}</b>\n\n"
+        f"⏰ Entrada  <b>{hora}</b>\n"
+        f"{linha_etapa}\n"
         f"{rodape}"
     )
 
@@ -1957,8 +1965,7 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
 def telegram_enviar_resultado_pendente(
     pendente,
     resultado,
-    abertura,
-    fechamento,
+    etapa=0,
 ):
     """
     Animação do resultado no próprio Telegram.
@@ -1992,8 +1999,7 @@ def telegram_enviar_resultado_pendente(
     final = telegram_formatar_resultado(
         pendente,
         resultado,
-        abertura,
-        fechamento,
+        etapa,
     )
 
     try:
@@ -2104,14 +2110,54 @@ def telegram_enviar_resultado_pendente(
         return False
 
 
+def _resultado_da_vela(vela, sinal):
+    """Diz se uma vela deu WIN, LOSS ou EMPATE para o sinal."""
+    abertura = vela.get("open")
+    fechamento = vela.get("close")
+
+    if abertura is None or fechamento is None:
+        return None
+
+    if fechamento > abertura:
+        direcao = "ALTA"
+    elif fechamento < abertura:
+        direcao = "BAIXA"
+    else:
+        return "EMPATE"
+
+    if sinal == "CALL" and direcao == "ALTA":
+        return "WIN"
+
+    if sinal == "PUT" and direcao == "BAIXA":
+        return "WIN"
+
+    return "LOSS"
+
+
 def conferir_resultado_pendente_telegram(par, pendente, iq):
+    """Percorre a sequência ENTRADA -> G1 -> G2 e só devolve
+    resultado quando ela FECHA.
+
+    Regra pedida: uma vela perdida sozinha não vira LOSS na
+    hora. O robô espera o gale.
+
+        entrada WIN            -> WIN
+        entrada LOSS + G1 WIN  -> WIN 1G
+        entrada LOSS + G1 LOSS + G2 WIN -> WIN 2G
+        as três perdidas       -> LOSS
+        vela sem movimento     -> EMPATE (encerra, não vai a gale;
+                                 não houve perda a recuperar)
+
+    Enquanto a sequência não fecha, devolve None e o monitor
+    tenta de novo no ciclo seguinte.
+    """
     entrada_em = int(pendente.get("entrada_em", 0))
     sinal = str(pendente.get("sinal", "")).upper()
 
     if not entrada_em or sinal not in ("CALL", "PUT"):
         return None
 
-    # Só confere depois do fechamento do M1.
+    # Nem a primeira vela fechou ainda.
     if time.time() < entrada_em + TIMEFRAME:
         return None
 
@@ -2128,41 +2174,49 @@ def conferir_resultado_pendente_telegram(par, pendente, iq):
         if c.get("from") is not None
     }
 
-    alvo = por_inicio.get(entrada_em)
+    # Guardado à parte: é o resultado da ENTRADA, sem gale.
+    # É ele que alimenta o aprendizado (ver comentário abaixo).
+    resultado_entrada = None
 
-    if not alvo:
-        return None
+    for etapa in range(0, TELEGRAM_MAX_GALES + 1):
 
-    # Garante que o candle realmente terminou.
-    if time.time() < entrada_em + TIMEFRAME:
-        return None
+        inicio_vela = entrada_em + (etapa * TIMEFRAME)
 
-    abertura = alvo.get("open")
-    fechamento = alvo.get("close")
+        # Esta etapa ainda não fechou: espera o próximo ciclo.
+        if time.time() < inicio_vela + TIMEFRAME:
+            return None
 
-    if abertura is None or fechamento is None:
-        return None
+        vela = por_inicio.get(inicio_vela)
 
-    if fechamento > abertura:
-        direcao = "ALTA"
-    elif fechamento < abertura:
-        direcao = "BAIXA"
-    else:
-        direcao = "DOJI"
+        if not vela:
+            return None
 
-    if direcao == "DOJI":
-        resultado = "EMPATE"
-    elif sinal == "CALL" and direcao == "ALTA":
-        resultado = "WIN"
-    elif sinal == "PUT" and direcao == "BAIXA":
-        resultado = "WIN"
-    else:
-        resultado = "LOSS"
+        resultado = _resultado_da_vela(vela, sinal)
 
+        if resultado is None:
+            return None
+
+        if etapa == 0:
+            resultado_entrada = resultado
+
+        if resultado in ("WIN", "EMPATE"):
+            return {
+                "resultado": resultado,
+                "etapa": etapa,
+                "resultado_entrada": resultado_entrada,
+                "abertura": vela.get("open"),
+                "fechamento": vela.get("close"),
+            }
+
+        # LOSS: segue para a próxima etapa do gale.
+
+    # Perdeu entrada, G1 e G2.
     return {
-        "resultado": resultado,
-        "abertura": abertura,
-        "fechamento": fechamento,
+        "resultado": "LOSS",
+        "etapa": TELEGRAM_MAX_GALES,
+        "resultado_entrada": resultado_entrada,
+        "abertura": None,
+        "fechamento": None,
     }
 
 
@@ -2209,7 +2263,7 @@ def telegram_processar_resultados():
 
             # Depois de alguns minutos, ainda pode ser conferido,
             # mas não processa sinais muito antigos.
-            if agora - entrada_em > 15 * 60:
+            if agora - entrada_em > 20 * 60:
                 continue
 
             candidatos.append((chave, pendente))
@@ -2236,29 +2290,31 @@ def telegram_processar_resultados():
                 enviado = telegram_enviar_resultado_pendente(
                     pendente,
                     resultado["resultado"],
-                    resultado["abertura"],
-                    resultado["fechamento"],
+                    resultado.get("etapa", 0),
                 )
 
                 if enviado:
-                    # Aprendizado usa somente WIN/LOSS.
-                    if resultado["resultado"] in ("WIN", "LOSS"):
+                    # ------------------------------------------
+                    # APRENDIZADO USA A VELA DA ENTRADA, NÃO O GALE
+                    # ------------------------------------------
+                    # Um "WIN 2G" foi, na origem, uma leitura
+                    # ERRADA que só se salvou dobrando aposta.
+                    # Se isso entrasse como WIN, o sistema
+                    # aprenderia que um contexto perdedor é bom
+                    # e passaria a repetir o erro.
+                    #
+                    # O grupo vê o resultado com gale; a
+                    # estatística guarda a verdade da entrada.
+                    # ------------------------------------------
+                    resultado_entrada = resultado.get(
+                        "resultado_entrada"
+                    )
+
+                    if resultado_entrada in ("WIN", "LOSS"):
                         registrar_resultado_aprendizado(
                             pendente.get("par"),
                             int(pendente.get("entrada_em")),
-                            resultado["resultado"],
-                        )
-
-                    # Martingale SOMENTE depois do resultado.
-                    # WIN encerra; LOSS mostra G1/G2 disponível.
-                    if resultado["resultado"] == "LOSS":
-                        telegram_registrar_loss_e_mostrar_gale(
-                            pendente
-                        )
-                    elif resultado["resultado"] == "WIN":
-                        telegram_encerrar_martingale(
-                            pendente,
-                            "WIN",
+                            resultado_entrada,
                         )
 
                     with _lock_aprendizado:
@@ -2270,10 +2326,12 @@ def telegram_processar_resultados():
 
                         if isinstance(item, dict):
                             item["resultado"] = resultado["resultado"]
+                            item["etapa_gale"] = resultado.get("etapa", 0)
+                            item["resultado_entrada"] = resultado.get(
+                                "resultado_entrada"
+                            )
                             item["resultado_enviado"] = True
                             item["resultado_enviado_em"] = int(time.time())
-                            item["abertura_resultado"] = resultado["abertura"]
-                            item["fechamento_resultado"] = resultado["fechamento"]
                             atuais[chave] = item
 
                             _salvar_json_seguro(
@@ -2360,86 +2418,20 @@ iniciar_monitor_resultados_telegram()
 # AVISO PARA O ALUNO: o gale dobra a exposição justamente no
 # momento em que a leitura já errou. É etapa opcional.
 
+# A sequência de gale é resolvida dentro de
+# conferir_resultado_pendente_telegram(): ela percorre
+# entrada -> G1 -> G2 e só anuncia quando fecha. Por isso o
+# controle de sequência em memória que existia aqui foi
+# removido — era estado duplicado, e estado duplicado
+# desencontra.
+
 TELEGRAM_MARTINGALE_ATIVO = (
     os.getenv("TELEGRAM_MARTINGALE_ATIVO", "1").strip().lower()
     not in ("0", "false", "nao", "não", "off")
 )
 
+# Quantos gales o robô acompanha antes de fechar como LOSS.
 TELEGRAM_MAX_GALES = 2
-_martingale_lock = threading.Lock()
-_martingale_sequencias = {}
-
-
-def telegram_martingale_key(pendente):
-    return (
-        f"{str(pendente.get('par', '')).upper()}|"
-        f"{int(pendente.get('entrada_em', 0) or 0)}"
-    )
-
-
-def telegram_registrar_loss_e_mostrar_gale(pendente):
-    """Apenas CONTA a etapa da sequência. Não envia mensagem.
-
-    Antes, cada LOSS disparava uma mensagem separada "G1
-    DISPONÍVEL" / "G2 DISPONÍVEL" no grupo. Duas mensagens
-    extras por sequência, no meio dos sinais, atrapalhavam a
-    leitura no celular.
-
-    Agora a orientação aparece como UMA LINHA no rodapé da
-    própria mensagem de LOSS. A contagem continua aqui porque
-    é ela que encerra a sequência depois do G2.
-    """
-    if not TELEGRAM_MARTINGALE_ATIVO:
-        return
-
-    chave = telegram_martingale_key(pendente)
-
-    with _martingale_lock:
-        sequencia = _martingale_sequencias.get(
-            chave,
-            {
-                "gale_atual": 0,
-                "finalizada": False,
-            },
-        )
-
-        if sequencia["finalizada"]:
-            return
-
-        proximo_gale = int(sequencia["gale_atual"]) + 1
-
-        if proximo_gale > TELEGRAM_MAX_GALES:
-            sequencia["finalizada"] = True
-            _martingale_sequencias[chave] = sequencia
-            return
-
-        sequencia["gale_atual"] = proximo_gale
-        _martingale_sequencias[chave] = sequencia
-
-
-def telegram_encerrar_martingale(pendente, resultado):
-    chave = telegram_martingale_key(pendente)
-
-    with _martingale_lock:
-        sequencia = _martingale_sequencias.get(
-            chave,
-            {
-                "gale_atual": 0,
-                "finalizada": False,
-            },
-        )
-
-        if resultado == "WIN":
-            sequencia["finalizada"] = True
-
-        elif (
-            resultado == "LOSS"
-            and int(sequencia.get("gale_atual", 0))
-            >= TELEGRAM_MAX_GALES
-        ):
-            sequencia["finalizada"] = True
-
-        _martingale_sequencias[chave] = sequencia
 
 
 # ============================================================
@@ -2733,7 +2725,6 @@ def telegram_formatar_sinal(par, analise):
         seta = "➖"
 
     rsi_texto = f"{float(rsi):.1f}" if isinstance(rsi, (int, float)) else "--"
-    preco_texto = f"{float(preco):.6f}" if isinstance(preco, (int, float)) else "--"
 
     # Quanto falta para a vela de entrada abrir. É o dado mais
     # prático da mensagem: diz se dá tempo de abrir a corretora.
@@ -2761,8 +2752,7 @@ def telegram_formatar_sinal(par, analise):
         f"{linha_contagem}\n"
         f"{seta} Tendência  <b>{tendencia}</b>\n"
         f"⭐ Força  {_barra_forca(confianca)}  <b>{confianca}</b>\n"
-        f"📊 RSI  <b>{rsi_texto}</b>\n"
-        f"💰 Preço  <b>{preco_texto}</b>\n\n"
+        f"📊 RSI  <b>{rsi_texto}</b>\n\n"
         "🔁 Martingale: até G2 (opcional)\n"
         "⚠️ <i>Alerta técnico e educacional.</i>"
     )
