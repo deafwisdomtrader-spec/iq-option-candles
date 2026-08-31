@@ -134,18 +134,18 @@ def telegram_token():
     return token
 
 
-def telegram_api(method, payload=None):
-    token = telegram_token()
-
-    url = (
+def telegram_url(method):
+    return (
         f"https://api.telegram.org/"
-        f"bot{token}/{method}"
+        f"bot{telegram_token()}/{method}"
     )
 
+
+def telegram_api(method, payload=None):
     response = requests.post(
-        url,
+        telegram_url(method),
         json=payload or {},
-        timeout=15,
+        timeout=20,
     )
 
     response.raise_for_status()
@@ -156,28 +156,56 @@ def telegram_api(method, payload=None):
         raise RuntimeError(
             data.get(
                 "description",
-                "Erro desconhecido do Telegram.",
+                "Erro desconhecido da API do Telegram.",
             )
         )
 
     return data
 
 
+def remover_webhook():
+    """
+    Remove webhook antigo para permitir getUpdates.
+    Não apaga as mensagens pendentes.
+    """
+
+    return telegram_api(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": False,
+        },
+    )
+
+
+def buscar_updates():
+    """
+    Busca atualizações pendentes do bot.
+    """
+
+    return telegram_api(
+        "getUpdates",
+        {
+            "limit": 100,
+            "timeout": 1,
+            "allowed_updates": [
+                "message",
+                "channel_post",
+            ],
+        },
+    )
+
+
 def descobrir_chat_id():
     global _telegram_chat_id
 
-    # Se o ID já estiver configurado,
-    # usa diretamente.
     if _telegram_chat_id:
         return _telegram_chat_id
 
-    data = telegram_api(
-        "getUpdates",
-        {
-            "limit": 20,
-            "timeout": 1,
-        },
-    )
+    # Primeiro garante que não existe webhook
+    # impedindo o uso do getUpdates.
+    remover_webhook()
+
+    data = buscar_updates()
 
     updates = data.get(
         "result",
@@ -201,9 +229,9 @@ def descobrir_chat_id():
             {},
         )
 
-        tipo = chat.get("type")
+        chat_type = chat.get("type")
 
-        if tipo in (
+        if chat_type in (
             "group",
             "supergroup",
         ):
@@ -211,14 +239,25 @@ def descobrir_chat_id():
             chat_id = chat.get("id")
 
             if chat_id is not None:
+
                 candidatos.append(
-                    str(chat_id)
+                    {
+                        "id": str(chat_id),
+                        "titulo": chat.get(
+                            "title",
+                            "Grupo sem nome",
+                        ),
+                        "tipo": chat_type,
+                    }
                 )
 
     if not candidatos:
         return None
 
-    _telegram_chat_id = candidatos[-1]
+    # Usa o último grupo encontrado.
+    ultimo = candidatos[-1]
+
+    _telegram_chat_id = ultimo["id"]
 
     return _telegram_chat_id
 
@@ -229,8 +268,8 @@ def enviar_telegram(texto):
     if not chat_id:
         raise RuntimeError(
             "Grupo não encontrado. "
-            "Envie primeiro uma mensagem no grupo "
-            "DW Trading — IQ Option."
+            "Envie uma nova mensagem no grupo "
+            "DW Trading — IQ Option e tente novamente."
         )
 
     return telegram_api(
@@ -286,7 +325,7 @@ def health():
 
 
 # =========================================================
-# CANDLES
+# CANDLES IQ OPTION
 # =========================================================
 
 @app.get("/candles")
@@ -313,7 +352,6 @@ def candles():
 
             pares = PARES
 
-        # Limite de segurança
         pares = pares[:20]
 
         resultados = []
@@ -404,7 +442,77 @@ def telegram_status():
 
 
 # =========================================================
-# TELEGRAM TESTE
+# TELEGRAM - VERIFICAR UPDATES
+# =========================================================
+
+@app.get("/telegram/updates")
+def telegram_updates():
+
+    try:
+
+        remover_webhook()
+
+        data = buscar_updates()
+
+        grupos = []
+
+        for update in data.get(
+            "result",
+            [],
+        ):
+
+            message = (
+                update.get("message")
+                or update.get("channel_post")
+            )
+
+            if not message:
+                continue
+
+            chat = message.get(
+                "chat",
+                {},
+            )
+
+            if chat.get("type") in (
+                "group",
+                "supergroup",
+            ):
+
+                grupos.append(
+                    {
+                        "chat_id": str(
+                            chat.get("id")
+                        ),
+                        "titulo": chat.get(
+                            "title"
+                        ),
+                        "tipo": chat.get(
+                            "type"
+                        ),
+                    }
+                )
+
+        return jsonify(
+            {
+                "ok": True,
+                "grupos_encontrados": grupos,
+                "quantidade": len(grupos),
+            }
+        )
+
+    except Exception as erro:
+
+        return jsonify(
+            {
+                "ok": False,
+                "erro": str(erro),
+            }
+        ), 503
+
+
+# =========================================================
+# TELEGRAM - TESTE
 # =========================================================
 
 @app.get("/telegram/test")
