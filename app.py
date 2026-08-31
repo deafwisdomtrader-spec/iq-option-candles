@@ -3444,7 +3444,7 @@ def status():
 
     threads_vivas = sorted(
         t.name for t in threading.enumerate()
-        if t.name in (
+        if t.is_alive() and t.name in (
             "telegram-sinais",
             "telegram-resultados",
             "keepalive",
@@ -3557,7 +3557,102 @@ def telegram_stickers_test():
     })
 
 
-# O monitor é iniciado quando o processo Gunicorn carrega o app.
+# ============================================================
+# GARANTIA DOS MONITORES
+# ============================================================
+#
+# Iniciar as threads só no carregamento do módulo NÃO basta.
+#
+# Se o gunicorn subir com --preload, ele carrega o programa,
+# as threads nascem, e só DEPOIS ele se divide em workers.
+# Threads não sobrevivem a essa divisão: morrem todas, sem
+# erro nenhum no log. O serviço responde HTTP normalmente e o
+# grupo fica mudo para sempre.
+#
+# Foi exatamente o que /status mostrou: threads_vivas vazio e
+# ciclos_sinais em zero.
+#
+# A defesa é conferir se as threads estão vivas e recriar as
+# que faltarem. Como isso roda a cada requisição, também
+# recupera thread que morreu por qualquer outro motivo.
+
+_lock_monitores = threading.Lock()
+
+
+def garantir_monitores():
+    """Sobe as threads que estiverem faltando. Barato de rodar."""
+    vivas = {
+        t.name for t in threading.enumerate()
+        if t.is_alive()
+    }
+
+    faltando = []
+
+    if TELEGRAM_SINAIS_ATIVOS and "telegram-sinais" not in vivas:
+        faltando.append("telegram-sinais")
+
+    if (
+        TELEGRAM_RESULTADOS_ATIVOS
+        and "telegram-resultados" not in vivas
+    ):
+        faltando.append("telegram-resultados")
+
+    if (
+        KEEPALIVE_ATIVO
+        and URL_PUBLICA
+        and "keepalive" not in vivas
+    ):
+        faltando.append("keepalive")
+
+    if not faltando:
+        return []
+
+    with _lock_monitores:
+        # Confere de novo dentro do lock: outra requisição
+        # pode ter subido as threads no meio do caminho.
+        vivas = {
+            t.name for t in threading.enumerate()
+            if t.is_alive()
+        }
+
+        criadas = []
+
+        if "telegram-sinais" in faltando and "telegram-sinais" not in vivas:
+            iniciar_monitor_telegram()
+            criadas.append("telegram-sinais")
+
+        if (
+            "telegram-resultados" in faltando
+            and "telegram-resultados" not in vivas
+        ):
+            iniciar_monitor_resultados_telegram()
+            criadas.append("telegram-resultados")
+
+        if "keepalive" in faltando and "keepalive" not in vivas:
+            iniciar_keepalive()
+            criadas.append("keepalive")
+
+        if criadas:
+            print("MONITORES RECRIADOS:", ", ".join(criadas))
+
+        return criadas
+
+
+@app.before_request
+def _antes_de_cada_requisicao():
+    try:
+        garantir_monitores()
+    except Exception as erro:
+        print(
+            "GARANTIR MONITORES:",
+            type(erro).__name__,
+            str(erro),
+        )
+
+
+# Tentativa no carregamento do módulo. Se o gunicorn usar
+# --preload, estas threads morrem no fork — e o
+# garantir_monitores() acima as recria na primeira visita.
 iniciar_monitor_telegram()
 iniciar_keepalive()
 
