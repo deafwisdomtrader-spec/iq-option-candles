@@ -2096,6 +2096,12 @@ def telegram_enviar_resultado_pendente(
     )
 
     try:
+        # Sticker do resultado PRIMEIRO, pelo mesmo motivo do
+        # sinal: ele é o aviso, o texto é o detalhe.
+        telegram_enviar_sticker(
+            _chave_sticker_resultado(resultado, etapa)
+        )
+
         send_url = (
             "https://api.telegram.org/bot"
             + TELEGRAM_BOT_TOKEN
@@ -2155,11 +2161,6 @@ def telegram_enviar_resultado_pendente(
                 r2.status_code,
                 r2.text[:1000],
             )
-
-        # Sticker do resultado, antes do texto final.
-        telegram_enviar_sticker(
-            _chave_sticker_resultado(resultado, etapa)
-        )
 
         time.sleep(0.65)
 
@@ -2936,6 +2937,12 @@ def telegram_enviar_sinal_animado(par, analise):
     )
 
     try:
+        # Sticker PRIMEIRO. Ele é o que chama atenção na tela;
+        # o texto vem logo abaixo, com os dados. Se o sticker
+        # fosse enviado no fim, ficaria embaixo da mensagem e
+        # perderia a função de aviso.
+        telegram_enviar_sticker(sinal)
+
         url = (
             "https://api.telegram.org/bot"
             + TELEGRAM_BOT_TOKEN
@@ -2991,9 +2998,6 @@ def telegram_enviar_sinal_animado(par, analise):
 
         if not final:
             return False
-
-        # Sticker da direção, logo antes do texto final.
-        telegram_enviar_sticker(sinal)
 
         resposta_final = requests.post(
             edit_url,
