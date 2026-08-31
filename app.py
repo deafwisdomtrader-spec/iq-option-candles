@@ -1857,6 +1857,303 @@ def telegram_test():
         }), 500
 
 
+
+# ============================================================
+# SINAIS AUTOMÁTICOS NO TELEGRAM
+# ============================================================
+#
+# Este módulo SOMENTE envia alertas. Não abre ordens.
+#
+# Ele usa a mesma análise existente em analisar_sinal().
+# Para evitar mensagens repetidas, cada par + candle de entrada
+# é enviado apenas uma vez.
+#
+# O serviço verifica um pequeno grupo de pares por ciclo e gira
+# a lista. Isso evita sobrecarregar o worker do Render.
+
+TELEGRAM_SINAIS_ATIVOS = (
+    os.getenv("TELEGRAM_SINAIS_ATIVOS", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+TELEGRAM_INTERVALO_SINAIS = 60
+TELEGRAM_MAX_PARES_CICLO = 4
+
+_lock_sinais_telegram = threading.Lock()
+_sinais_telegram_enviados = {}
+
+
+def telegram_formatar_sinal(par, analise):
+    sinal = str(analise.get("sinal", "")).upper()
+    entrada = analise.get("entrada", "--:--")
+    preco = analise.get("preco")
+
+    if sinal == "CALL":
+        emoji = "🟢"
+        titulo = "CALL"
+    elif sinal == "PUT":
+        emoji = "🔴"
+        titulo = "PUT"
+    else:
+        return None
+
+    confianca = analise.get("confianca", 0)
+    estrategia = analise.get("estrategia", ESTRATEGIA)
+    tendencia = analise.get("tendencia", "NEUTRA")
+    rsi = analise.get("rsi")
+
+    if isinstance(rsi, (int, float)):
+        rsi_texto = f"{float(rsi):.1f}"
+    else:
+        rsi_texto = "--"
+
+    if isinstance(preco, (int, float)):
+        preco_texto = f"{float(preco):.6f}"
+    else:
+        preco_texto = "--"
+
+    return (
+        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
+        f"📊 <b>Ativo:</b> {par}\n"
+        f"⏱️ <b>Timeframe:</b> M1\n"
+        f"🎯 <b>Entrada:</b> {entrada}\n"
+        f"💰 <b>Preço:</b> {preco_texto}\n"
+        f"📈 <b>Tendência:</b> {tendencia}\n"
+        f"📊 <b>RSI:</b> {rsi_texto}\n"
+        f"⭐ <b>Confirmações:</b> {confianca}\n"
+        f"🧠 <b>Estratégia:</b> {estrategia}\n\n"
+        "⚠️ <i>Alerta técnico/educacional. Não é garantia de resultado.</i>"
+    )
+
+
+def telegram_enviar_sinal_se_novo(par, analise):
+    if not telegram_configurado():
+        return False
+
+    sinal = analise.get("sinal")
+    entrada_em = analise.get("entrada_em")
+
+    if sinal not in ("CALL", "PUT") or not entrada_em:
+        return False
+
+    chave = f"{str(par).upper()}|{int(entrada_em)}|{sinal}"
+
+    with _lock_sinais_telegram:
+        if chave in _sinais_telegram_enviados:
+            return False
+
+    mensagem = telegram_formatar_sinal(par, analise)
+    if not mensagem:
+        return False
+
+    enviado = telegram_enviar(mensagem)
+
+    if enviado:
+        with _lock_sinais_telegram:
+            _sinais_telegram_enviados[chave] = int(time.time())
+
+            # Mantém somente as chaves recentes em memória.
+            if len(_sinais_telegram_enviados) > 500:
+                antigas = sorted(
+                    _sinais_telegram_enviados.items(),
+                    key=lambda item: item[1],
+                )
+                for chave_antiga, _ in antigas[:-300]:
+                    _sinais_telegram_enviados.pop(chave_antiga, None)
+
+    return enviado
+
+
+def telegram_processar_sinais():
+    if not TELEGRAM_SINAIS_ATIVOS:
+        return
+
+    if not telegram_configurado():
+        print(
+            "TELEGRAM SINAIS: aguardando "
+            "TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID."
+        )
+        return
+
+    try:
+        iq = conectar()
+
+        # Rotação: cada ciclo analisa poucos pares.
+        indice = (
+            int(time.time() // TELEGRAM_INTERVALO_SINAIS)
+            * TELEGRAM_MAX_PARES_CICLO
+        ) % len(PARES)
+
+        pares_ciclo = [
+            PARES[
+                (indice + i) % len(PARES)
+            ]
+            for i in range(
+                min(TELEGRAM_MAX_PARES_CICLO, len(PARES))
+            )
+        ]
+
+        for par in pares_ciclo:
+            try:
+                candles = buscar_candles_com_timeout(
+                    iq,
+                    par,
+                    CANDLE_COUNT,
+                    timeout_segundos=5,
+                )
+
+                if not candles:
+                    continue
+
+                analise = analisar_sinal(
+                    candles,
+                    par,
+                )
+
+                registrar_sinal_pendente(
+                    par,
+                    analise,
+                )
+
+                if analise.get("sinal") in ("CALL", "PUT"):
+                    telegram_enviar_sinal_se_novo(
+                        par,
+                        analise,
+                    )
+
+            except Exception as erro:
+                print(
+                    "TELEGRAM SINAIS:",
+                    par,
+                    type(erro).__name__,
+                    str(erro),
+                )
+
+    except Exception as erro:
+        invalidar_conexao()
+        print(
+            "TELEGRAM SINAIS CICLO:",
+            type(erro).__name__,
+            str(erro),
+        )
+
+
+def iniciar_monitor_telegram():
+    """
+    Inicia um único monitor dentro do processo Gunicorn.
+    Ele apenas envia alertas; nunca executa ordens.
+    """
+    if not TELEGRAM_SINAIS_ATIVOS:
+        print("TELEGRAM SINAIS: desativado.")
+        return
+
+    def trabalhador():
+        # Pequeno atraso para deixar Flask/Gunicorn iniciar primeiro.
+        time.sleep(8)
+
+        while True:
+            try:
+                telegram_processar_sinais()
+            except Exception as erro:
+                print(
+                    "TELEGRAM MONITOR:",
+                    type(erro).__name__,
+                    str(erro),
+                )
+
+            time.sleep(TELEGRAM_INTERVALO_SINAIS)
+
+    thread = threading.Thread(
+        target=trabalhador,
+        name="telegram-sinais",
+        daemon=True,
+    )
+    thread.start()
+    print("TELEGRAM SINAIS: monitor iniciado.")
+
+
+@app.get("/telegram/sinais/test")
+def telegram_sinais_test():
+    """
+    Força uma leitura dos pares e envia o primeiro CALL/PUT
+    encontrado. Se não houver sinal confirmado, informa isso.
+    """
+    try:
+        if not telegram_configurado():
+            return jsonify({
+                "ok": False,
+                "erro": (
+                    "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID "
+                    "não configurado."
+                ),
+            }), 503
+
+        iq = conectar()
+
+        for par in PARES:
+            try:
+                candles = buscar_candles_com_timeout(
+                    iq,
+                    par,
+                    CANDLE_COUNT,
+                    timeout_segundos=5,
+                )
+
+                if not candles:
+                    continue
+
+                analise = analisar_sinal(candles, par)
+
+                if analise.get("sinal") in ("CALL", "PUT"):
+                    enviado = telegram_enviar_sinal_se_novo(
+                        par,
+                        analise,
+                    )
+
+                    return jsonify({
+                        "ok": True,
+                        "enviado": enviado,
+                        "par": par,
+                        "sinal": analise.get("sinal"),
+                        "entrada": analise.get("entrada"),
+                        "confianca": analise.get("confianca"),
+                        "mensagem": (
+                            "Sinal enviado ao Telegram."
+                            if enviado
+                            else "Este sinal já foi enviado anteriormente."
+                        ),
+                    })
+
+            except Exception as erro:
+                print(
+                    "TELEGRAM SINAIS TEST:",
+                    par,
+                    type(erro).__name__,
+                    str(erro),
+                )
+
+        return jsonify({
+            "ok": True,
+            "enviado": False,
+            "mensagem": (
+                "Nenhum CALL/PUT confirmado foi encontrado "
+                "nos pares testados agora."
+            ),
+        })
+
+    except Exception as erro:
+        invalidar_conexao()
+        return jsonify({
+            "ok": False,
+            "erro": "Erro ao testar sinais Telegram.",
+            "tipo": type(erro).__name__,
+        }), 503
+
+
+# O monitor é iniciado quando o processo Gunicorn carrega o app.
+iniciar_monitor_telegram()
+
+
 # ============================================================
 # HOME
 # ============================================================
