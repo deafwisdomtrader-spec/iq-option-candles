@@ -37,7 +37,7 @@ PARES = [
 
 
 # =========================================================
-# CONEXÃO IQ OPTION
+# IQ OPTION
 # =========================================================
 
 _iq = None
@@ -116,14 +116,14 @@ def buscar_candles(iq, par):
 
 _telegram_chat_id = os.getenv(
     "TELEGRAM_CHAT_ID",
-    ""
+    "",
 ).strip()
 
 
 def telegram_token():
     token = os.getenv(
         "TELEGRAM_BOT_TOKEN",
-        ""
+        "",
     ).strip()
 
     if not token:
@@ -156,7 +156,7 @@ def telegram_api(method, payload=None):
         raise RuntimeError(
             data.get(
                 "description",
-                "Erro desconhecido da API do Telegram."
+                "Erro desconhecido do Telegram.",
             )
         )
 
@@ -164,27 +164,9 @@ def telegram_api(method, payload=None):
 
 
 def descobrir_chat_id():
-    """
-    Descobre automaticamente o último grupo ou
-    supergrupo em que o bot recebeu uma mensagem.
-
-    Primeiro teste:
-
-    1. Abra o grupo:
-       DW Trading — IQ Option
-
-    2. Envie uma mensagem no grupo:
-       TESTE BOT
-
-    3. Abra:
-       /telegram/test
-
-    O servidor tentará encontrar o ID do grupo.
-    """
-
     global _telegram_chat_id
 
-    # Se já estiver configurado no Render,
+    # Se o ID já estiver configurado,
     # usa diretamente.
     if _telegram_chat_id:
         return _telegram_chat_id
@@ -199,7 +181,7 @@ def descobrir_chat_id():
 
     updates = data.get(
         "result",
-        []
+        [],
     )
 
     candidatos = []
@@ -216,7 +198,7 @@ def descobrir_chat_id():
 
         chat = message.get(
             "chat",
-            {}
+            {},
         )
 
         tipo = chat.get("type")
@@ -286,7 +268,7 @@ def inicio():
 
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.get("/health")
@@ -304,7 +286,7 @@ def health():
 
 
 # =========================================================
-# CANDLES IQ OPTION
+# CANDLES
 # =========================================================
 
 @app.get("/candles")
@@ -316,7 +298,7 @@ def candles():
 
         pares_param = request.args.get(
             "pares",
-            ""
+            "",
         ).strip()
 
         if pares_param:
@@ -332,7 +314,6 @@ def candles():
             pares = PARES
 
         # Limite de segurança
-        # para o serviço gratuito.
         pares = pares[:20]
 
         resultados = []
@@ -343,7 +324,7 @@ def candles():
 
                 dados = buscar_candles(
                     iq,
-                    par
+                    par,
                 )
 
                 resultados.append(
@@ -397,7 +378,7 @@ def candles():
 
 
 # =========================================================
-# TELEGRAM - STATUS
+# TELEGRAM STATUS
 # =========================================================
 
 @app.get("/telegram/status")
@@ -414,7 +395,7 @@ def telegram_status():
             "chat_id_configurado": bool(
                 os.getenv(
                     "TELEGRAM_CHAT_ID",
-                    ""
+                    "",
                 ).strip()
             ),
             "bot": "DWTradingIQOptionBot",
@@ -423,7 +404,7 @@ def telegram_status():
 
 
 # =========================================================
-# TELEGRAM - TESTE
+# TELEGRAM TESTE
 # =========================================================
 
 @app.get("/telegram/test")
@@ -474,7 +455,7 @@ def telegram_test():
 
 
 # =========================================================
-# INICIAR SERVIDOR
+# SERVIDOR
 # =========================================================
 
 if __name__ == "__main__":
@@ -482,11 +463,11 @@ if __name__ == "__main__":
     porta = int(
         os.getenv(
             "PORT",
-            "10000"
+            "10000",
         )
     )
 
     app.run(
         host="0.0.0.0",
-        port=porta
+        port=porta,
     )
