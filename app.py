@@ -25,7 +25,7 @@ app = Flask(__name__)
 #
 # Ao subir uma alteração, mude este número. Se /status ainda
 # mostrar o número antigo, o deploy não chegou.
-VERSAO = "2026-08-31-v6-trava"
+VERSAO = "2026-08-31-v8-trava-fork"
 
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
@@ -507,14 +507,41 @@ ARQUIVO_TRAVA = os.path.join(
 )
 
 _arquivo_trava_aberto = None
+_pid_da_trava = None
 
 
 def sou_o_dono_do_monitor():
-    """Tenta virar o único processo dono dos monitores."""
-    global _arquivo_trava_aberto
+    """Tenta virar o único processo dono dos monitores.
 
-    if _arquivo_trava_aberto is not None:
+    CUIDADO COM O FORK: um arquivo aberto é HERDADO pelos
+    processos filhos. Sem conferir o PID, todo worker nascido
+    de um fork achava que já tinha a trava — porque via o
+    arquivo aberto pelo pai — e todos subiam o próprio
+    monitor. Resultado: sinal duplicado no grupo.
+
+    Trava herdada não vale. Só vale a que este processo
+    conquistou.
+    """
+    global _arquivo_trava_aberto
+    global _pid_da_trava
+
+    pid_atual = os.getpid()
+
+    # Já conquistada por ESTE processo.
+    if (
+        _arquivo_trava_aberto is not None
+        and _pid_da_trava == pid_atual
+    ):
         return True
+
+    # Herdada do pai: descarta e disputa de novo.
+    if _arquivo_trava_aberto is not None:
+        try:
+            _arquivo_trava_aberto.close()
+        except Exception:
+            pass
+        _arquivo_trava_aberto = None
+        _pid_da_trava = None
 
     try:
         import fcntl
@@ -531,14 +558,15 @@ def sou_o_dono_do_monitor():
             arquivo.close()
             return False
 
-        arquivo.write(str(os.getpid()))
+        arquivo.write(str(pid_atual))
         arquivo.flush()
 
         # Guardado numa variável de módulo justamente para o
         # arquivo NÃO ser fechado. Fechar solta a trava.
         _arquivo_trava_aberto = arquivo
+        _pid_da_trava = pid_atual
 
-        print("MONITOR: este processo assumiu, pid", os.getpid())
+        print("MONITOR: este processo assumiu, pid", pid_atual)
         return True
 
     except Exception as erro:
@@ -2546,6 +2574,42 @@ def conferir_resultado_pendente_telegram(par, pendente, iq):
     }
 
 
+def reservar_envio_resultado(chave):
+    """Reserva o direito de enviar ESTE resultado.
+
+    Devolve True só para quem conseguiu a reserva.
+
+    A trava de dono já garante um monitor só. Isto é a segunda
+    linha de defesa: se por qualquer motivo dois processos
+    rodarem juntos, apenas um envia. Sinal duplicado no grupo
+    confunde o aluno e ainda estraga a estatística.
+
+    A reserva é gravada ANTES do envio, não depois.
+    """
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+        item = pendentes.get(chave)
+
+        if not isinstance(item, dict):
+            return False
+
+        if item.get("resultado_enviado"):
+            return False
+
+        reserva = int(item.get("enviando_desde", 0) or 0)
+        agora = int(time.time())
+
+        # Reserva velha (processo morreu no meio do envio)
+        # pode ser retomada depois de 2 minutos.
+        if reserva and agora - reserva < 120:
+            return False
+
+        item["enviando_desde"] = agora
+        pendentes[chave] = item
+
+        return _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
+
+
 def telegram_processar_resultados():
     if not TELEGRAM_RESULTADOS_ATIVOS:
         return
@@ -2613,11 +2677,33 @@ def telegram_processar_resultados():
                 if not resultado:
                     continue
 
+                # Reserva ANTES de enviar. Sem isto, dois
+                # processos podem conferir a mesma vela e
+                # mandar o resultado duas vezes.
+                if not reservar_envio_resultado(chave):
+                    continue
+
                 enviado = telegram_enviar_resultado_pendente(
                     pendente,
                     resultado["resultado"],
                     resultado.get("etapa", 0),
                 )
+
+                if not enviado:
+                    # Solta a reserva: o próximo ciclo tenta
+                    # de novo em vez de deixar o resultado
+                    # preso para sempre.
+                    with _lock_aprendizado:
+                        atuais = _ler_json_seguro(
+                            ARQUIVO_PENDENTES, {}
+                        )
+                        item = atuais.get(chave)
+                        if isinstance(item, dict):
+                            item.pop("enviando_desde", None)
+                            atuais[chave] = item
+                            _salvar_json_seguro(
+                                ARQUIVO_PENDENTES, atuais
+                            )
 
                 if enviado:
                     # ------------------------------------------
@@ -2720,8 +2806,11 @@ def iniciar_monitor_resultados_telegram():
     print("TELEGRAM RESULTADOS: monitor iniciado.")
 
 
-if sou_o_dono_do_monitor():
-    iniciar_monitor_resultados_telegram()
+# NÃO disputa a trava aqui. Veja o comentário no fim do
+# arquivo: com --preload isto rodaria no processo PAI, que
+# ficaria com a trava para sempre e nenhum worker conseguiria
+# assumir. Quem sobe os monitores é garantir_monitores(),
+# chamado a cada requisição — sempre dentro de um worker.
 
 
 # ============================================================
@@ -3029,6 +3118,19 @@ def telegram_enviar_sinal_animado(par, analise):
 
     with _lock_sinais_telegram:
         if chave in _sinais_telegram_enviados:
+            return False
+
+    # Confere também no ARQUIVO. O controle acima é em memória
+    # e não enxerga outro processo; o arquivo é compartilhado.
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+        registro = pendentes.get(
+            f"{str(par).upper()}|{int(entrada_em)}"
+        )
+        if (
+            isinstance(registro, dict)
+            and registro.get("telegram_enviado")
+        ):
             return False
 
     if sinal == "CALL":
@@ -3750,13 +3852,27 @@ def _antes_de_cada_requisicao():
         )
 
 
-# Tentativa no carregamento do módulo. Se o gunicorn usar
-# --preload, estas threads morrem no fork — e o
-# garantir_monitores() acima as recria na primeira visita,
-# num worker só.
-if sou_o_dono_do_monitor():
-    iniciar_monitor_telegram()
-    iniciar_keepalive()
+# ------------------------------------------------------------
+# POR QUE OS MONITORES NÃO SOBEM AQUI
+# ------------------------------------------------------------
+# Parece natural iniciar as threads no carregamento do módulo.
+# Com o gunicorn em --preload, porém, este código roda no
+# processo PAI, antes da divisão em workers. Duas coisas dão
+# errado ao mesmo tempo:
+#
+#   1. As threads morrem no fork e o grupo fica mudo;
+#   2. O PAI fica segurando a trava para sempre, e aí nenhum
+#      worker consegue assumir — nem com a correção do PID.
+#
+# Por isso quem sobe os monitores é garantir_monitores(),
+# chamado no before_request. Ele roda sempre dentro de um
+# worker de verdade, disputa a trava de forma limpa, e apenas
+# um vence.
+#
+# Na prática o atraso é de segundos: o próprio Render faz uma
+# visita de verificação assim que o serviço sobe, e o cron da
+# Hostinger visita a cada 5 minutos.
+# ------------------------------------------------------------
 
 
 # ============================================================
