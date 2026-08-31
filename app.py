@@ -1936,14 +1936,34 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
     else:
         fechamento_txt = "--"
 
+    # Quanto a vela andou. O aluno vê se o resultado veio de um
+    # movimento de verdade ou de uma raspa de nada.
+    if (
+        isinstance(abertura, (int, float))
+        and isinstance(fechamento, (int, float))
+    ):
+        variacao = float(fechamento) - float(abertura)
+        sentido = "▲" if variacao > 0 else ("▼" if variacao < 0 else "▬")
+        variacao_txt = f"{sentido} {abs(variacao):.6f}"
+    else:
+        variacao_txt = "--"
+
+    if resultado == "WIN":
+        rodape = "🔥 Entrada vencedora."
+    elif resultado == "LOSS":
+        rodape = "📉 Entrada encerrada."
+    else:
+        rodape = "➖ Vela fechou no mesmo preço."
+
     return (
-        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
-        f"📊 {par}  •  M1\n"
-        f"🎯 Entrada: {hora}\n"
-        f"📌 Sinal: <b>{sinal}</b>\n"
-        f"💰 Abertura: {abertura_txt}\n"
-        f"🏁 Fechamento: {fechamento_txt}\n\n"
-        f"{'🔥 Entrada vencedora!' if resultado == 'WIN' else '📉 Entrada encerrada.'}"
+        f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        f"📌 Sinal  <b>{sinal}</b> · M1\n"
+        f"⏰ Entrada  <b>{hora}</b>\n\n"
+        f"💰 Abertura  {abertura_txt}\n"
+        f"🏁 Fechamento  {fechamento_txt}\n"
+        f"📐 Variação  <b>{variacao_txt}</b>\n\n"
+        f"{rodape}"
     )
 
 
@@ -1966,20 +1986,20 @@ def telegram_enviar_resultado_pendente(
 
     # Frame 1 — começa a animação.
     frame1 = (
-        "🔎 <b>DW TRADING — APURANDO</b>\n\n"
-        f"📊 {par} • M1\n"
-        f"🎯 Sinal: <b>{sinal}</b>\n"
-        "⏳ Calculando resultado...\n"
-        "▰▱▱▱▱▱▱▱▱▱ 10%"
+        f"🔎 <b>APURANDO</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        f"📌 Sinal  <b>{sinal}</b> · M1\n"
+        "⏳ Calculando resultado...\n\n"
+        "▰▱▱▱▱▱▱▱▱▱"
     )
 
     # Frame 2 — confirmação.
     frame2 = (
-        "⚡ <b>DW TRADING — CONFIRMANDO</b>\n\n"
-        f"📊 {par} • M1\n"
-        f"🎯 Sinal: <b>{sinal}</b>\n"
-        "🔄 Conferindo fechamento da vela...\n"
-        "▰▰▰▰▰▰▰▱▱▱ 80%"
+        f"⚡ <b>CONFERINDO</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        f"📌 Sinal  <b>{sinal}</b> · M1\n"
+        "🔄 Lendo o fechamento da vela...\n\n"
+        "▰▰▰▰▰▰▰▰▱▱"
     )
 
     final = telegram_formatar_resultado(
@@ -2391,12 +2411,12 @@ def telegram_enviar_martingale_disponivel(pendente, gale):
         )
 
     mensagem = (
-        f"🔁 <b>DW TRADING — {titulo}</b>\n\n"
-        f"📊 {par} • M1\n"
-        f"📌 Sinal original: <b>{sinal}</b>\n"
-        f"❌ Resultado anterior: <b>LOSS</b>\n\n"
+        f"🔁 <b>{titulo}</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        f"📌 Sinal original  <b>{sinal}</b> · M1\n"
+        "❌ Resultado anterior  <b>LOSS</b>\n\n"
         f"{orientacao}\n"
-        "⏳ Aguardando a próxima entrada da sequência.\n\n"
+        "⏳ Aguardando a próxima entrada.\n\n"
         "⚠️ <i>Etapa opcional. O gale aumenta o risco. "
         "Use gestão de banca.</i>"
     )
@@ -2622,6 +2642,29 @@ _lock_sinais_telegram = threading.Lock()
 _sinais_telegram_enviados = {}
 
 
+def _barra_forca(pontos, maximo=10):
+    """Transforma a pontuação numa barra curta de 5 marcas.
+
+    Um número solto ("Confirmações: 7") não diz nada para quem
+    está começando. A barra mostra de bate-pronto se a leitura
+    veio folgada ou apertada.
+    """
+    try:
+        valor = int(pontos)
+    except (TypeError, ValueError):
+        valor = 0
+
+    valor = max(0, min(maximo, valor))
+
+    # int(x + 0.5), não round(). O round() do Python arredonda
+    # 2.5 para 2 e 4.5 para 4 (regra do banqueiro), o que fazia
+    # forças diferentes desenharem a mesma barra.
+    cheios = int((valor / maximo * 5) + 0.5)
+    cheios = max(0, min(5, cheios))
+
+    return "●" * cheios + "○" * (5 - cheios)
+
+
 def telegram_formatar_sinal(par, analise):
     sinal = str(analise.get("sinal", "")).upper()
     entrada = analise.get("entrada", "--:--")
@@ -2639,21 +2682,29 @@ def telegram_formatar_sinal(par, analise):
     else:
         return None
 
+    if tendencia == "ALTA":
+        seta = "📈"
+    elif tendencia == "BAIXA":
+        seta = "📉"
+    else:
+        seta = "➖"
+
     rsi_texto = f"{float(rsi):.1f}" if isinstance(rsi, (int, float)) else "--"
     preco_texto = f"{float(preco):.6f}" if isinstance(preco, (int, float)) else "--"
 
+    # SEM moldura de caracteres. O Telegram no celular usa fonte
+    # de largura variável, então "╭──╮" e "│" nunca alinham e a
+    # mensagem fica torta. Espaço em branco e negrito resolvem.
     return (
-        "╭────────────────────╮\n"
-        f"│  {emoji} <b>{titulo}</b>  •  <b>M1</b>\n"
-        "├────────────────────┤\n"
-        f"│ 📊 <b>{par}</b>\n"
-        f"│ 🎯 Entrada: <b>{entrada}</b>\n"
-        f"│ 📈 Tendência: <b>{tendencia}</b>\n"
-        f"│ ⭐ Confirmações: <b>{confianca}</b>\n"
-        f"│ 📊 RSI: <b>{rsi_texto}</b>\n"
-        f"│ 💰 Preço: <b>{preco_texto}</b>\n"
-        "╰────────────────────╯\n"
-        "⚠️ <i>Alerta técnico/educacional.</i>"
+        f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        f"⏰ Entrada  <b>{entrada}</b>\n"
+        f"⏱ Duração  <b>M1</b>\n\n"
+        f"{seta} Tendência  <b>{tendencia}</b>\n"
+        f"⭐ Força  {_barra_forca(confianca)}  <b>{confianca}</b>\n"
+        f"📊 RSI  <b>{rsi_texto}</b>\n"
+        f"💰 Preço  <b>{preco_texto}</b>\n\n"
+        "⚠️ <i>Alerta técnico e educacional.</i>"
     )
 
 
@@ -2720,22 +2771,17 @@ def telegram_enviar_sinal_animado(par, analise):
 
     # Animação compacta para leitura rápida no celular.
     pre = (
-        "╭────────────────────╮\n"
-        "│  🤖 <b>DW TRADING</b>\n"
-        "├────────────────────┤\n"
-        f"│ 🔎 Analisando <b>{par}</b>\n"
-        "│ ▰▱▱▱▱▱▱▱▱▱ 10%\n"
-        "╰────────────────────╯"
+        "🤖 <b>DW TRADING</b>\n"
+        "─────────────\n"
+        f"🔎 Analisando <b>{par}</b>\n\n"
+        "▰▱▱▱▱▱▱▱▱▱"
     )
 
     meio = (
-        "╭────────────────────╮\n"
-        f"│  ⚡ <b>SINAL {titulo}</b>\n"
-        "├────────────────────┤\n"
-        f"│ 📊 <b>{par}</b>  •  M1\n"
-        "│ ▰▰▰▰▰▰▱▱▱▱ 70%\n"
-        "│ 🎯 Confirmando...\n"
-        "╰────────────────────╯"
+        f"⚡ <b>SINAL {titulo}</b> · <b>{par}</b>\n"
+        "─────────────\n"
+        "🎯 Confirmando indicadores...\n\n"
+        "▰▰▰▰▰▰▰▱▱▱"
     )
 
     try:
