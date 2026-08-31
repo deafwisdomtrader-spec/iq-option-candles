@@ -1799,6 +1799,11 @@ def telegram_enviar(mensagem):
 # ============================================================
 # RESULTADO AUTOMÁTICO — WIN / LOSS
 # ============================================================
+# REGRA DW ACADEMY: 1 entrada = 1 resultado.
+# Após um LOSS, confirmar LOSS imediatamente no fechamento do M1.
+# NÃO criar G1, G2, martingale ou entrada de recuperação.
+# O próximo sinal só pode ser uma nova entrada normal.
+
 
 TELEGRAM_RESULTADOS_ATIVOS = (
     os.getenv("TELEGRAM_RESULTADOS_ATIVOS", "1").strip().lower()
