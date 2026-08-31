@@ -1887,6 +1887,9 @@ def telegram_formatar_sinal(par, analise):
     sinal = str(analise.get("sinal", "")).upper()
     entrada = analise.get("entrada", "--:--")
     preco = analise.get("preco")
+    confianca = analise.get("confianca", 0)
+    tendencia = str(analise.get("tendencia", "NEUTRA")).upper()
+    rsi = analise.get("rsi")
 
     if sinal == "CALL":
         emoji = "🟢"
@@ -1897,40 +1900,33 @@ def telegram_formatar_sinal(par, analise):
     else:
         return None
 
-    confianca = analise.get("confianca", 0)
-    estrategia = analise.get("estrategia", ESTRATEGIA)
-    tendencia = analise.get("tendencia", "NEUTRA")
-    rsi = analise.get("rsi")
-
-    if isinstance(rsi, (int, float)):
-        rsi_texto = f"{float(rsi):.1f}"
-    else:
-        rsi_texto = "--"
-
-    if isinstance(preco, (int, float)):
-        preco_texto = f"{float(preco):.6f}"
-    else:
-        preco_texto = "--"
+    rsi_texto = f"{float(rsi):.1f}" if isinstance(rsi, (int, float)) else "--"
+    preco_texto = f"{float(preco):.6f}" if isinstance(preco, (int, float)) else "--"
 
     return (
-        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
-        f"📊 <b>Ativo:</b> {par}\n"
-        f"⏱️ <b>Timeframe:</b> M1\n"
-        f"🎯 <b>Entrada:</b> {entrada}\n"
-        f"💰 <b>Preço:</b> {preco_texto}\n"
-        f"📈 <b>Tendência:</b> {tendencia}\n"
-        f"📊 <b>RSI:</b> {rsi_texto}\n"
-        f"⭐ <b>Confirmações:</b> {confianca}\n"
-        f"🧠 <b>Estratégia:</b> {estrategia}\n\n"
-        "⚠️ <i>Alerta técnico/educacional. Não é garantia de resultado.</i>"
+        "╭────────────────────╮\n"
+        f"│  {emoji} <b>{titulo}</b>  •  <b>M1</b>\n"
+        "├────────────────────┤\n"
+        f"│ 📊 <b>{par}</b>\n"
+        f"│ 🎯 Entrada: <b>{entrada}</b>\n"
+        f"│ 📈 Tendência: <b>{tendencia}</b>\n"
+        f"│ ⭐ Confirmações: <b>{confianca}</b>\n"
+        f"│ 📊 RSI: <b>{rsi_texto}</b>\n"
+        f"│ 💰 Preço: <b>{preco_texto}</b>\n"
+        "╰────────────────────╯\n"
+        "⚠️ <i>Alerta técnico/educacional.</i>"
     )
 
-
-def telegram_enviar_sinal_se_novo(par, analise):
+def telegram_enviar_sinal_animado(par, analise):
+    """
+    Envia o sinal com uma pequena animação feita por edição da mensagem.
+    O Telegram recebe uma mensagem e ela é atualizada em poucos frames,
+    criando o efeito visual de animação sem precisar de GIF externo.
+    """
     if not telegram_configurado():
         return False
 
-    sinal = analise.get("sinal")
+    sinal = str(analise.get("sinal", "")).upper()
     entrada_em = analise.get("entrada_em")
 
     if sinal not in ("CALL", "PUT") or not entrada_em:
@@ -1942,17 +1938,120 @@ def telegram_enviar_sinal_se_novo(par, analise):
         if chave in _sinais_telegram_enviados:
             return False
 
-    mensagem = telegram_formatar_sinal(par, analise)
-    if not mensagem:
-        return False
+    if sinal == "CALL":
+        emoji = "🟢"
+        titulo = "CALL"
+    else:
+        emoji = "🔴"
+        titulo = "PUT"
 
-    enviado = telegram_enviar(mensagem)
+    # Animação compacta para leitura rápida no celular.
+    pre = (
+        "╭────────────────────╮\n"
+        "│  🤖 <b>DW TRADING</b>\n"
+        "├────────────────────┤\n"
+        f"│ 🔎 Analisando <b>{par}</b>\n"
+        "│ ▰▱▱▱▱▱▱▱▱▱ 10%\n"
+        "╰────────────────────╯"
+    )
 
-    if enviado:
+    meio = (
+        "╭────────────────────╮\n"
+        f"│  ⚡ <b>SINAL {titulo}</b>\n"
+        "├────────────────────┤\n"
+        f"│ 📊 <b>{par}</b>  •  M1\n"
+        "│ ▰▰▰▰▰▰▱▱▱▱ 70%\n"
+        "│ 🎯 Confirmando...\n"
+        "╰────────────────────╯"
+    )
+
+    try:
+        url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/sendMessage"
+        )
+
+        resposta = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": pre,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not resposta.ok:
+            print("TELEGRAM ANIM ERROR:", resposta.status_code, resposta.text[:1000])
+            return False
+
+        dados = resposta.json()
+
+        if not dados.get("ok"):
+            print("TELEGRAM ANIM API ERROR:", dados)
+            return False
+
+        message_id = dados["result"]["message_id"]
+
+        time.sleep(0.7)
+
+        edit_url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/editMessageText"
+        )
+
+        requests.post(
+            edit_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": meio,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        time.sleep(0.7)
+
+        final = telegram_formatar_sinal(par, analise)
+
+        resposta_final = requests.post(
+            edit_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": final.replace(
+                    f"{emoji} <b>{titulo}</b>",
+                    f"{emoji} <b>{titulo} CONFIRMADO</b>",
+                    1,
+                ),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not resposta_final.ok:
+            print(
+                "TELEGRAM ANIM FINAL ERROR:",
+                resposta_final.status_code,
+                resposta_final.text[:1000],
+            )
+            return False
+
+        dados_final = resposta_final.json()
+
+        if not dados_final.get("ok"):
+            print("TELEGRAM ANIM FINAL API ERROR:", dados_final)
+            return False
+
         with _lock_sinais_telegram:
             _sinais_telegram_enviados[chave] = int(time.time())
 
-            # Mantém somente as chaves recentes em memória.
             if len(_sinais_telegram_enviados) > 500:
                 antigas = sorted(
                     _sinais_telegram_enviados.items(),
@@ -1961,7 +2060,20 @@ def telegram_enviar_sinal_se_novo(par, analise):
                 for chave_antiga, _ in antigas[:-300]:
                     _sinais_telegram_enviados.pop(chave_antiga, None)
 
-    return enviado
+        print("TELEGRAM ANIMADO OK:", par, sinal)
+        return True
+
+    except Exception as erro:
+        print(
+            "TELEGRAM ANIM EXCEPTION:",
+            type(erro).__name__,
+            str(erro),
+        )
+        return False
+
+
+def telegram_enviar_sinal_se_novo(par, analise):
+    return telegram_enviar_sinal_animado(par, analise)
 
 
 def telegram_processar_sinais():
