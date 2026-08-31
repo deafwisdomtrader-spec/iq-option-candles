@@ -1877,6 +1877,9 @@ TELEGRAM_SINAIS_ATIVOS = (
 )
 
 TELEGRAM_INTERVALO_SINAIS = 60
+TELEGRAM_ESPERA_ENTRE_ENTRADAS = 180  # 3 minutos
+_telegram_ultima_entrada_enviada = 0
+_telegram_lock_cooldown = threading.Lock()
 TELEGRAM_MAX_PARES_CICLO = 4
 
 _lock_sinais_telegram = threading.Lock()
@@ -1923,6 +1926,8 @@ def telegram_enviar_sinal_animado(par, analise):
     O Telegram recebe uma mensagem e ela é atualizada em poucos frames,
     criando o efeito visual de animação sem precisar de GIF externo.
     """
+    global _telegram_ultima_entrada_enviada
+
     if not telegram_configurado():
         return False
 
@@ -1931,6 +1936,25 @@ def telegram_enviar_sinal_animado(par, analise):
 
     if sinal not in ("CALL", "PUT") or not entrada_em:
         return False
+
+    # Só permite uma nova entrada depois de 3 minutos.
+    # Isso evita vários CALL/PUT quase simultâneos no grupo.
+    agora = time.time()
+    with _telegram_lock_cooldown:
+        if (
+            _telegram_ultima_entrada_enviada
+            and agora - _telegram_ultima_entrada_enviada
+            < TELEGRAM_ESPERA_ENTRE_ENTRADAS
+        ):
+            restante = int(
+                TELEGRAM_ESPERA_ENTRE_ENTRADAS
+                - (agora - _telegram_ultima_entrada_enviada)
+            )
+            print(
+                f"TELEGRAM COOLDOWN: aguardando {restante}s "
+                f"antes da próxima entrada."
+            )
+            return False
 
     chave = f"{str(par).upper()}|{int(entrada_em)}|{sinal}"
 
@@ -2051,6 +2075,9 @@ def telegram_enviar_sinal_animado(par, analise):
 
         with _lock_sinais_telegram:
             _sinais_telegram_enviados[chave] = int(time.time())
+
+            with _telegram_lock_cooldown:
+                _telegram_ultima_entrada_enviada = time.time()
 
             if len(_sinais_telegram_enviados) > 500:
                 antigas = sorted(
