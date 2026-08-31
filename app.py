@@ -1744,40 +1744,116 @@ def verificar_resultado(iq, tipo, order_id, timeout=180):
 
 
 # ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+def telegram_configurado():
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def telegram_enviar(mensagem):
+    """Envia mensagem pela API oficial do Telegram."""
+    if not telegram_configurado():
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    resposta = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": mensagem,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+
+    if not resposta.ok:
+        print(
+            "TELEGRAM ERROR:",
+            resposta.status_code,
+            resposta.text[:1000],
+        )
+        return False
+
+    dados = resposta.json()
+
+    if not dados.get("ok"):
+        print("TELEGRAM API ERROR:", dados)
+        return False
+
+    print("TELEGRAM OK: mensagem enviada.")
+    return True
+
+
+# ============================================================
 # TESTE TELEGRAM
 # ============================================================
 
 @app.get("/telegram/test")
 def telegram_test():
-    mensagem = (
-        "🤖 <b>DW TRADING — TESTE TELEGRAM</b>\n\n"
-        "✅ Bot conectado com sucesso!\n"
-        "📊 Grupo: DW Trading — IQ Option\n"
-        "⏱️ Timeframe: M1\n"
-        "🔔 Integração Telegram funcionando.\n\n"
-        "Este é apenas um teste."
-    )
+    try:
+        if not TELEGRAM_BOT_TOKEN:
+            return jsonify({
+                "ok": False,
+                "erro": "TELEGRAM_BOT_TOKEN não configurado no Render.",
+            }), 503
 
-    if not telegram_configurado():
+        if not TELEGRAM_CHAT_ID:
+            return jsonify({
+                "ok": False,
+                "erro": "TELEGRAM_CHAT_ID não configurado no Render.",
+            }), 503
+
+        mensagem = (
+            "🤖 <b>DW TRADING — TESTE TELEGRAM</b>\n\n"
+            "✅ Bot conectado com sucesso!\n"
+            "📊 Grupo: DW Trading — IQ Option\n"
+            "⏱️ Timeframe: M1\n"
+            "🔔 Integração Telegram funcionando.\n\n"
+            "Este é apenas um teste."
+        )
+
+        enviado = telegram_enviar(mensagem)
+
+        if enviado:
+            return jsonify({
+                "ok": True,
+                "mensagem": "Mensagem enviada ao Telegram.",
+                "chat_id_configurado": True,
+            })
+
         return jsonify({
             "ok": False,
-            "erro": "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID não configurado no Render.",
-        }), 503
+            "erro": (
+                "A API do Telegram recusou o envio. "
+                "Verifique se o bot está no grupo e se "
+                "TELEGRAM_CHAT_ID está correto."
+            ),
+            "chat_id_configurado": True,
+        }), 502
 
-    enviado = telegram_enviar(mensagem)
+    except Exception as erro:
+        print(
+            "ERRO /telegram/test:",
+            type(erro).__name__,
+            str(erro),
+        )
 
-    if enviado:
         return jsonify({
-            "ok": True,
-            "mensagem": "Mensagem de teste enviada ao Telegram.",
-            "chat_id": TELEGRAM_CHAT_ID,
-        })
-
-    return jsonify({
-        "ok": False,
-        "erro": "O Telegram não confirmou o envio. Verifique o token e o Chat ID.",
-        "chat_id": TELEGRAM_CHAT_ID,
-    }), 503
+            "ok": False,
+            "erro": "Erro interno ao testar o Telegram.",
+            "tipo": type(erro).__name__,
+        }), 500
 
 
 # ============================================================
