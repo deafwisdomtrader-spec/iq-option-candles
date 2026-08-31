@@ -1926,27 +1926,11 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
         titulo = "EMPATE"
         emoji = "⚪"
 
-    if isinstance(abertura, (int, float)):
-        abertura_txt = f"{float(abertura):.6f}"
-    else:
-        abertura_txt = "--"
-
-    if isinstance(fechamento, (int, float)):
-        fechamento_txt = f"{float(fechamento):.6f}"
-    else:
-        fechamento_txt = "--"
-
-    # Quanto a vela andou. O aluno vê se o resultado veio de um
-    # movimento de verdade ou de uma raspa de nada.
-    if (
-        isinstance(abertura, (int, float))
-        and isinstance(fechamento, (int, float))
-    ):
-        variacao = float(fechamento) - float(abertura)
-        sentido = "▲" if variacao > 0 else ("▼" if variacao < 0 else "▬")
-        variacao_txt = f"{sentido} {abs(variacao):.6f}"
-    else:
-        variacao_txt = "--"
+    # Abertura, fechamento e variação NÃO entram mais na
+    # mensagem — o aluno não usava esses números. Eles
+    # continuam gravados no arquivo de pendentes e aparecem em
+    # /telegram/pendentes, para conferir contra o gráfico da
+    # corretora se algum dia precisar auditar um resultado.
 
     if resultado == "WIN":
         rodape = "🔥 Entrada vencedora."
@@ -1966,9 +1950,6 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
         "─────────────\n"
         f"📌 Sinal  <b>{sinal}</b> · M1\n"
         f"⏰ Entrada  <b>{hora}</b>\n\n"
-        f"💰 Abertura  {abertura_txt}\n"
-        f"🏁 Fechamento  {fechamento_txt}\n"
-        f"📐 Variação  <b>{variacao_txt}</b>\n\n"
         f"{rodape}"
     )
 
