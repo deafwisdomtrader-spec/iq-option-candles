@@ -1797,6 +1797,296 @@ def telegram_enviar(mensagem):
 
 
 # ============================================================
+# RESULTADO AUTOMÁTICO — WIN / LOSS
+# ============================================================
+
+TELEGRAM_RESULTADOS_ATIVOS = (
+    os.getenv("TELEGRAM_RESULTADOS_ATIVOS", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+TELEGRAM_INTERVALO_RESULTADOS = 10
+
+
+def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
+    par = pendente.get("par", "--")
+    sinal = str(pendente.get("sinal", "--")).upper()
+    entrada_em = int(pendente.get("entrada_em", 0))
+
+    hora = (
+        time.strftime("%H:%M", time.localtime(entrada_em))
+        if entrada_em
+        else "--:--"
+    )
+
+    if resultado == "WIN":
+        titulo = "WIN"
+        emoji = "✅"
+    elif resultado == "LOSS":
+        titulo = "LOSS"
+        emoji = "❌"
+    else:
+        titulo = "EMPATE"
+        emoji = "⚪"
+
+    if isinstance(abertura, (int, float)):
+        abertura_txt = f"{float(abertura):.6f}"
+    else:
+        abertura_txt = "--"
+
+    if isinstance(fechamento, (int, float)):
+        fechamento_txt = f"{float(fechamento):.6f}"
+    else:
+        fechamento_txt = "--"
+
+    return (
+        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
+        f"📊 {par}  •  M1\n"
+        f"🎯 Entrada: {hora}\n"
+        f"📌 Sinal: <b>{sinal}</b>\n"
+        f"💰 Abertura: {abertura_txt}\n"
+        f"🏁 Fechamento: {fechamento_txt}\n\n"
+        f"{'🔥 Entrada vencedora!' if resultado == 'WIN' else '📉 Entrada encerrada.'}"
+    )
+
+
+def telegram_enviar_resultado_pendente(
+    pendente,
+    resultado,
+    abertura,
+    fechamento,
+):
+    if not telegram_configurado():
+        return False
+
+    mensagem = telegram_formatar_resultado(
+        pendente,
+        resultado,
+        abertura,
+        fechamento,
+    )
+
+    return telegram_enviar(mensagem)
+
+
+def conferir_resultado_pendente_telegram(par, pendente, iq):
+    entrada_em = int(pendente.get("entrada_em", 0))
+    sinal = str(pendente.get("sinal", "")).upper()
+
+    if not entrada_em or sinal not in ("CALL", "PUT"):
+        return None
+
+    # Só confere depois do fechamento do M1.
+    if time.time() < entrada_em + TIMEFRAME:
+        return None
+
+    candles = buscar_candles_com_timeout(
+        iq,
+        par,
+        CANDLE_COUNT,
+        timeout_segundos=5,
+    )
+
+    por_inicio = {
+        int(c.get("from")): c
+        for c in candles
+        if c.get("from") is not None
+    }
+
+    alvo = por_inicio.get(entrada_em)
+
+    if not alvo:
+        return None
+
+    # Garante que o candle realmente terminou.
+    if time.time() < entrada_em + TIMEFRAME:
+        return None
+
+    abertura = alvo.get("open")
+    fechamento = alvo.get("close")
+
+    if abertura is None or fechamento is None:
+        return None
+
+    if fechamento > abertura:
+        direcao = "ALTA"
+    elif fechamento < abertura:
+        direcao = "BAIXA"
+    else:
+        direcao = "DOJI"
+
+    if direcao == "DOJI":
+        resultado = "EMPATE"
+    elif sinal == "CALL" and direcao == "ALTA":
+        resultado = "WIN"
+    elif sinal == "PUT" and direcao == "BAIXA":
+        resultado = "WIN"
+    else:
+        resultado = "LOSS"
+
+    return {
+        "resultado": resultado,
+        "abertura": abertura,
+        "fechamento": fechamento,
+    }
+
+
+def telegram_processar_resultados():
+    if not TELEGRAM_RESULTADOS_ATIVOS:
+        return
+
+    if not telegram_configurado():
+        return
+
+    try:
+        agora = int(time.time())
+
+        with _lock_aprendizado:
+            pendentes = _ler_json_seguro(
+                ARQUIVO_PENDENTES,
+                {},
+            )
+
+        candidatos = []
+
+        for chave, pendente in pendentes.items():
+            if not isinstance(pendente, dict):
+                continue
+
+            if not pendente.get("telegram_enviado"):
+                continue
+
+            if pendente.get("resultado_enviado"):
+                continue
+
+            entrada_em = int(
+                pendente.get("entrada_em", 0) or 0
+            )
+
+            # Não deixa crescer indefinidamente.
+            if entrada_em <= 0:
+                continue
+
+            # Depois de alguns minutos, ainda pode ser conferido,
+            # mas não processa sinais muito antigos.
+            if agora - entrada_em > 15 * 60:
+                continue
+
+            candidatos.append((chave, pendente))
+
+        # Processa no máximo alguns por ciclo.
+        candidatos = candidatos[:8]
+
+        if not candidatos:
+            return
+
+        iq = conectar()
+
+        for chave, pendente in candidatos:
+            try:
+                resultado = conferir_resultado_pendente_telegram(
+                    pendente.get("par"),
+                    pendente,
+                    iq,
+                )
+
+                if not resultado:
+                    continue
+
+                enviado = telegram_enviar_resultado_pendente(
+                    pendente,
+                    resultado["resultado"],
+                    resultado["abertura"],
+                    resultado["fechamento"],
+                )
+
+                if enviado:
+                    # Aprendizado usa somente WIN/LOSS.
+                    if resultado["resultado"] in ("WIN", "LOSS"):
+                        registrar_resultado_aprendizado(
+                            pendente.get("par"),
+                            int(pendente.get("entrada_em")),
+                            resultado["resultado"],
+                        )
+
+                    with _lock_aprendizado:
+                        atuais = _ler_json_seguro(
+                            ARQUIVO_PENDENTES,
+                            {},
+                        )
+                        item = atuais.get(chave)
+
+                        if isinstance(item, dict):
+                            item["resultado"] = resultado["resultado"]
+                            item["resultado_enviado"] = True
+                            item["resultado_enviado_em"] = int(time.time())
+                            item["abertura_resultado"] = resultado["abertura"]
+                            item["fechamento_resultado"] = resultado["fechamento"]
+                            atuais[chave] = item
+
+                            _salvar_json_seguro(
+                                ARQUIVO_PENDENTES,
+                                atuais,
+                            )
+
+                    print(
+                        "TELEGRAM RESULTADO OK:",
+                        pendente.get("par"),
+                        pendente.get("sinal"),
+                        resultado["resultado"],
+                    )
+
+            except Exception as erro:
+                print(
+                    "TELEGRAM RESULTADO:",
+                    pendente.get("par"),
+                    type(erro).__name__,
+                    str(erro),
+                )
+
+    except Exception as erro:
+        invalidar_conexao()
+        print(
+            "TELEGRAM RESULTADOS CICLO:",
+            type(erro).__name__,
+            str(erro),
+        )
+
+
+def iniciar_monitor_resultados_telegram():
+    if not TELEGRAM_RESULTADOS_ATIVOS:
+        print("TELEGRAM RESULTADOS: desativado.")
+        return
+
+    def trabalhador():
+        time.sleep(12)
+
+        while True:
+            try:
+                telegram_processar_resultados()
+            except Exception as erro:
+                print(
+                    "TELEGRAM RESULTADOS MONITOR:",
+                    type(erro).__name__,
+                    str(erro),
+                )
+
+            time.sleep(TELEGRAM_INTERVALO_RESULTADOS)
+
+    thread = threading.Thread(
+        target=trabalhador,
+        name="telegram-resultados",
+        daemon=True,
+    )
+    thread.start()
+
+    print("TELEGRAM RESULTADOS: monitor iniciado.")
+
+
+iniciar_monitor_resultados_telegram()
+
+
+# ============================================================
 # TESTE TELEGRAM
 # ============================================================
 
@@ -2078,6 +2368,32 @@ def telegram_enviar_sinal_animado(par, analise):
 
             with _telegram_lock_cooldown:
                 _telegram_ultima_entrada_enviada = time.time()
+
+        # Marca no arquivo de pendentes que este sinal realmente
+        # chegou ao Telegram. O monitor de WIN/LOSS usa essa marca.
+        try:
+            with _lock_aprendizado:
+                pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+                pendente = pendentes.get(
+                    f"{str(par).upper()}|{int(entrada_em)}"
+                )
+                if isinstance(pendente, dict):
+                    pendente["telegram_enviado"] = True
+                    pendente["telegram_enviado_em"] = int(time.time())
+                    pendente["resultado_enviado"] = False
+                    pendentes[
+                        f"{str(par).upper()}|{int(entrada_em)}"
+                    ] = pendente
+                    _salvar_json_seguro(
+                        ARQUIVO_PENDENTES,
+                        pendentes,
+                    )
+        except Exception as erro:
+            print(
+                "TELEGRAM RESULTADO: não foi possível marcar pendente:",
+                type(erro).__name__,
+                str(erro),
+            )
 
             if len(_sinais_telegram_enviados) > 500:
                 antigas = sorted(
