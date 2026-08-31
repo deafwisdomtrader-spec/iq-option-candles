@@ -5,11 +5,12 @@ import concurrent.futures
 import json
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # Brasil não tem mais horário de verão desde 2019,
 # então um offset fixo de UTC-3 é sempre correto
 # (evita depender de tzdata instalado no servidor do Render).
-FUSO_BR = timezone(timedelta(hours=-3))
+FUSO_BR = ZoneInfo("America/Sao_Paulo")
 
 from flask import Flask, jsonify, request
 from iqoptionapi.stable_api import IQ_Option
@@ -1819,7 +1820,10 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
     entrada_em = int(pendente.get("entrada_em", 0))
 
     hora = (
-        time.strftime("%H:%M", time.localtime(entrada_em))
+        datetime.fromtimestamp(
+            entrada_em,
+            tz=FUSO_BR,
+        ).strftime("%H:%M")
         if entrada_em
         else "--:--"
     )
@@ -1861,17 +1865,158 @@ def telegram_enviar_resultado_pendente(
     abertura,
     fechamento,
 ):
+    """
+    Animação do resultado no próprio Telegram.
+    Primeiro mostra APURANDO, depois CONFIRMANDO e por fim
+    substitui pela mensagem final WIN/LOSS/EMPATE.
+    """
     if not telegram_configurado():
         return False
 
-    mensagem = telegram_formatar_resultado(
+    par = pendente.get("par", "--")
+    sinal = str(pendente.get("sinal", "--")).upper()
+
+    if resultado == "WIN":
+        emoji = "✅"
+        titulo = "WIN"
+    elif resultado == "LOSS":
+        emoji = "❌"
+        titulo = "LOSS"
+    else:
+        emoji = "⚪"
+        titulo = "EMPATE"
+
+    # Frame 1 — começa a animação.
+    frame1 = (
+        "🔎 <b>DW TRADING — APURANDO</b>\n\n"
+        f"📊 {par} • M1\n"
+        f"🎯 Sinal: <b>{sinal}</b>\n"
+        "⏳ Calculando resultado...\n"
+        "▰▱▱▱▱▱▱▱▱▱ 10%"
+    )
+
+    # Frame 2 — confirmação.
+    frame2 = (
+        "⚡ <b>DW TRADING — CONFIRMANDO</b>\n\n"
+        f"📊 {par} • M1\n"
+        f"🎯 Sinal: <b>{sinal}</b>\n"
+        "🔄 Conferindo fechamento da vela...\n"
+        "▰▰▰▰▰▰▰▱▱▱ 80%"
+    )
+
+    final = telegram_formatar_resultado(
         pendente,
         resultado,
         abertura,
         fechamento,
     )
 
-    return telegram_enviar(mensagem)
+    try:
+        send_url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/sendMessage"
+        )
+
+        resposta = requests.post(
+            send_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": frame1,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not resposta.ok:
+            print(
+                "TELEGRAM RESULTADO ANIM ERROR:",
+                resposta.status_code,
+                resposta.text[:1000],
+            )
+            return False
+
+        dados = resposta.json()
+
+        if not dados.get("ok"):
+            print("TELEGRAM RESULTADO API ERROR:", dados)
+            return False
+
+        message_id = dados["result"]["message_id"]
+
+        edit_url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/editMessageText"
+        )
+
+        time.sleep(0.65)
+
+        r2 = requests.post(
+            edit_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": frame2,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not r2.ok:
+            print(
+                "TELEGRAM RESULTADO FRAME2 ERROR:",
+                r2.status_code,
+                r2.text[:1000],
+            )
+
+        time.sleep(0.65)
+
+        r3 = requests.post(
+            edit_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": final,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not r3.ok:
+            print(
+                "TELEGRAM RESULTADO FINAL ERROR:",
+                r3.status_code,
+                r3.text[:1000],
+            )
+            return False
+
+        dados_final = r3.json()
+
+        if not dados_final.get("ok"):
+            print(
+                "TELEGRAM RESULTADO FINAL API ERROR:",
+                dados_final,
+            )
+            return False
+
+        print(
+            "TELEGRAM RESULTADO ANIMADO OK:",
+            par,
+            resultado,
+        )
+        return True
+
+    except Exception as erro:
+        print(
+            "TELEGRAM RESULTADO ANIM EXCEPTION:",
+            type(erro).__name__,
+            str(erro),
+        )
+        return False
 
 
 def conferir_resultado_pendente_telegram(par, pendente, iq):
@@ -2014,6 +2159,18 @@ def telegram_processar_resultados():
                             resultado["resultado"],
                         )
 
+                    # Martingale SOMENTE depois do resultado.
+                    # WIN encerra; LOSS mostra G1/G2 disponível.
+                    if resultado["resultado"] == "LOSS":
+                        telegram_registrar_loss_e_mostrar_gale(
+                            pendente
+                        )
+                    elif resultado["resultado"] == "WIN":
+                        telegram_encerrar_martingale(
+                            pendente,
+                            "WIN",
+                        )
+
                     with _lock_aprendizado:
                         atuais = _ler_json_seguro(
                             ARQUIVO_PENDENTES,
@@ -2089,6 +2246,130 @@ def iniciar_monitor_resultados_telegram():
 
 
 iniciar_monitor_resultados_telegram()
+
+
+# ============================================================
+# MARTINGALE APÓS RESULTADO
+# ============================================================
+#
+# Regra:
+# - Entrada normal é enviada primeiro.
+# - Depois do fechamento do M1, envia WIN/LOSS.
+# - SOMENTE depois de LOSS aparece a disponibilidade de G1.
+# - G1 só é enviado se o sistema encontrar/usar a sequência de
+#   Martingale configurada.
+# - Após G1 LOSS, aparece G2.
+# - Após WIN em qualquer etapa, encerra a sequência.
+# - Após G2 LOSS, encerra como LOSS FINAL.
+# - Nunca mostra Martingale antes do resultado.
+#
+# Observação: esta camada é de alertas Telegram e não executa
+# ordens na IQ Option.
+
+TELEGRAM_MARTINGALE_ATIVO = (
+    os.getenv("TELEGRAM_MARTINGALE_ATIVO", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+TELEGRAM_MAX_GALES = 2
+_martingale_lock = threading.Lock()
+_martingale_sequencias = {}
+
+
+def telegram_martingale_key(pendente):
+    return (
+        f"{str(pendente.get('par', '')).upper()}|"
+        f"{int(pendente.get('entrada_em', 0) or 0)}"
+    )
+
+
+def telegram_enviar_martingale_disponivel(pendente, gale):
+    if not telegram_configurado():
+        return False
+
+    par = pendente.get("par", "--")
+    sinal = str(pendente.get("sinal", "--")).upper()
+
+    if gale == 1:
+        titulo = "G1 DISPONÍVEL"
+        emoji = "🔁"
+    else:
+        titulo = "G2 DISPONÍVEL"
+        emoji = "🔁"
+
+    mensagem = (
+        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
+        f"📊 {par} • M1\n"
+        f"📌 Sinal original: <b>{sinal}</b>\n"
+        f"❌ Resultado anterior: <b>LOSS</b>\n\n"
+        f"🎯 Próxima etapa: <b>G{gale}</b>\n"
+        "⏳ Aguardando a próxima entrada da sequência."
+    )
+
+    return telegram_enviar(mensagem)
+
+
+def telegram_registrar_loss_e_mostrar_gale(pendente):
+    if not TELEGRAM_MARTINGALE_ATIVO:
+        return
+
+    chave = telegram_martingale_key(pendente)
+
+    with _martingale_lock:
+        sequencia = _martingale_sequencias.get(
+            chave,
+            {
+                "gale_atual": 0,
+                "finalizada": False,
+            },
+        )
+
+        if sequencia["finalizada"]:
+            return
+
+        gale_atual = int(sequencia["gale_atual"])
+
+        # Depois da entrada normal LOSS -> G1.
+        # Depois de G1 LOSS -> G2.
+        proximo_gale = gale_atual + 1
+
+        if proximo_gale > TELEGRAM_MAX_GALES:
+            sequencia["finalizada"] = True
+            _martingale_sequencias[chave] = sequencia
+            return
+
+        sequencia["gale_atual"] = proximo_gale
+        _martingale_sequencias[chave] = sequencia
+
+    telegram_enviar_martingale_disponivel(
+        pendente,
+        proximo_gale,
+    )
+
+
+def telegram_encerrar_martingale(pendente, resultado):
+    chave = telegram_martingale_key(pendente)
+
+    with _martingale_lock:
+        sequencia = _martingale_sequencias.get(
+            chave,
+            {
+                "gale_atual": 0,
+                "finalizada": False,
+            },
+        )
+
+        if resultado == "WIN":
+            sequencia["finalizada"] = True
+
+        elif (
+            resultado == "LOSS"
+            and int(sequencia.get("gale_atual", 0))
+            >= TELEGRAM_MAX_GALES
+        ):
+            sequencia["finalizada"] = True
+
+        _martingale_sequencias[chave] = sequencia
 
 
 # ============================================================
