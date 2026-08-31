@@ -2624,6 +2624,54 @@ TELEGRAM_OFFSET_VELA = 2
 # vela de entrada e o envio da mensagem.
 TELEGRAM_ATRASO_MAXIMO_ENTRADA = 15
 
+# ------------------------------------------------------------
+# ANTECEDÊNCIA DA ENTRADA
+# ------------------------------------------------------------
+# Quantas velas à frente o sinal marca a entrada.
+#
+# Contando a partir do momento em que a mensagem sai (logo
+# depois da virada do minuto):
+#
+#   0 = entra na vela seguinte  -> quase nenhum aviso
+#   1 = cerca de 1 minuto de aviso
+#   2 = cerca de 2 minutos de aviso   <- em uso
+#
+# TROCA CONSCIENTE: a análise lê a vela que acabou de fechar.
+# Quanto mais longe estiver a entrada, mais velha fica essa
+# leitura, e menos ela representa o momento da entrada. Em
+# compensação, sem tempo de aviso o aluno não consegue abrir a
+# corretora e clicar.
+#
+# O resultado WIN/LOSS continua sendo medido na vela REAL da
+# entrada, não na vela analisada. A conferência segue honesta.
+TELEGRAM_VELAS_ANTECEDENCIA = 2
+
+
+def _adiantar_entrada(analise, velas=TELEGRAM_VELAS_ANTECEDENCIA):
+    """Empurra a entrada algumas velas para frente.
+
+    Devolve uma CÓPIA. O painel do site continua usando a
+    análise original, sem alteração.
+    """
+    if velas <= 0:
+        return analise
+
+    entrada_em = analise.get("entrada_em")
+
+    if not entrada_em:
+        return analise
+
+    novo = dict(analise)
+    novo_ts = int(entrada_em) + (velas * TIMEFRAME)
+
+    novo["entrada_em"] = novo_ts
+    novo["entrada"] = datetime.fromtimestamp(
+        novo_ts,
+        tz=FUSO_BR,
+    ).strftime("%H:%M")
+
+    return novo
+
 
 def _dormir_ate_proxima_vela(offset=TELEGRAM_OFFSET_VELA):
     """Dorme até logo depois da próxima virada de minuto."""
@@ -2687,6 +2735,21 @@ def telegram_formatar_sinal(par, analise):
     rsi_texto = f"{float(rsi):.1f}" if isinstance(rsi, (int, float)) else "--"
     preco_texto = f"{float(preco):.6f}" if isinstance(preco, (int, float)) else "--"
 
+    # Quanto falta para a vela de entrada abrir. É o dado mais
+    # prático da mensagem: diz se dá tempo de abrir a corretora.
+    entrada_em = analise.get("entrada_em")
+    linha_contagem = ""
+
+    if entrada_em:
+        faltam = int(entrada_em) - int(time.time())
+
+        if faltam >= 60:
+            linha_contagem = (
+                f"⏳ Prepare-se  <b>{faltam // 60}min {faltam % 60}s</b>\n"
+            )
+        elif faltam > 0:
+            linha_contagem = f"⏳ Prepare-se  <b>{faltam}s</b>\n"
+
     # SEM moldura de caracteres. O Telegram no celular usa fonte
     # de largura variável, então "╭──╮" e "│" nunca alinham e a
     # mensagem fica torta. Espaço em branco e negrito resolvem.
@@ -2694,7 +2757,8 @@ def telegram_formatar_sinal(par, analise):
         f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
         "─────────────\n"
         f"⏰ Entrada  <b>{entrada}</b>\n"
-        f"⏱ Duração  <b>M1</b>\n\n"
+        f"⏱ Duração  <b>M1</b>\n"
+        f"{linha_contagem}\n"
         f"{seta} Tendência  <b>{tendencia}</b>\n"
         f"⭐ Força  {_barra_forca(confianca)}  <b>{confianca}</b>\n"
         f"📊 RSI  <b>{rsi_texto}</b>\n"
@@ -2966,6 +3030,11 @@ def telegram_processar_sinais():
                     par,
                 )
 
+                # Empurra a entrada para frente, dando tempo do
+                # aluno abrir a corretora. Só vale para o
+                # Telegram; o painel do site segue igual.
+                analise = _adiantar_entrada(analise)
+
                 # A ORDEM IMPORTA: grava o pendente ANTES de
                 # enviar. A marcação só consegue atualizar um
                 # registro que já existe.
@@ -3067,6 +3136,8 @@ def telegram_sinais_test():
                 analise = analisar_sinal(candles, par)
 
                 if analise.get("sinal") in ("CALL", "PUT"):
+
+                    analise = _adiantar_entrada(analise)
 
                     # ----------------------------------------
                     # CORREÇÃO 2 — SINAL DE TESTE SEM RESULTADO
