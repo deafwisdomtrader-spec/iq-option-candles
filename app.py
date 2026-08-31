@@ -17,6 +17,16 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
+# ------------------------------------------------------------
+# VERSÃO DO ARQUIVO
+# ------------------------------------------------------------
+# Aparece em /status e /health. Serve para responder sem
+# adivinhação: "o Render já está rodando o arquivo novo?"
+#
+# Ao subir uma alteração, mude este número. Se /status ainda
+# mostrar o número antigo, o deploy não chegou.
+VERSAO = "2026-08-31-v5-threads"
+
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
 # ============================================================
@@ -3453,6 +3463,7 @@ def status():
 
     return jsonify({
         "ok": True,
+        "versao": VERSAO,
         "monitor_saudavel": monitor_ok,
         "minutos_no_ar": minutos_no_ar,
         "threads_vivas": threads_vivas,
@@ -3721,6 +3732,8 @@ def health():
 
         "servico":
             "iq-option-candles",
+
+        "versao": VERSAO,
 
         "iq_conectada":
             conectado,
