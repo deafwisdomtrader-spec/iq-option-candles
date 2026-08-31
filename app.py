@@ -1952,11 +1952,15 @@ def telegram_formatar_resultado(pendente, resultado, etapa=0):
     else:
         linha_etapa = ""
 
+    # O horário aqui é o da ENTRADA, não o do envio da
+    # mensagem. Com a antecedência ligada, o sinal sai alguns
+    # minutos antes — então dizer "sinal das 09:00" faria o
+    # aluno procurar uma mensagem que não existe nesse horário.
     return (
         f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
         "─────────────\n"
-        f"📌 Sinal  <b>{sinal}</b> · M1\n"
-        f"⏰ Entrada  <b>{hora}</b>\n"
+        f"↩️ Entrada das  <b>{hora}</b>\n"
+        f"📌 Direção  <b>{sinal}</b> · M1\n"
         f"{linha_etapa}\n"
         f"{rodape}"
     )
@@ -2726,21 +2730,6 @@ def telegram_formatar_sinal(par, analise):
 
     rsi_texto = f"{float(rsi):.1f}" if isinstance(rsi, (int, float)) else "--"
 
-    # Quanto falta para a vela de entrada abrir. É o dado mais
-    # prático da mensagem: diz se dá tempo de abrir a corretora.
-    entrada_em = analise.get("entrada_em")
-    linha_contagem = ""
-
-    if entrada_em:
-        faltam = int(entrada_em) - int(time.time())
-
-        if faltam >= 60:
-            linha_contagem = (
-                f"⏳ Prepare-se  <b>{faltam // 60}min {faltam % 60}s</b>\n"
-            )
-        elif faltam > 0:
-            linha_contagem = f"⏳ Prepare-se  <b>{faltam}s</b>\n"
-
     # SEM moldura de caracteres. O Telegram no celular usa fonte
     # de largura variável, então "╭──╮" e "│" nunca alinham e a
     # mensagem fica torta. Espaço em branco e negrito resolvem.
@@ -2748,8 +2737,7 @@ def telegram_formatar_sinal(par, analise):
         f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
         "─────────────\n"
         f"⏰ Entrada  <b>{entrada}</b>\n"
-        f"⏱ Duração  <b>M1</b>\n"
-        f"{linha_contagem}\n"
+        f"⏱ Duração  <b>M1</b>\n\n"
         f"{seta} Tendência  <b>{tendencia}</b>\n"
         f"⭐ Força  {_barra_forca(confianca)}  <b>{confianca}</b>\n"
         f"📊 RSI  <b>{rsi_texto}</b>\n\n"
