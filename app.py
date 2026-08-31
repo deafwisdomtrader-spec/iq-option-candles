@@ -1836,6 +1836,95 @@ def telegram_configurado():
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
+# ============================================================
+# STICKERS
+# ============================================================
+#
+# Os arquivos .webp ficam na mesma pasta do app.py, vindos do
+# GitHub. O bot envia o arquivo direto, sem precisar de
+# file_id nem de pacote publicado.
+#
+# Se um arquivo não existir, o envio simplesmente não acontece
+# e a mensagem de texto segue normal. Sticker é enfeite; o
+# sinal não pode depender dele.
+
+PASTA_STICKERS = os.path.dirname(os.path.abspath(__file__))
+
+STICKERS = {
+    "CALL": "call.webp",
+    "PUT": "put.webp",
+    "WIN": "win.webp",
+    "WIN_G1": "win_g1.webp",
+    "WIN_G2": "win_g2.webp",
+    "LOSS": "loss.webp",
+    "EMPATE": "empate.webp",
+}
+
+
+def telegram_enviar_sticker(chave):
+    """Envia um sticker do pacote local. Falha em silêncio."""
+    if not telegram_configurado():
+        return False
+
+    nome = STICKERS.get(str(chave).upper())
+
+    if not nome:
+        return False
+
+    caminho = os.path.join(PASTA_STICKERS, nome)
+
+    if not os.path.isfile(caminho):
+        print("STICKER: arquivo nao encontrado —", nome)
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendSticker"
+    )
+
+    try:
+        with open(caminho, "rb") as arquivo:
+            resposta = requests.post(
+                url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "disable_notification": True,
+                },
+                files={"sticker": (nome, arquivo, "image/webp")},
+                timeout=20,
+            )
+
+        if not resposta.ok or not resposta.json().get("ok"):
+            print(
+                "STICKER ERROR:",
+                resposta.status_code,
+                resposta.text[:300],
+            )
+            return False
+
+        return True
+
+    except Exception as erro:
+        print("STICKER EXCEPTION:", type(erro).__name__, str(erro))
+        return False
+
+
+def _chave_sticker_resultado(resultado, etapa):
+    """Traduz resultado + etapa no nome do sticker."""
+    if resultado == "WIN":
+        if etapa == 1:
+            return "WIN_G1"
+        if etapa >= 2:
+            return "WIN_G2"
+        return "WIN"
+
+    if resultado == "LOSS":
+        return "LOSS"
+
+    return "EMPATE"
+
+
 def telegram_enviar(mensagem):
     """Envia mensagem pela API oficial do Telegram."""
     if not telegram_configurado():
@@ -2066,6 +2155,11 @@ def telegram_enviar_resultado_pendente(
                 r2.status_code,
                 r2.text[:1000],
             )
+
+        # Sticker do resultado, antes do texto final.
+        telegram_enviar_sticker(
+            _chave_sticker_resultado(resultado, etapa)
+        )
 
         time.sleep(0.65)
 
@@ -2897,6 +2991,9 @@ def telegram_enviar_sinal_animado(par, analise):
 
         if not final:
             return False
+
+        # Sticker da direção, logo antes do texto final.
+        telegram_enviar_sticker(sinal)
 
         resposta_final = requests.post(
             edit_url,
