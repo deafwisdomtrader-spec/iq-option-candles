@@ -2596,6 +2596,46 @@ TELEGRAM_MAX_PARES_CICLO = 4
 _lock_sinais_telegram = threading.Lock()
 _sinais_telegram_enviados = {}
 
+# ------------------------------------------------------------
+# SINCRONIA COM A VELA M1
+# ------------------------------------------------------------
+# O sinal manda entrar na vela que abre logo depois da análise.
+# Se a mensagem chegar quando essa vela já está correndo, o
+# aluno entra atrasado, num preço diferente do analisado — e o
+# robô ainda confere o resultado nessa mesma vela, que o aluno
+# não pegou inteira. O número fica bonito e a operação real
+# não bate.
+#
+# Duas travas para isso:
+#
+# 1. O ciclo acorda logo depois da virada do minuto, e não em
+#    qualquer ponto dele.
+# 2. Se mesmo assim o envio atrasar, o sinal é DESCARTADO em
+#    vez de enviado tarde. Sinal nenhum é melhor que sinal que
+#    não dá para operar.
+# ------------------------------------------------------------
+
+# Segundos após a virada do minuto em que o ciclo acorda.
+# Pequeno, mas o bastante para a corretora já ter fechado
+# a vela anterior.
+TELEGRAM_OFFSET_VELA = 2
+
+# Atraso máximo tolerado, em segundos, entre a abertura da
+# vela de entrada e o envio da mensagem.
+TELEGRAM_ATRASO_MAXIMO_ENTRADA = 15
+
+
+def _dormir_ate_proxima_vela(offset=TELEGRAM_OFFSET_VELA):
+    """Dorme até logo depois da próxima virada de minuto."""
+    agora = time.time()
+    proxima = (int(agora // TIMEFRAME) + 1) * TIMEFRAME + offset
+    espera = proxima - agora
+
+    if espera <= 0:
+        espera = TIMEFRAME
+
+    time.sleep(espera)
+
 
 def _barra_forca(pontos, maximo=10):
     """Transforma a pontuação numa barra curta de 5 marcas.
@@ -2693,6 +2733,25 @@ def telegram_enviar_sinal_animado(par, analise):
     if sinal not in ("CALL", "PUT") or not entrada_em:
         return False
 
+    # ------------------------------------------------------
+    # TRAVA DE ATRASO
+    # ------------------------------------------------------
+    # Se a vela de entrada já está correndo há muito tempo, o
+    # aluno não consegue mais entrar no preço analisado. Nesse
+    # caso o sinal é descartado, não enviado tarde.
+    # ------------------------------------------------------
+    atraso_entrada = time.time() - int(entrada_em)
+
+    if atraso_entrada > TELEGRAM_ATRASO_MAXIMO_ENTRADA:
+        print(
+            "TELEGRAM ATRASO: sinal de",
+            par,
+            "descartado —",
+            int(atraso_entrada),
+            "s depois da abertura da vela de entrada.",
+        )
+        return False
+
     # Só permite uma nova entrada depois de 3 minutos.
     # Isso evita vários CALL/PUT quase simultâneos no grupo.
     agora = time.time()
@@ -2770,7 +2829,7 @@ def telegram_enviar_sinal_animado(par, analise):
 
         message_id = dados["result"]["message_id"]
 
-        time.sleep(0.7)
+        time.sleep(0.4)
 
         edit_url = (
             "https://api.telegram.org/bot"
@@ -2790,7 +2849,7 @@ def telegram_enviar_sinal_animado(par, analise):
             timeout=15,
         )
 
-        time.sleep(0.7)
+        time.sleep(0.4)
 
         final = telegram_formatar_sinal(par, analise)
 
@@ -2952,6 +3011,11 @@ def iniciar_monitor_telegram():
         time.sleep(8)
 
         while True:
+            # Acorda logo DEPOIS da virada do minuto, e não em
+            # qualquer ponto dele. Assim o sinal sai no começo
+            # da vela de entrada, e o aluno consegue operar.
+            _dormir_ate_proxima_vela()
+
             try:
                 telegram_processar_sinais()
             except Exception as erro:
@@ -2960,8 +3024,6 @@ def iniciar_monitor_telegram():
                     type(erro).__name__,
                     str(erro),
                 )
-
-            time.sleep(TELEGRAM_INTERVALO_SINAIS)
 
     thread = threading.Thread(
         target=trabalhador,
