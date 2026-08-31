@@ -1819,10 +1819,7 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
     entrada_em = int(pendente.get("entrada_em", 0))
 
     hora = (
-        datetime.fromtimestamp(
-            entrada_em,
-            tz=FUSO_BR,
-        ).strftime("%H:%M")
+        time.strftime("%H:%M", time.localtime(entrada_em))
         if entrada_em
         else "--:--"
     )
@@ -2017,18 +2014,6 @@ def telegram_processar_resultados():
                             resultado["resultado"],
                         )
 
-                    # Martingale SOMENTE depois do resultado.
-                    # WIN encerra; LOSS mostra G1/G2 disponível.
-                    if resultado["resultado"] == "LOSS":
-                        telegram_registrar_loss_e_mostrar_gale(
-                            pendente
-                        )
-                    elif resultado["resultado"] == "WIN":
-                        telegram_encerrar_martingale(
-                            pendente,
-                            "WIN",
-                        )
-
                     with _lock_aprendizado:
                         atuais = _ler_json_seguro(
                             ARQUIVO_PENDENTES,
@@ -2104,130 +2089,6 @@ def iniciar_monitor_resultados_telegram():
 
 
 iniciar_monitor_resultados_telegram()
-
-
-# ============================================================
-# MARTINGALE APÓS RESULTADO
-# ============================================================
-#
-# Regra:
-# - Entrada normal é enviada primeiro.
-# - Depois do fechamento do M1, envia WIN/LOSS.
-# - SOMENTE depois de LOSS aparece a disponibilidade de G1.
-# - G1 só é enviado se o sistema encontrar/usar a sequência de
-#   Martingale configurada.
-# - Após G1 LOSS, aparece G2.
-# - Após WIN em qualquer etapa, encerra a sequência.
-# - Após G2 LOSS, encerra como LOSS FINAL.
-# - Nunca mostra Martingale antes do resultado.
-#
-# Observação: esta camada é de alertas Telegram e não executa
-# ordens na IQ Option.
-
-TELEGRAM_MARTINGALE_ATIVO = (
-    os.getenv("TELEGRAM_MARTINGALE_ATIVO", "1").strip().lower()
-    not in ("0", "false", "nao", "não", "off")
-)
-
-TELEGRAM_MAX_GALES = 2
-_martingale_lock = threading.Lock()
-_martingale_sequencias = {}
-
-
-def telegram_martingale_key(pendente):
-    return (
-        f"{str(pendente.get('par', '')).upper()}|"
-        f"{int(pendente.get('entrada_em', 0) or 0)}"
-    )
-
-
-def telegram_enviar_martingale_disponivel(pendente, gale):
-    if not telegram_configurado():
-        return False
-
-    par = pendente.get("par", "--")
-    sinal = str(pendente.get("sinal", "--")).upper()
-
-    if gale == 1:
-        titulo = "G1 DISPONÍVEL"
-        emoji = "🔁"
-    else:
-        titulo = "G2 DISPONÍVEL"
-        emoji = "🔁"
-
-    mensagem = (
-        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
-        f"📊 {par} • M1\n"
-        f"📌 Sinal original: <b>{sinal}</b>\n"
-        f"❌ Resultado anterior: <b>LOSS</b>\n\n"
-        f"🎯 Próxima etapa: <b>G{gale}</b>\n"
-        "⏳ Aguardando a próxima entrada da sequência."
-    )
-
-    return telegram_enviar(mensagem)
-
-
-def telegram_registrar_loss_e_mostrar_gale(pendente):
-    if not TELEGRAM_MARTINGALE_ATIVO:
-        return
-
-    chave = telegram_martingale_key(pendente)
-
-    with _martingale_lock:
-        sequencia = _martingale_sequencias.get(
-            chave,
-            {
-                "gale_atual": 0,
-                "finalizada": False,
-            },
-        )
-
-        if sequencia["finalizada"]:
-            return
-
-        gale_atual = int(sequencia["gale_atual"])
-
-        # Depois da entrada normal LOSS -> G1.
-        # Depois de G1 LOSS -> G2.
-        proximo_gale = gale_atual + 1
-
-        if proximo_gale > TELEGRAM_MAX_GALES:
-            sequencia["finalizada"] = True
-            _martingale_sequencias[chave] = sequencia
-            return
-
-        sequencia["gale_atual"] = proximo_gale
-        _martingale_sequencias[chave] = sequencia
-
-    telegram_enviar_martingale_disponivel(
-        pendente,
-        proximo_gale,
-    )
-
-
-def telegram_encerrar_martingale(pendente, resultado):
-    chave = telegram_martingale_key(pendente)
-
-    with _martingale_lock:
-        sequencia = _martingale_sequencias.get(
-            chave,
-            {
-                "gale_atual": 0,
-                "finalizada": False,
-            },
-        )
-
-        if resultado == "WIN":
-            sequencia["finalizada"] = True
-
-        elif (
-            resultado == "LOSS"
-            and int(sequencia.get("gale_atual", 0))
-            >= TELEGRAM_MAX_GALES
-        ):
-            sequencia["finalizada"] = True
-
-        _martingale_sequencias[chave] = sequencia
 
 
 # ============================================================
