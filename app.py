@@ -1,7 +1,7 @@
 import os
 import time
 import threading
-import concurrent.futures 
+import concurrent.futures
 import json
 import requests
 from datetime import datetime, timezone, timedelta
@@ -2473,6 +2473,7 @@ def iniciar_monitor_resultados_telegram():
         while True:
             try:
                 telegram_processar_resultados()
+                _marcar_batimento("resultados", "ciclos_resultados")
             except Exception as erro:
                 print(
                     "TELEGRAM RESULTADOS MONITOR:",
@@ -2686,6 +2687,32 @@ TELEGRAM_MAX_PARES_CICLO = 4
 
 _lock_sinais_telegram = threading.Lock()
 _sinais_telegram_enviados = {}
+
+# ------------------------------------------------------------
+# BATIMENTO DOS MONITORES
+# ------------------------------------------------------------
+# Guarda quando cada monitor rodou pela última vez. Sem isso
+# não há como saber se o serviço parou de mandar sinal porque
+# o mercado estava parado ou porque a thread morreu.
+#
+# Aparece em /status.
+_batimento = {
+    "inicio": int(time.time()),
+    "sinais": 0,
+    "resultados": 0,
+    "ciclos_sinais": 0,
+    "ciclos_resultados": 0,
+    "keepalive": 0,
+    "keepalive_falhas": 0,
+}
+_lock_batimento = threading.Lock()
+
+
+def _marcar_batimento(chave, contador=None):
+    with _lock_batimento:
+        _batimento[chave] = int(time.time())
+        if contador:
+            _batimento[contador] = _batimento.get(contador, 0) + 1
 
 # ------------------------------------------------------------
 # SINCRONIA COM A VELA M1
@@ -3159,19 +3186,29 @@ def iniciar_monitor_telegram():
         time.sleep(8)
 
         while True:
-            # Acorda logo DEPOIS da virada do minuto, e não em
-            # qualquer ponto dele. Assim o sinal sai no começo
-            # da vela de entrada, e o aluno consegue operar.
-            _dormir_ate_proxima_vela()
-
+            # TUDO dentro do try. Antes, se _dormir_ate_proxima_vela
+            # levantasse qualquer exceção, a thread morria em
+            # silêncio e o grupo ficava mudo até alguém reiniciar
+            # o serviço — sem nenhum erro visível no log.
             try:
+                # Acorda logo DEPOIS da virada do minuto, e não
+                # em qualquer ponto dele. Assim o sinal sai no
+                # começo da vela de entrada.
+                _dormir_ate_proxima_vela()
+
                 telegram_processar_sinais()
+
+                _marcar_batimento("sinais", "ciclos_sinais")
+
             except Exception as erro:
                 print(
                     "TELEGRAM MONITOR:",
                     type(erro).__name__,
                     str(erro),
                 )
+                # Sem esta pausa, um erro logo no sleep viraria
+                # laço infinito consumindo CPU.
+                time.sleep(5)
 
     thread = threading.Thread(
         target=trabalhador,
@@ -3277,8 +3314,252 @@ def telegram_sinais_test():
         }), 503
 
 
+# ============================================================
+# KEEP-ALIVE — EVITAR QUE O RENDER DURMA
+# ============================================================
+#
+# O plano gratuito do Render desliga o serviço depois de ~15
+# minutos sem NENHUMA visita HTTP. Quando isso acontece, as
+# threads do Telegram morrem junto e o grupo fica mudo até
+# alguém abrir alguma URL do serviço.
+#
+# Foi o que aconteceu no silêncio das 15:05 às 18:30.
+#
+# Este monitor visita a própria /health de tempos em tempos.
+# Essa visita conta como tráfego e segura o serviço acordado.
+#
+# LIMITE HONESTO: isto EVITA que durma, mas não ACORDA um
+# serviço que já dormiu — se o serviço cair por outro motivo,
+# ele não volta sozinho. Para garantia real existem dois
+# caminhos:
+#   1. Plano pago do Render (não dorme nunca);
+#   2. Um monitor externo e gratuito (UptimeRobot,
+#      cron-job.org) visitando /health a cada 5 minutos.
+# O ideal é usar o monitor externo junto com isto.
+
+KEEPALIVE_ATIVO = (
+    os.getenv("KEEPALIVE_ATIVO", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+# O Render publica esta variável sozinho. Se não existir,
+# dá para preencher à mão nas Environment Variables.
+URL_PUBLICA = (
+    os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+)
+
+# 10 minutos: folgado dentro dos 15 do Render.
+KEEPALIVE_INTERVALO = 600
+
+
+def iniciar_keepalive():
+    if not KEEPALIVE_ATIVO:
+        print("KEEPALIVE: desativado.")
+        return
+
+    if not URL_PUBLICA:
+        print(
+            "KEEPALIVE: sem RENDER_EXTERNAL_URL. "
+            "Configure essa variável no Render para o "
+            "serviço não dormir."
+        )
+        return
+
+    alvo = URL_PUBLICA + "/health"
+
+    def trabalhador():
+        time.sleep(60)
+
+        while True:
+            try:
+                resposta = requests.get(alvo, timeout=20)
+
+                if resposta.ok:
+                    _marcar_batimento("keepalive")
+                else:
+                    _marcar_batimento(
+                        "keepalive",
+                        "keepalive_falhas",
+                    )
+                    print(
+                        "KEEPALIVE: resposta",
+                        resposta.status_code,
+                    )
+
+            except Exception as erro:
+                _marcar_batimento("keepalive", "keepalive_falhas")
+                print(
+                    "KEEPALIVE:",
+                    type(erro).__name__,
+                    str(erro)[:120],
+                )
+
+            time.sleep(KEEPALIVE_INTERVALO)
+
+    thread = threading.Thread(
+        target=trabalhador,
+        name="keepalive",
+        daemon=True,
+    )
+    thread.start()
+
+    print("KEEPALIVE: monitor iniciado —", alvo)
+
+
+# ============================================================
+# STATUS — OS MONITORES ESTÃO VIVOS?
+# ============================================================
+#
+# Serve para responder, sem adivinhação: "o Telegram parou
+# porque não teve sinal, ou porque o serviço morreu?"
+#
+# Uso: /status
+# ============================================================
+
+@app.get("/status")
+def status():
+
+    agora = int(time.time())
+
+    with _lock_batimento:
+        dados = dict(_batimento)
+
+    def ha_quanto(chave):
+        marca = dados.get(chave, 0)
+        if not marca:
+            return None
+        return agora - marca
+
+    minutos_no_ar = (agora - dados.get("inicio", agora)) // 60
+
+    segundos_sinais = ha_quanto("sinais")
+    segundos_resultados = ha_quanto("resultados")
+
+    # O ciclo de sinais roda a cada minuto. Passando de 5
+    # minutos sem batida, alguma coisa está errada.
+    monitor_ok = (
+        segundos_sinais is not None
+        and segundos_sinais < 300
+    )
+
+    threads_vivas = sorted(
+        t.name for t in threading.enumerate()
+        if t.name in (
+            "telegram-sinais",
+            "telegram-resultados",
+            "keepalive",
+        )
+    )
+
+    return jsonify({
+        "ok": True,
+        "monitor_saudavel": monitor_ok,
+        "minutos_no_ar": minutos_no_ar,
+        "threads_vivas": threads_vivas,
+        "ultimo_ciclo_sinais_seg": segundos_sinais,
+        "ultimo_ciclo_resultados_seg": segundos_resultados,
+        "ciclos_sinais": dados.get("ciclos_sinais", 0),
+        "ciclos_resultados": dados.get("ciclos_resultados", 0),
+        "keepalive_ativo": KEEPALIVE_ATIVO,
+        "keepalive_url": URL_PUBLICA or None,
+        "keepalive_ultimo_seg": ha_quanto("keepalive"),
+        "keepalive_falhas": dados.get("keepalive_falhas", 0),
+        "timestamp": agora,
+    })
+
+
+# ============================================================
+# CONFERIR OS STICKERS
+# ============================================================
+#
+# O código não tem como saber se o arquivo call.webp contém
+# mesmo o desenho do CALL. Se os nomes forem trocados na hora
+# de subir, o robô manda o sticker errado sem dar nenhum erro
+# — e o aluno entra na direção errada.
+#
+# Esta rota manda os 7 stickers no grupo, cada um com uma
+# legenda dizendo qual DEVERIA ser. Assim dá para conferir
+# com o olho em 10 segundos.
+#
+# Uso: /telegram/stickers/test
+# ============================================================
+
+@app.get("/telegram/stickers/test")
+def telegram_stickers_test():
+
+    if not telegram_configurado():
+        return jsonify({
+            "ok": False,
+            "erro": (
+                "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID "
+                "não configurado."
+            ),
+        }), 503
+
+    esperado = {
+        "CALL": "verde, seta para CIMA",
+        "PUT": "vermelho, seta para BAIXO",
+        "WIN": "verde, tique",
+        "WIN_G1": "azul, tique, escrito WIN 1G",
+        "WIN_G2": "azul, tique, escrito WIN 2G",
+        "LOSS": "vermelho, xis",
+        "EMPATE": "cinza, dois traços",
+    }
+
+    telegram_enviar(
+        "🔍 <b>CONFERÊNCIA DE STICKERS</b>\n\n"
+        "Cada sticker vem com a descrição do que ele "
+        "DEVERIA ser. Se algum não bater, o arquivo foi "
+        "trocado na hora de subir."
+    )
+
+    relatorio = []
+
+    for chave, descricao in esperado.items():
+
+        nome = STICKERS[chave]
+        caminho = os.path.join(PASTA_STICKERS, nome)
+        existe = os.path.isfile(caminho)
+
+        if existe:
+            enviado = telegram_enviar_sticker(chave)
+            telegram_enviar(
+                f"☝️ deveria ser: <b>{chave}</b> — {descricao}"
+            )
+        else:
+            enviado = False
+            telegram_enviar(
+                f"❗ <b>{chave}</b> — arquivo <code>{nome}</code> "
+                "não encontrado no servidor."
+            )
+
+        relatorio.append({
+            "sticker": chave,
+            "arquivo": nome,
+            "existe": existe,
+            "enviado": enviado,
+            "deveria_ser": descricao,
+        })
+
+        time.sleep(0.4)
+
+    faltando = [r["arquivo"] for r in relatorio if not r["existe"]]
+
+    return jsonify({
+        "ok": True,
+        "mensagem": (
+            "Stickers enviados ao grupo. Confira se cada "
+            "desenho bate com a descrição abaixo dele."
+        ),
+        "total": len(relatorio),
+        "faltando": faltando,
+        "detalhes": relatorio,
+    })
+
+
 # O monitor é iniciado quando o processo Gunicorn carrega o app.
 iniciar_monitor_telegram()
+iniciar_keepalive()
 
 
 # ============================================================
