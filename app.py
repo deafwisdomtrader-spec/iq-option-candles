@@ -1742,6 +1742,44 @@ def verificar_resultado(iq, tipo, order_id, timeout=180):
     }
 
 
+
+# ============================================================
+# TESTE TELEGRAM
+# ============================================================
+
+@app.get("/telegram/test")
+def telegram_test():
+    mensagem = (
+        "🤖 <b>DW TRADING — TESTE TELEGRAM</b>\n\n"
+        "✅ Bot conectado com sucesso!\n"
+        "📊 Grupo: DW Trading — IQ Option\n"
+        "⏱️ Timeframe: M1\n"
+        "🔔 Integração Telegram funcionando.\n\n"
+        "Este é apenas um teste."
+    )
+
+    if not telegram_configurado():
+        return jsonify({
+            "ok": False,
+            "erro": "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID não configurado no Render.",
+        }), 503
+
+    enviado = telegram_enviar(mensagem)
+
+    if enviado:
+        return jsonify({
+            "ok": True,
+            "mensagem": "Mensagem de teste enviada ao Telegram.",
+            "chat_id": TELEGRAM_CHAT_ID,
+        })
+
+    return jsonify({
+        "ok": False,
+        "erro": "O Telegram não confirmou o envio. Verifique o token e o Chat ID.",
+        "chat_id": TELEGRAM_CHAT_ID,
+    }), 503
+
+
 # ============================================================
 # HOME
 # ============================================================
