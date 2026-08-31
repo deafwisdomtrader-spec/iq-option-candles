@@ -25,7 +25,7 @@ app = Flask(__name__)
 #
 # Ao subir uma alteração, mude este número. Se /status ainda
 # mostrar o número antigo, o deploy não chegou.
-VERSAO = "2026-08-31-v5-threads"
+VERSAO = "2026-08-31-v6-trava"
 
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
@@ -445,6 +445,223 @@ def _salvar_json_seguro(caminho, dados):
         except Exception:
             pass
         return False
+
+
+# ------------------------------------------------------------
+# BATIMENTO DOS MONITORES
+# ------------------------------------------------------------
+# O gunicorn pode rodar vários workers. Cada um é um processo
+# separado, com memória própria. Guardar o batimento só na
+# memória fazia /status responder coisas diferentes conforme
+# o worker que atendesse a visita: um dizia "ok", outro dizia
+# "PARADO", 42 segundos depois.
+#
+# Por isso o batimento vai para ARQUIVO. Qualquer worker lê o
+# mesmo dado e responde a mesma coisa.
+
+ARQUIVO_BATIMENTO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "batimento.json",
+)
+
+_lock_batimento = threading.Lock()
+
+_inicio_processo = int(time.time())
+
+
+def _marcar_batimento(chave, contador=None):
+    with _lock_batimento:
+        dados = _ler_json_seguro(ARQUIVO_BATIMENTO, {})
+
+        dados[chave] = int(time.time())
+        dados["dono_pid"] = os.getpid()
+
+        if contador:
+            dados[contador] = int(dados.get(contador, 0)) + 1
+
+        _salvar_json_seguro(ARQUIVO_BATIMENTO, dados)
+
+
+def _ler_batimento():
+    with _lock_batimento:
+        return _ler_json_seguro(ARQUIVO_BATIMENTO, {})
+
+
+# ------------------------------------------------------------
+# TRAVA DE DONO — UM MONITOR SÓ
+# ------------------------------------------------------------
+# Se cada worker subir o seu monitor, o grupo recebe o MESMO
+# sinal várias vezes. O controle de duplicata é em memória, e
+# memória não é compartilhada entre processos.
+#
+# A trava abaixo é do sistema de arquivos: só um processo
+# consegue segurá-la. Os outros seguem servindo HTTP normal,
+# sem monitor.
+#
+# Se o dono morrer, o sistema solta a trava sozinho e o
+# próximo worker que receber uma visita assume.
+
+ARQUIVO_TRAVA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "monitor.lock",
+)
+
+_arquivo_trava_aberto = None
+
+
+def sou_o_dono_do_monitor():
+    """Tenta virar o único processo dono dos monitores."""
+    global _arquivo_trava_aberto
+
+    if _arquivo_trava_aberto is not None:
+        return True
+
+    try:
+        import fcntl
+
+        arquivo = open(ARQUIVO_TRAVA, "w")
+
+        try:
+            fcntl.flock(
+                arquivo,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except (OSError, IOError):
+            # Outro worker já é o dono. Normal.
+            arquivo.close()
+            return False
+
+        arquivo.write(str(os.getpid()))
+        arquivo.flush()
+
+        # Guardado numa variável de módulo justamente para o
+        # arquivo NÃO ser fechado. Fechar solta a trava.
+        _arquivo_trava_aberto = arquivo
+
+        print("MONITOR: este processo assumiu, pid", os.getpid())
+        return True
+
+    except Exception as erro:
+        # Sem fcntl (Windows) ou outro problema: não trava
+        # nada e deixa seguir, para não travar o serviço.
+        print(
+            "MONITOR TRAVA:",
+            type(erro).__name__,
+            str(erro),
+        )
+        return True
+
+# ------------------------------------------------------------
+# SINCRONIA COM A VELA M1
+# ------------------------------------------------------------
+# O sinal manda entrar na vela que abre logo depois da análise.
+# Se a mensagem chegar quando essa vela já está correndo, o
+# aluno entra atrasado, num preço diferente do analisado — e o
+# robô ainda confere o resultado nessa mesma vela, que o aluno
+# não pegou inteira. O número fica bonito e a operação real
+# não bate.
+#
+# Duas travas para isso:
+#
+# 1. O ciclo acorda logo depois da virada do minuto, e não em
+#    qualquer ponto dele.
+# 2. Se mesmo assim o envio atrasar, o sinal é DESCARTADO em
+#    vez de enviado tarde. Sinal nenhum é melhor que sinal que
+#    não dá para operar.
+# ------------------------------------------------------------
+
+# Segundos após a virada do minuto em que o ciclo acorda.
+# Pequeno, mas o bastante para a corretora já ter fechado
+# a vela anterior.
+TELEGRAM_OFFSET_VELA = 2
+
+# Atraso máximo tolerado, em segundos, entre a abertura da
+# vela de entrada e o envio da mensagem.
+TELEGRAM_ATRASO_MAXIMO_ENTRADA = 15
+
+# ------------------------------------------------------------
+# ANTECEDÊNCIA DA ENTRADA
+# ------------------------------------------------------------
+# Quantas velas à frente o sinal marca a entrada.
+#
+# Contando a partir do momento em que a mensagem sai (logo
+# depois da virada do minuto):
+#
+#   0 = entra na vela seguinte  -> quase nenhum aviso
+#   1 = cerca de 1 minuto de aviso
+#   2 = cerca de 2 minutos de aviso   <- em uso
+#
+# TROCA CONSCIENTE: a análise lê a vela que acabou de fechar.
+# Quanto mais longe estiver a entrada, mais velha fica essa
+# leitura, e menos ela representa o momento da entrada. Em
+# compensação, sem tempo de aviso o aluno não consegue abrir a
+# corretora e clicar.
+#
+# O resultado WIN/LOSS continua sendo medido na vela REAL da
+# entrada, não na vela analisada. A conferência segue honesta.
+TELEGRAM_VELAS_ANTECEDENCIA = 2
+
+
+def _adiantar_entrada(analise, velas=TELEGRAM_VELAS_ANTECEDENCIA):
+    """Empurra a entrada algumas velas para frente.
+
+    Devolve uma CÓPIA. O painel do site continua usando a
+    análise original, sem alteração.
+    """
+    if velas <= 0:
+        return analise
+
+    entrada_em = analise.get("entrada_em")
+
+    if not entrada_em:
+        return analise
+
+    novo = dict(analise)
+    novo_ts = int(entrada_em) + (velas * TIMEFRAME)
+
+    novo["entrada_em"] = novo_ts
+    novo["entrada"] = datetime.fromtimestamp(
+        novo_ts,
+        tz=FUSO_BR,
+    ).strftime("%H:%M")
+
+    return novo
+
+
+def _dormir_ate_proxima_vela(offset=TELEGRAM_OFFSET_VELA):
+    """Dorme até logo depois da próxima virada de minuto."""
+    agora = time.time()
+    proxima = (int(agora // TIMEFRAME) + 1) * TIMEFRAME + offset
+    espera = proxima - agora
+
+    if espera <= 0:
+        espera = TIMEFRAME
+
+    time.sleep(espera)
+
+
+def _barra_forca(pontos, maximo=10):
+    """Transforma a pontuação numa barra curta de 5 marcas.
+
+    Um número solto ("Confirmações: 7") não diz nada para quem
+    está começando. A barra mostra de bate-pronto se a leitura
+    veio folgada ou apertada.
+    """
+    try:
+        valor = int(pontos)
+    except (TypeError, ValueError):
+        valor = 0
+
+    valor = max(0, min(maximo, valor))
+
+    # int(x + 0.5), não round(). O round() do Python arredonda
+    # 2.5 para 2 e 4.5 para 4 (regra do banqueiro), o que fazia
+    # forças diferentes desenharem a mesma barra.
+    cheios = int((valor / maximo * 5) + 0.5)
+    cheios = max(0, min(5, cheios))
+
+    return "●" * cheios + "○" * (5 - cheios)
+
 
 
 def _faixa_rsi(rsi):
@@ -2503,7 +2720,8 @@ def iniciar_monitor_resultados_telegram():
     print("TELEGRAM RESULTADOS: monitor iniciado.")
 
 
-iniciar_monitor_resultados_telegram()
+if sou_o_dono_do_monitor():
+    iniciar_monitor_resultados_telegram()
 
 
 # ============================================================
@@ -2697,144 +2915,6 @@ TELEGRAM_MAX_PARES_CICLO = 4
 
 _lock_sinais_telegram = threading.Lock()
 _sinais_telegram_enviados = {}
-
-# ------------------------------------------------------------
-# BATIMENTO DOS MONITORES
-# ------------------------------------------------------------
-# Guarda quando cada monitor rodou pela última vez. Sem isso
-# não há como saber se o serviço parou de mandar sinal porque
-# o mercado estava parado ou porque a thread morreu.
-#
-# Aparece em /status.
-_batimento = {
-    "inicio": int(time.time()),
-    "sinais": 0,
-    "resultados": 0,
-    "ciclos_sinais": 0,
-    "ciclos_resultados": 0,
-    "keepalive": 0,
-    "keepalive_falhas": 0,
-}
-_lock_batimento = threading.Lock()
-
-
-def _marcar_batimento(chave, contador=None):
-    with _lock_batimento:
-        _batimento[chave] = int(time.time())
-        if contador:
-            _batimento[contador] = _batimento.get(contador, 0) + 1
-
-# ------------------------------------------------------------
-# SINCRONIA COM A VELA M1
-# ------------------------------------------------------------
-# O sinal manda entrar na vela que abre logo depois da análise.
-# Se a mensagem chegar quando essa vela já está correndo, o
-# aluno entra atrasado, num preço diferente do analisado — e o
-# robô ainda confere o resultado nessa mesma vela, que o aluno
-# não pegou inteira. O número fica bonito e a operação real
-# não bate.
-#
-# Duas travas para isso:
-#
-# 1. O ciclo acorda logo depois da virada do minuto, e não em
-#    qualquer ponto dele.
-# 2. Se mesmo assim o envio atrasar, o sinal é DESCARTADO em
-#    vez de enviado tarde. Sinal nenhum é melhor que sinal que
-#    não dá para operar.
-# ------------------------------------------------------------
-
-# Segundos após a virada do minuto em que o ciclo acorda.
-# Pequeno, mas o bastante para a corretora já ter fechado
-# a vela anterior.
-TELEGRAM_OFFSET_VELA = 2
-
-# Atraso máximo tolerado, em segundos, entre a abertura da
-# vela de entrada e o envio da mensagem.
-TELEGRAM_ATRASO_MAXIMO_ENTRADA = 15
-
-# ------------------------------------------------------------
-# ANTECEDÊNCIA DA ENTRADA
-# ------------------------------------------------------------
-# Quantas velas à frente o sinal marca a entrada.
-#
-# Contando a partir do momento em que a mensagem sai (logo
-# depois da virada do minuto):
-#
-#   0 = entra na vela seguinte  -> quase nenhum aviso
-#   1 = cerca de 1 minuto de aviso
-#   2 = cerca de 2 minutos de aviso   <- em uso
-#
-# TROCA CONSCIENTE: a análise lê a vela que acabou de fechar.
-# Quanto mais longe estiver a entrada, mais velha fica essa
-# leitura, e menos ela representa o momento da entrada. Em
-# compensação, sem tempo de aviso o aluno não consegue abrir a
-# corretora e clicar.
-#
-# O resultado WIN/LOSS continua sendo medido na vela REAL da
-# entrada, não na vela analisada. A conferência segue honesta.
-TELEGRAM_VELAS_ANTECEDENCIA = 2
-
-
-def _adiantar_entrada(analise, velas=TELEGRAM_VELAS_ANTECEDENCIA):
-    """Empurra a entrada algumas velas para frente.
-
-    Devolve uma CÓPIA. O painel do site continua usando a
-    análise original, sem alteração.
-    """
-    if velas <= 0:
-        return analise
-
-    entrada_em = analise.get("entrada_em")
-
-    if not entrada_em:
-        return analise
-
-    novo = dict(analise)
-    novo_ts = int(entrada_em) + (velas * TIMEFRAME)
-
-    novo["entrada_em"] = novo_ts
-    novo["entrada"] = datetime.fromtimestamp(
-        novo_ts,
-        tz=FUSO_BR,
-    ).strftime("%H:%M")
-
-    return novo
-
-
-def _dormir_ate_proxima_vela(offset=TELEGRAM_OFFSET_VELA):
-    """Dorme até logo depois da próxima virada de minuto."""
-    agora = time.time()
-    proxima = (int(agora // TIMEFRAME) + 1) * TIMEFRAME + offset
-    espera = proxima - agora
-
-    if espera <= 0:
-        espera = TIMEFRAME
-
-    time.sleep(espera)
-
-
-def _barra_forca(pontos, maximo=10):
-    """Transforma a pontuação numa barra curta de 5 marcas.
-
-    Um número solto ("Confirmações: 7") não diz nada para quem
-    está começando. A barra mostra de bate-pronto se a leitura
-    veio folgada ou apertada.
-    """
-    try:
-        valor = int(pontos)
-    except (TypeError, ValueError):
-        valor = 0
-
-    valor = max(0, min(maximo, valor))
-
-    # int(x + 0.5), não round(). O round() do Python arredonda
-    # 2.5 para 2 e 4.5 para 4 (regra do banqueiro), o que fazia
-    # forças diferentes desenharem a mesma barra.
-    cheios = int((valor / maximo * 5) + 0.5)
-    cheios = max(0, min(5, cheios))
-
-    return "●" * cheios + "○" * (5 - cheios)
-
 
 def telegram_formatar_sinal(par, analise):
     sinal = str(analise.get("sinal", "")).upper()
@@ -3431,8 +3511,7 @@ def status():
 
     agora = int(time.time())
 
-    with _lock_batimento:
-        dados = dict(_batimento)
+    dados = _ler_batimento()
 
     def ha_quanto(chave):
         marca = dados.get(chave, 0)
@@ -3440,7 +3519,7 @@ def status():
             return None
         return agora - marca
 
-    minutos_no_ar = (agora - dados.get("inicio", agora)) // 60
+    minutos_no_ar = (agora - _inicio_processo) // 60
 
     segundos_sinais = ha_quanto("sinais")
     segundos_resultados = ha_quanto("resultados")
@@ -3475,6 +3554,9 @@ def status():
         "keepalive_url": URL_PUBLICA or None,
         "keepalive_ultimo_seg": ha_quanto("keepalive"),
         "keepalive_falhas": dados.get("keepalive_falhas", 0),
+        "monitor_neste_worker": bool(threads_vivas),
+        "pid_deste_worker": os.getpid(),
+        "pid_dono_monitor": dados.get("dono_pid"),
         "timestamp": agora,
     })
 
@@ -3591,7 +3673,14 @@ _lock_monitores = threading.Lock()
 
 
 def garantir_monitores():
-    """Sobe as threads que estiverem faltando. Barato de rodar."""
+    """Sobe as threads que faltarem — mas só no processo dono.
+
+    Em outros workers isto não faz nada: eles apenas servem
+    HTTP. Assim o sinal não sai duplicado no grupo.
+    """
+    if not sou_o_dono_do_monitor():
+        return []
+
     vivas = {
         t.name for t in threading.enumerate()
         if t.is_alive()
@@ -3663,9 +3752,11 @@ def _antes_de_cada_requisicao():
 
 # Tentativa no carregamento do módulo. Se o gunicorn usar
 # --preload, estas threads morrem no fork — e o
-# garantir_monitores() acima as recria na primeira visita.
-iniciar_monitor_telegram()
-iniciar_keepalive()
+# garantir_monitores() acima as recria na primeira visita,
+# num worker só.
+if sou_o_dono_do_monitor():
+    iniciar_monitor_telegram()
+    iniciar_keepalive()
 
 
 # ============================================================
