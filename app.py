@@ -18,6 +18,19 @@ from iqoptionapi.stable_api import IQ_Option
 app = Flask(__name__)
 
 # ============================================================
+# IMPORTANTE — START COMMAND NO RENDER
+# ============================================================
+#
+# Os monitores do Telegram sobem junto com este arquivo. Se o
+# gunicorn rodar com mais de 1 worker, cada worker cria o SEU
+# monitor e as mensagens saem duplicadas no grupo (o controle
+# de duplicata é em memória, não é compartilhado).
+#
+#   gunicorn app:app -w 1 --threads 4 --timeout 60
+#
+# ============================================================
+
+# ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
@@ -61,19 +74,14 @@ PARES_FOREX = [
     "EURAUD",
 ]
 
-# AÇÕES.
-# ATENÇÃO: os nomes abaixo são um PALPITE inicial. Os códigos
-# reais da corretora podem ser diferentes (com ou sem -OTC).
-# Use a rota /ativos para ver a lista exata do que está aberto
-# e ajuste esta lista com os nomes que aparecerem lá.
 # AÇÕES (pregão da bolsa, dias úteis).
 #
 # Confirmados por teste direto em /candles/<nome>:
 #   APPLE, FACEBOOK, TESLA  -> responderam ok:true
 #
 # Os demais são o mesmo padrão de nome (sem sufixo) e ainda
-# precisam ser confirmados. Se algum der ERRO na segunda-feira,
-# basta apagar a linha dele.
+# precisam ser confirmados. Se algum der ERRO, basta apagar
+# a linha dele.
 #
 # IMPORTANTE: não existe versão -OTC para ações. Fora do
 # pregão elas retornam MERCADO FECHADO, o que é o correto.
@@ -91,7 +99,6 @@ PARES_ACOES = [
     "MCDON",
     "VISA",
 ]
-
 
 
 ESTRATEGIA = (
@@ -336,6 +343,7 @@ _executor_candles = concurrent.futures.ThreadPoolExecutor(
     max_workers=12
 )
 
+
 def buscar_candles_com_timeout(
     iq,
     par,
@@ -489,6 +497,34 @@ def _ajuste_contexto(contexto):
     }
 
 
+# ------------------------------------------------------------
+# CORREÇÃO 1 — O PAINEL APAGAVA A MARCAÇÃO
+# ------------------------------------------------------------
+# registrar_sinal_pendente() roda TODA vez que o painel
+# atualiza (/candles e /candles/<par>). Antes ela sobrescrevia
+# o registro inteiro, apagando "telegram_enviado" que o envio
+# tinha acabado de gravar.
+#
+# Efeito: telegram_processar_resultados() pulava o sinal para
+# sempre. Nenhum WIN/LOSS saía, e sem WIN/LOSS não aparecia
+# G1/G2 nenhum.
+#
+# Agora os campos de estado são preservados quando o mesmo
+# par + candle de entrada é registrado de novo.
+# ------------------------------------------------------------
+
+CAMPOS_ESTADO_PENDENTE = (
+    "telegram_enviado",
+    "telegram_enviado_em",
+    "resultado",
+    "resultado_enviado",
+    "resultado_enviado_em",
+    "abertura_resultado",
+    "fechamento_resultado",
+    "registrado",
+)
+
+
 def registrar_sinal_pendente(par, analise):
     if not analise or analise.get("sinal") not in ("CALL", "PUT"):
         return
@@ -509,11 +545,51 @@ def registrar_sinal_pendente(par, analise):
     }
     with _lock_aprendizado:
         pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+
+        # Preserva o estado já gravado para esta mesma entrada.
+        anterior = pendentes.get(chave)
+        if isinstance(anterior, dict):
+            for campo in CAMPOS_ESTADO_PENDENTE:
+                if campo in anterior:
+                    registro[campo] = anterior[campo]
+            if anterior.get("criado_em"):
+                registro["criado_em"] = anterior["criado_em"]
+
         pendentes[chave] = registro
+
         if len(pendentes) > APRENDIZADO_MAX_REGISTROS:
             ordenados = sorted(pendentes.items(), key=lambda par_item: par_item[1].get("criado_em", 0))
             pendentes = dict(ordenados[-APRENDIZADO_MAX_REGISTROS:])
         _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
+
+
+def marcar_pendente_enviado_telegram(par, entrada_em):
+    """Grava que este sinal realmente chegou ao grupo.
+
+    O monitor de WIN/LOSS só confere pendentes com esta marca.
+    """
+    try:
+        chave = f"{str(par).upper()}|{int(entrada_em)}"
+    except (TypeError, ValueError):
+        return False
+
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+        pendente = pendentes.get(chave)
+
+        if not isinstance(pendente, dict):
+            print(
+                "TELEGRAM MARCAR: pendente nao encontrado para",
+                chave,
+            )
+            return False
+
+        pendente["telegram_enviado"] = True
+        pendente["telegram_enviado_em"] = int(time.time())
+        pendente.setdefault("resultado_enviado", False)
+        pendentes[chave] = pendente
+
+        return _salvar_json_seguro(ARQUIVO_PENDENTES, pendentes)
 
 
 def registrar_resultado_aprendizado(par, inicio_candle, resultado):
@@ -1399,15 +1475,19 @@ def analisar_sinal(candles, par=None):
     # nenhum sinal aparecia), agora 5 como meio-termo.
     PONTUACAO_MINIMA = 5
 
-    # O lado vencedor também precisa ganhar por esta margem.
+    # ----------------------------------------------------
+    # CORREÇÃO 3 — QUASE NENHUM SINAL PASSAVA
+    # ----------------------------------------------------
+    # Estava em 5. Como o MHI é contrarian, ele quase sempre
+    # dá 1 ponto para o lado oposto — a diferença caía para 4
+    # e o sinal era descartado. Somando o cooldown de 180s e
+    # 4 pares por ciclo, passavam pouquíssimos sinais por dia.
     #
-    # Histórico: 3 deixava passar os sinais "fracos" (diferença
-    # de 3 a 4 pontos). Agora 5, para só aparecerem os sinais
-    # classificados como MÉDIO (5-6) e FORTE (7+) no painel.
-    #
-    # Efeito: menos sinal na tela, todos com concordância
-    # folgada entre os indicadores.
-    DIFERENCA_MINIMA = 5
+    # Com 3, os sinais MÉDIO e FORTE continuam passando e o
+    # volume volta ao normal. Se vier sinal fraco demais,
+    # sobe para 4 e testa de novo.
+    # ----------------------------------------------------
+    DIFERENCA_MINIMA = 3
 
     if (
         pontos_call >= PONTUACAO_MINIMA
@@ -1744,7 +1824,6 @@ def verificar_resultado(iq, tipo, order_id, timeout=180):
     }
 
 
-
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -1768,16 +1847,26 @@ def telegram_enviar(mensagem):
         + "/sendMessage"
     )
 
-    resposta = requests.post(
-        url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": mensagem,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
-    )
+    # CORREÇÃO 5: sem este try/except, uma queda de rede
+    # levantava exceção aqui e derrubava o ciclo inteiro.
+    try:
+        resposta = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": mensagem,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+    except Exception as erro:
+        print(
+            "TELEGRAM EXCEPTION:",
+            type(erro).__name__,
+            str(erro),
+        )
+        return False
 
     if not resposta.ok:
         print(
@@ -1802,7 +1891,6 @@ def telegram_enviar(mensagem):
 # ============================================================
 # REGRA DW ACADEMY: 1 entrada = 1 resultado.
 # Após um LOSS, confirmar LOSS imediatamente no fechamento do M1.
-# NÃO criar G1, G2, martingale ou entrada de recuperação.
 # O próximo sinal só pode ser uma nova entrada normal.
 
 
@@ -1875,16 +1963,6 @@ def telegram_enviar_resultado_pendente(
 
     par = pendente.get("par", "--")
     sinal = str(pendente.get("sinal", "--")).upper()
-
-    if resultado == "WIN":
-        emoji = "✅"
-        titulo = "WIN"
-    elif resultado == "LOSS":
-        emoji = "❌"
-        titulo = "LOSS"
-    else:
-        emoji = "⚪"
-        titulo = "EMPATE"
 
     # Frame 1 — começa a animação.
     frame1 = (
@@ -2103,6 +2181,7 @@ def telegram_processar_resultados():
             if not isinstance(pendente, dict):
                 continue
 
+            # Só confere o que realmente foi anunciado no grupo.
             if not pendente.get("telegram_enviado"):
                 continue
 
@@ -2115,6 +2194,10 @@ def telegram_processar_resultados():
 
             # Não deixa crescer indefinidamente.
             if entrada_em <= 0:
+                continue
+
+            # Ainda não fechou o M1: nem tenta.
+            if agora < entrada_em + TIMEFRAME:
                 continue
 
             # Depois de alguns minutos, ainda pode ser conferido,
@@ -2252,12 +2335,13 @@ iniciar_monitor_resultados_telegram()
 # MARTINGALE APÓS RESULTADO
 # ============================================================
 #
+# SEQUÊNCIA: ENTRADA → LOSS → G1 → LOSS → G2 → LOSS FINAL
+# WIN em qualquer etapa encerra a sequência.
+#
 # Regra:
 # - Entrada normal é enviada primeiro.
 # - Depois do fechamento do M1, envia WIN/LOSS.
 # - SOMENTE depois de LOSS aparece a disponibilidade de G1.
-# - G1 só é enviado se o sistema encontrar/usar a sequência de
-#   Martingale configurada.
 # - Após G1 LOSS, aparece G2.
 # - Após WIN em qualquer etapa, encerra a sequência.
 # - Após G2 LOSS, encerra como LOSS FINAL.
@@ -2265,6 +2349,9 @@ iniciar_monitor_resultados_telegram()
 #
 # Observação: esta camada é de alertas Telegram e não executa
 # ordens na IQ Option.
+#
+# AVISO PARA O ALUNO: o gale dobra a exposição justamente no
+# momento em que a leitura já errou. É etapa opcional.
 
 TELEGRAM_MARTINGALE_ATIVO = (
     os.getenv("TELEGRAM_MARTINGALE_ATIVO", "1").strip().lower()
@@ -2292,18 +2379,26 @@ def telegram_enviar_martingale_disponivel(pendente, gale):
 
     if gale == 1:
         titulo = "G1 DISPONÍVEL"
-        emoji = "🔁"
+        orientacao = (
+            "🎯 Próxima etapa: <b>G1</b>\n"
+            "⏭️ Se G1 = LOSS → próxima etapa: <b>G2</b>"
+        )
     else:
         titulo = "G2 DISPONÍVEL"
-        emoji = "🔁"
+        orientacao = (
+            "🎯 Próxima etapa: <b>G2</b>\n"
+            "⛔ Se G2 = LOSS → <b>LOSS FINAL</b>"
+        )
 
     mensagem = (
-        f"{emoji} <b>DW TRADING — {titulo}</b>\n\n"
+        f"🔁 <b>DW TRADING — {titulo}</b>\n\n"
         f"📊 {par} • M1\n"
         f"📌 Sinal original: <b>{sinal}</b>\n"
         f"❌ Resultado anterior: <b>LOSS</b>\n\n"
-        f"🎯 Próxima etapa: <b>G{gale}</b>\n"
-        "⏳ Aguardando a próxima entrada da sequência."
+        f"{orientacao}\n"
+        "⏳ Aguardando a próxima entrada da sequência.\n\n"
+        "⚠️ <i>Etapa opcional. O gale aumenta o risco. "
+        "Use gestão de banca.</i>"
     )
 
     return telegram_enviar(mensagem)
@@ -2433,6 +2528,71 @@ def telegram_test():
         }), 500
 
 
+# ============================================================
+# DIAGNÓSTICO DA FILA DE PENDENTES
+# ============================================================
+#
+# Mostra o que está na fila e em que estado, sem adivinhação.
+#
+#   telegram_enviado: true   -> o sinal chegou ao grupo
+#   resultado_enviado: true  -> o WIN/LOSS já saiu
+#
+# Uso: /telegram/pendentes
+# ============================================================
+
+@app.get("/telegram/pendentes")
+def telegram_pendentes():
+    with _lock_aprendizado:
+        pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
+
+    agora = int(time.time())
+
+    lista = []
+
+    for chave, item in pendentes.items():
+        if not isinstance(item, dict):
+            continue
+
+        entrada_em = int(item.get("entrada_em", 0) or 0)
+
+        lista.append({
+            "chave": chave,
+            "par": item.get("par"),
+            "sinal": item.get("sinal"),
+            "entrada_em": entrada_em,
+            "entrada": (
+                datetime.fromtimestamp(
+                    entrada_em,
+                    tz=FUSO_BR,
+                ).strftime("%H:%M")
+                if entrada_em
+                else "--:--"
+            ),
+            "telegram_enviado": bool(item.get("telegram_enviado")),
+            "resultado": item.get("resultado"),
+            "resultado_enviado": bool(item.get("resultado_enviado")),
+            "idade_segundos": (agora - entrada_em) if entrada_em else None,
+        })
+
+    lista.sort(
+        key=lambda x: x.get("entrada_em") or 0,
+        reverse=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "total": len(lista),
+        "enviados_telegram": sum(
+            1 for x in lista if x["telegram_enviado"]
+        ),
+        "aguardando_resultado": sum(
+            1 for x in lista
+            if x["telegram_enviado"] and not x["resultado_enviado"]
+        ),
+        "pendentes": lista[:50],
+        "timestamp": agora,
+    })
+
 
 # ============================================================
 # SINAIS AUTOMÁTICOS NO TELEGRAM
@@ -2495,6 +2655,19 @@ def telegram_formatar_sinal(par, analise):
         "╰────────────────────╯\n"
         "⚠️ <i>Alerta técnico/educacional.</i>"
     )
+
+
+def _limpar_cache_sinais_enviados():
+    """Mantém o cache de duplicatas em tamanho razoável."""
+    with _lock_sinais_telegram:
+        if len(_sinais_telegram_enviados) > 500:
+            antigas = sorted(
+                _sinais_telegram_enviados.items(),
+                key=lambda item: item[1],
+            )
+            for chave_antiga, _ in antigas[:-300]:
+                _sinais_telegram_enviados.pop(chave_antiga, None)
+
 
 def telegram_enviar_sinal_animado(par, analise):
     """
@@ -2619,6 +2792,9 @@ def telegram_enviar_sinal_animado(par, analise):
 
         final = telegram_formatar_sinal(par, analise)
 
+        if not final:
+            return False
+
         resposta_final = requests.post(
             edit_url,
             data={
@@ -2652,42 +2828,20 @@ def telegram_enviar_sinal_animado(par, analise):
         with _lock_sinais_telegram:
             _sinais_telegram_enviados[chave] = int(time.time())
 
-            with _telegram_lock_cooldown:
-                _telegram_ultima_entrada_enviada = time.time()
+        with _telegram_lock_cooldown:
+            _telegram_ultima_entrada_enviada = time.time()
 
-        # Marca no arquivo de pendentes que este sinal realmente
-        # chegou ao Telegram. O monitor de WIN/LOSS usa essa marca.
-        try:
-            with _lock_aprendizado:
-                pendentes = _ler_json_seguro(ARQUIVO_PENDENTES, {})
-                pendente = pendentes.get(
-                    f"{str(par).upper()}|{int(entrada_em)}"
-                )
-                if isinstance(pendente, dict):
-                    pendente["telegram_enviado"] = True
-                    pendente["telegram_enviado_em"] = int(time.time())
-                    pendente["resultado_enviado"] = False
-                    pendentes[
-                        f"{str(par).upper()}|{int(entrada_em)}"
-                    ] = pendente
-                    _salvar_json_seguro(
-                        ARQUIVO_PENDENTES,
-                        pendentes,
-                    )
-        except Exception as erro:
-            print(
-                "TELEGRAM RESULTADO: não foi possível marcar pendente:",
-                type(erro).__name__,
-                str(erro),
-            )
+        # ------------------------------------------------
+        # Marca no arquivo de pendentes que este sinal
+        # realmente chegou ao Telegram. O monitor de
+        # WIN/LOSS só confere quem tem esta marca.
+        # ------------------------------------------------
+        marcar_pendente_enviado_telegram(par, entrada_em)
 
-            if len(_sinais_telegram_enviados) > 500:
-                antigas = sorted(
-                    _sinais_telegram_enviados.items(),
-                    key=lambda item: item[1],
-                )
-                for chave_antiga, _ in antigas[:-300]:
-                    _sinais_telegram_enviados.pop(chave_antiga, None)
+        # CORREÇÃO 4: a limpeza do cache estava DENTRO do
+        # "except" do bloco de marcação, ou seja, só rodava
+        # quando dava erro. Agora roda no caminho normal.
+        _limpar_cache_sinais_enviados()
 
         print("TELEGRAM ANIMADO OK:", par, sinal)
         return True
@@ -2751,6 +2905,9 @@ def telegram_processar_sinais():
                     par,
                 )
 
+                # A ORDEM IMPORTA: grava o pendente ANTES de
+                # enviar. A marcação só consegue atualizar um
+                # registro que já existe.
                 registrar_sinal_pendente(
                     par,
                     analise,
@@ -2846,6 +3003,17 @@ def telegram_sinais_test():
                 analise = analisar_sinal(candles, par)
 
                 if analise.get("sinal") in ("CALL", "PUT"):
+
+                    # ----------------------------------------
+                    # CORREÇÃO 2 — SINAL DE TESTE SEM RESULTADO
+                    # ----------------------------------------
+                    # Esta rota enviava o sinal SEM gravar o
+                    # pendente antes. A marcação procurava um
+                    # registro que não existia e não fazia nada,
+                    # então o WIN/LOSS desse sinal nunca saía.
+                    # ----------------------------------------
+                    registrar_sinal_pendente(par, analise)
+
                     enviado = telegram_enviar_sinal_se_novo(
                         par,
                         analise,
@@ -2861,7 +3029,11 @@ def telegram_sinais_test():
                         "mensagem": (
                             "Sinal enviado ao Telegram."
                             if enviado
-                            else "Este sinal já foi enviado anteriormente."
+                            else (
+                                "Sinal nao enviado: ja foi enviado "
+                                "antes ou ainda esta no intervalo "
+                                "de espera entre entradas."
+                            )
                         ),
                     })
 
@@ -2937,16 +3109,16 @@ def inicio():
 @app.get("/health")
 def health():
 
-    global _iq
-
     conectado = False
 
-    if _iq is not None:
+    cliente = _iq
+
+    if cliente is not None:
 
         try:
 
             conectado = bool(
-                _iq.check_connect()
+                cliente.check_connect()
             )
 
         except Exception:
@@ -2962,6 +3134,15 @@ def health():
 
         "iq_conectada":
             conectado,
+
+        "telegram_configurado":
+            telegram_configurado(),
+
+        "telegram_sinais_ativos":
+            TELEGRAM_SINAIS_ATIVOS,
+
+        "telegram_resultados_ativos":
+            TELEGRAM_RESULTADOS_ATIVOS,
 
         "timestamp":
             int(time.time()),
@@ -3074,8 +3255,7 @@ def listar_ativos():
             "ok": True,
             "dica": (
                 "Use estes nomes exatos nas listas "
-                "PARES, PARES_FOREX, PARES_ACOES ou "
-                "PARES_ACOES do app.py."
+                "PARES, PARES_FOREX ou PARES_ACOES do app.py."
             ),
             "filtro": filtro or None,
             "total_abertos": total,
@@ -3434,10 +3614,7 @@ def candles_par(par):
 
         # Se a conexão caiu,
         # força nova conexão na próxima chamada.
-
-        global _iq
-
-        _iq = None
+        invalidar_conexao()
 
         return jsonify({
 
@@ -3562,9 +3739,7 @@ def operar(par):
 
     except Exception as erro:
 
-        global _iq
-
-        _iq = None
+        invalidar_conexao()
 
         return jsonify({
 
@@ -3659,10 +3834,6 @@ def candles():
             TAMANHO_GRUPO = 5
 
             # ROTAÇÃO DOS PARES: 120 segundos (2 minutos).
-            # Isso é SEPARADO da busca de dados, que roda a
-            # cada 120s no front-end. Com os dois em 120s,
-            # cada grupo de pares recebe uma busca antes de
-            # dar lugar ao próximo.
             indice_rotativo = int(
                 time.time() // 120
             ) % len(lista_base)
@@ -3707,14 +3878,9 @@ def candles():
         # ORÇAMENTO DE TEMPO
         #
         # O gunicorn mata o worker por volta dos 30 segundos.
-        # Com 5 pares a 15s cada, a soma podia chegar a 75s e
-        # a requisição inteira voltava como 502, derrubando
-        # todos os pares — inclusive os que já tinham
-        # respondido bem.
-        #
-        # Agora cada par tem 7s, e existe um teto total de 22s
-        # para a chamada inteira. Quando o teto estoura, os
-        # pares restantes voltam com status PULADO em vez de
+        # Cada par tem 7s, e existe um teto total de 22s para a
+        # chamada inteira. Quando o teto estoura, os pares
+        # restantes voltam com status PULADO em vez de
         # arriscar o 502.
 
         ORCAMENTO_TOTAL = 22
@@ -3938,9 +4104,7 @@ def candles():
 
     except Exception as erro:
 
-        global _iq
-
-        _iq = None
+        invalidar_conexao()
 
         return jsonify({
 
