@@ -1951,7 +1951,13 @@ def telegram_formatar_resultado(pendente, resultado, abertura, fechamento):
     if resultado == "WIN":
         rodape = "🔥 Entrada vencedora."
     elif resultado == "LOSS":
-        rodape = "📉 Entrada encerrada."
+        # A orientação de gale vira UMA LINHA aqui, em vez de
+        # uma mensagem separada. Mensagem separada de G1 e G2
+        # enchia o grupo e atrapalhava a leitura.
+        rodape = (
+            "📉 Entrada encerrada.\n"
+            "🔁 Martingale: até G2 (opcional)"
+        )
     else:
         rodape = "➖ Vela fechou no mesmo preço."
 
@@ -2390,41 +2396,18 @@ def telegram_martingale_key(pendente):
     )
 
 
-def telegram_enviar_martingale_disponivel(pendente, gale):
-    if not telegram_configurado():
-        return False
-
-    par = pendente.get("par", "--")
-    sinal = str(pendente.get("sinal", "--")).upper()
-
-    if gale == 1:
-        titulo = "G1 DISPONÍVEL"
-        orientacao = (
-            "🎯 Próxima etapa: <b>G1</b>\n"
-            "⏭️ Se G1 = LOSS → próxima etapa: <b>G2</b>"
-        )
-    else:
-        titulo = "G2 DISPONÍVEL"
-        orientacao = (
-            "🎯 Próxima etapa: <b>G2</b>\n"
-            "⛔ Se G2 = LOSS → <b>LOSS FINAL</b>"
-        )
-
-    mensagem = (
-        f"🔁 <b>{titulo}</b> · <b>{par}</b>\n"
-        "─────────────\n"
-        f"📌 Sinal original  <b>{sinal}</b> · M1\n"
-        "❌ Resultado anterior  <b>LOSS</b>\n\n"
-        f"{orientacao}\n"
-        "⏳ Aguardando a próxima entrada.\n\n"
-        "⚠️ <i>Etapa opcional. O gale aumenta o risco. "
-        "Use gestão de banca.</i>"
-    )
-
-    return telegram_enviar(mensagem)
-
-
 def telegram_registrar_loss_e_mostrar_gale(pendente):
+    """Apenas CONTA a etapa da sequência. Não envia mensagem.
+
+    Antes, cada LOSS disparava uma mensagem separada "G1
+    DISPONÍVEL" / "G2 DISPONÍVEL" no grupo. Duas mensagens
+    extras por sequência, no meio dos sinais, atrapalhavam a
+    leitura no celular.
+
+    Agora a orientação aparece como UMA LINHA no rodapé da
+    própria mensagem de LOSS. A contagem continua aqui porque
+    é ela que encerra a sequência depois do G2.
+    """
     if not TELEGRAM_MARTINGALE_ATIVO:
         return
 
@@ -2442,11 +2425,7 @@ def telegram_registrar_loss_e_mostrar_gale(pendente):
         if sequencia["finalizada"]:
             return
 
-        gale_atual = int(sequencia["gale_atual"])
-
-        # Depois da entrada normal LOSS -> G1.
-        # Depois de G1 LOSS -> G2.
-        proximo_gale = gale_atual + 1
+        proximo_gale = int(sequencia["gale_atual"]) + 1
 
         if proximo_gale > TELEGRAM_MAX_GALES:
             sequencia["finalizada"] = True
@@ -2455,11 +2434,6 @@ def telegram_registrar_loss_e_mostrar_gale(pendente):
 
         sequencia["gale_atual"] = proximo_gale
         _martingale_sequencias[chave] = sequencia
-
-    telegram_enviar_martingale_disponivel(
-        pendente,
-        proximo_gale,
-    )
 
 
 def telegram_encerrar_martingale(pendente, resultado):
@@ -2704,6 +2678,7 @@ def telegram_formatar_sinal(par, analise):
         f"⭐ Força  {_barra_forca(confianca)}  <b>{confianca}</b>\n"
         f"📊 RSI  <b>{rsi_texto}</b>\n"
         f"💰 Preço  <b>{preco_texto}</b>\n\n"
+        "🔁 Martingale: até G2 (opcional)\n"
         "⚠️ <i>Alerta técnico e educacional.</i>"
     )
 
