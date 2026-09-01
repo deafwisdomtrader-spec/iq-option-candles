@@ -2162,21 +2162,17 @@ def inicio():
 @app.get("/health")
 def health():
 
+    # Esta rota NÃO pode tocar na biblioteca da corretora.
+    #
+    # check_connect() é uma chamada da iqoptionapi e pode ficar
+    # pendurada, exatamente como get_candles. Quando isso
+    # acontecia, nem o /health respondia — e ficava impossível
+    # saber se o serviço estava vivo.
+    #
+    # Agora ela só informa o estado interno do processo, sem
+    # chamar nada externo. Responde sempre, na hora.
+
     global _iq
-
-    conectado = False
-
-    if _iq is not None:
-
-        try:
-
-            conectado = bool(
-                _iq.check_connect()
-            )
-
-        except Exception:
-
-            conectado = False
 
     return jsonify({
 
@@ -2185,8 +2181,17 @@ def health():
         "servico":
             "iq-option-candles",
 
-        "iq_conectada":
-            conectado,
+        # Se existe um objeto de conexão em memória. NÃO
+        # garante que a sessão da corretora esteja viva —
+        # para isso, use /candles.
+        "conexao_em_memoria":
+            _iq is not None,
+
+        "banco_historico":
+            _DB_PRONTO,
+
+        "threads_travadas":
+            _threads_travadas,
 
         "timestamp":
             int(time.time()),
