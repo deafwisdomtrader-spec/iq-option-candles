@@ -108,6 +108,33 @@ _ultima_conexao = 0
 
 
 # ============================================================
+# CORS
+# ============================================================
+#
+# Libera a leitura direta do navegador, de qualquer origem.
+#
+# Por que é seguro aqui: esta API é SOMENTE LEITURA de dados
+# públicos de mercado. Não há login, não há dado pessoal e
+# nenhuma rota altera nada com base em quem chamou.
+#
+# Por que é útil: sem estes cabeçalhos, o navegador bloqueia
+# qualquer página que tente ler o Render diretamente — mesmo
+# com o servidor funcionando. Era isso que fazia a página de
+# diagnóstico acusar "Failed to fetch" e apontar falha onde
+# não havia.
+# ============================================================
+
+@app.after_request
+def liberar_cors(resposta):
+
+    resposta.headers["Access-Control-Allow-Origin"] = "*"
+    resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resposta.headers["Access-Control-Allow-Headers"] = "Content-Type"
+
+    return resposta
+
+
+# ============================================================
 # BANCO DE HISTÓRICO (SQLite)
 # ============================================================
 #
@@ -126,6 +153,26 @@ _ultima_conexao = 0
 #   Render e apontar HISTORICO_DB para dentro dele.
 #   Ex.: HISTORICO_DB=/var/data/historico.db
 # ============================================================
+
+# ============================================================
+# VERSÃO DO CÓDIGO
+# ============================================================
+#
+# Aparece em / e em /health. Serve para saber, em um segundo,
+# QUAL versão está rodando no servidor — sem depender de
+# mensagens de erro para deduzir.
+#
+# Sempre que este arquivo mudar de forma relevante, troque
+# este número.
+# ============================================================
+
+VERSAO_APP = "2026-09-01.6"
+
+VERSAO_NOTAS = (
+    "aquecimento no boot, conexao 25s, cadeado com prazo, "
+    "reciclagem de pool, CORS liberado"
+)
+
 
 CAMINHO_DB = os.getenv(
     "HISTORICO_DB",
@@ -584,11 +631,11 @@ def conectar():
     # Com prazo, quem não conseguir entrar em 8s desiste e
     # devolve erro — em vez de acumular esperando.
 
-    if not _lock.acquire(timeout=8):
+    if not _lock.acquire(timeout=20):
 
         raise TimeoutError(
             "Outra conexão com a corretora está em andamento "
-            "e não liberou em 8s."
+            "e não liberou em 20s."
         )
 
     try:
@@ -642,6 +689,52 @@ def conectar():
 
         # Libera sempre, mesmo se algo acima levantar exceção.
         _lock.release()
+
+
+# ============================================================
+# AQUECIMENTO DA CONEXÃO
+# ============================================================
+#
+# O primeiro login na IQ Option é lento: o handshake pode
+# passar de 15 segundos. Se isso acontecer durante uma
+# requisição, ela estoura o tempo e volta erro — mesmo estando
+# tudo certo.
+#
+# Aqui a conexão é aberta assim que o processo sobe, numa
+# thread separada. Quando a primeira requisição chegar, a
+# sessão já está pronta e ela só reutiliza.
+#
+# A thread nunca derruba nada: qualquer falha é ignorada, e a
+# próxima requisição tenta normalmente.
+# ============================================================
+
+def aquecer_conexao():
+
+    try:
+        conectar()
+    except Exception:
+        # Falha no aquecimento é aceitável: a requisição
+        # seguinte tenta de novo por conta própria.
+        pass
+
+
+def iniciar_aquecimento():
+
+    try:
+
+        thread = threading.Thread(
+            target=aquecer_conexao,
+            name="aquecimento-iq",
+            daemon=True,
+        )
+
+        thread.start()
+
+    except Exception:
+        pass
+
+
+iniciar_aquecimento()
 
 
 # ============================================================
@@ -824,7 +917,7 @@ def registrar_thread_travada():
 
     return True
 
-def conectar_com_timeout(timeout_segundos=12):
+def conectar_com_timeout(timeout_segundos=25):
     """Conecta com limite de tempo.
 
     conectar() pode ficar pendurada dentro da biblioteca da
@@ -2221,6 +2314,12 @@ def health():
         "servico":
             "iq-option-candles",
 
+        "versao":
+            VERSAO_APP,
+
+        "versao_notas":
+            VERSAO_NOTAS,
+
         # Se existe um objeto de conexão em memória. NÃO
         # garante que a sessão da corretora esteja viva —
         # para isso, use /candles.
@@ -3176,8 +3275,16 @@ def candles():
         # chegar aqui. Somando, o pior caso fica em torno de
         # 30s — dentro do limite do Render, que devolve 504
         # quando a resposta demora demais.
-        ORCAMENTO_TOTAL = 18
-        TIMEOUT_POR_PAR = 6
+        # Orçamento da BUSCA de candles.
+        #
+        # A conexão já está aquecida na maioria das vezes, mas
+        # no pior caso pode consumir até 25s antes de chegar
+        # aqui. Por isso a busca fica enxuta: 15s no total.
+        #
+        # Com gunicorn --timeout 60 no Render, o pior caso
+        # (25 + 15 = 40s) cabe com folga.
+        ORCAMENTO_TOTAL = 15
+        TIMEOUT_POR_PAR = 5
 
         inicio_lote = time.time()
 
