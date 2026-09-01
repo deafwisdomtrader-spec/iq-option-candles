@@ -25,7 +25,7 @@ app = Flask(__name__)
 #
 # Ao subir uma alteração, mude este número. Se /status ainda
 # mostrar o número antigo, o deploy não chegou.
-VERSAO = "2026-09-01-v9-mercados"
+VERSAO = "2026-09-01-v10-carga"
 
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
@@ -3000,7 +3000,21 @@ TELEGRAM_INTERVALO_SINAIS = 60
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = 180  # 3 minutos
 _telegram_ultima_entrada_enviada = 0
 _telegram_lock_cooldown = threading.Lock()
-TELEGRAM_MAX_PARES_CICLO = 4
+# ------------------------------------------------------------
+# QUANTOS PARES POR CICLO
+# ------------------------------------------------------------
+# A conexão com a IQ Option é UMA só, compartilhada entre o
+# robô do Telegram e o painel do site.
+#
+# Ao subir a lista do Telegram de 8 para 23 pares, o robô
+# passou a ocupar a conexão por muito mais tempo. O painel
+# pedia dados, ficava esperando e devolvia HTTP 503.
+#
+# 2 pares por ciclo deixam a conexão livre a maior parte do
+# tempo. A lista inteira ainda é coberta, só que mais devagar.
+TELEGRAM_MAX_PARES_CICLO = int(
+    os.getenv("TELEGRAM_MAX_PARES_CICLO", "2")
+)
 
 # ------------------------------------------------------------
 # QUAIS MERCADOS O TELEGRAM ACOMPANHA
@@ -3381,11 +3395,14 @@ def telegram_processar_sinais():
 
         for par in pares_ciclo:
             try:
+                # Timeout curto de propósito: o painel do
+                # site usa a MESMA conexão. Se o robô demorar,
+                # o aluno vê 503 na tela.
                 candles = buscar_candles_com_timeout(
                     iq,
                     par,
                     CANDLE_COUNT,
-                    timeout_segundos=5,
+                    timeout_segundos=4,
                 )
 
                 if not candles:
