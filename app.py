@@ -545,8 +545,25 @@ def invalidar_conexao():
 
     global _iq
 
-    with _lock:
+    # NUNCA esperar pelo cadeado aqui.
+    #
+    # Esta função é chamada JUSTAMENTE quando uma conexão
+    # travou — e a thread travada continua segurando o _lock
+    # lá dentro de conectar(). Se esperássemos por ele, o
+    # worker congelaria para sempre: foi exatamente o impasse
+    # que derrubou o serviço com WORKER TIMEOUT e SIGKILL.
+    #
+    # acquire(blocking=False) tenta pegar e desiste na hora.
+    # Se não conseguir, invalida assim mesmo: a atribuição de
+    # None é atômica em Python, então é segura sem o cadeado.
+
+    pegou = _lock.acquire(blocking=False)
+
+    try:
         _iq = None
+    finally:
+        if pegou:
+            _lock.release()
 
 
 def conectar():
@@ -556,7 +573,25 @@ def conectar():
 
     email, password = obter_credenciais()
 
-    with _lock:
+    # CADEADO COM PRAZO
+    #
+    # Antes era "with _lock:", que espera para sempre. Como a
+    # conexão de rede acontece DENTRO do cadeado, uma conexão
+    # travada prendia todas as outras requisições na fila:
+    # elas enchiam o pool de threads, o gunicorn matava o
+    # worker e o serviço caía.
+    #
+    # Com prazo, quem não conseguir entrar em 8s desiste e
+    # devolve erro — em vez de acumular esperando.
+
+    if not _lock.acquire(timeout=8):
+
+        raise TimeoutError(
+            "Outra conexão com a corretora está em andamento "
+            "e não liberou em 8s."
+        )
+
+    try:
 
         # Tenta reutilizar a conexão existente
         if _iq is not None:
@@ -602,6 +637,11 @@ def conectar():
         )
 
         return _iq
+
+    finally:
+
+        # Libera sempre, mesmo se algo acima levantar exceção.
+        _lock.release()
 
 
 # ============================================================
