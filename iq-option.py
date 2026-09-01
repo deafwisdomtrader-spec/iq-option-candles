@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -154,6 +153,26 @@ def liberar_cors(resposta):
 #   Render e apontar HISTORICO_DB para dentro dele.
 #   Ex.: HISTORICO_DB=/var/data/historico.db
 # ============================================================
+
+# ============================================================
+# VERSÃO DO CÓDIGO
+# ============================================================
+#
+# Aparece em / e em /health. Serve para saber, em um segundo,
+# QUAL versão está rodando no servidor — sem depender de
+# mensagens de erro para deduzir.
+#
+# Sempre que este arquivo mudar de forma relevante, troque
+# este número.
+# ============================================================
+
+VERSAO_APP = "2026-09-01.6"
+
+VERSAO_NOTAS = (
+    "aquecimento no boot, conexao 25s, cadeado com prazo, "
+    "reciclagem de pool, CORS liberado"
+)
+
 
 CAMINHO_DB = os.getenv(
     "HISTORICO_DB",
@@ -2294,6 +2313,12 @@ def health():
 
         "servico":
             "iq-option-candles",
+
+        "versao":
+            VERSAO_APP,
+
+        "versao_notas":
+            VERSAO_NOTAS,
 
         # Se existe um objeto de conexão em memória. NÃO
         # garante que a sessão da corretora esteja viva —
