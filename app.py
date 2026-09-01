@@ -25,7 +25,7 @@ app = Flask(__name__)
 #
 # Ao subir uma alteração, mude este número. Se /status ainda
 # mostrar o número antigo, o deploy não chegou.
-VERSAO = "2026-09-01-v10-carga"
+VERSAO = "2026-09-01-v11-volta-otc"
 
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
@@ -3013,7 +3013,7 @@ _telegram_lock_cooldown = threading.Lock()
 # 2 pares por ciclo deixam a conexão livre a maior parte do
 # tempo. A lista inteira ainda é coberta, só que mais devagar.
 TELEGRAM_MAX_PARES_CICLO = int(
-    os.getenv("TELEGRAM_MAX_PARES_CICLO", "2")
+    os.getenv("TELEGRAM_MAX_PARES_CICLO", "4")
 )
 
 # ------------------------------------------------------------
@@ -3027,9 +3027,20 @@ TELEGRAM_MAX_PARES_CICLO = int(
 # voltam com status MERCADO FECHADO e simplesmente não geram
 # sinal. Nada quebra: eles só ficam quietos até abrir.
 #
-# Para desligar algum, use as variáveis no Render:
-#   TELEGRAM_FOREX=0     -> só OTC
-#   TELEGRAM_ACOES=1     -> liga ações também
+# ATENÇÃO — POR QUE FOREX ESTÁ DESLIGADO
+#
+# A conexão com a IQ Option é UMA só, dividida entre o robô do
+# Telegram e o painel do site. Ao ligar o Forex, a lista pulou
+# de 8 para 23 pares, o robô passou a ocupar a conexão por
+# muito mais tempo, e o painel dos alunos começou a devolver
+# HTTP 503 e depois 502.
+#
+# Por isso o padrão voltou a ser SÓ OTC. Para ligar de novo,
+# não basta mudar a variável: antes é preciso separar o robô
+# do painel em dois serviços, cada um com sua conexão.
+#
+#   TELEGRAM_FOREX=1     -> liga Forex (só depois de separar)
+#   TELEGRAM_ACOES=1     -> liga ações
 
 TELEGRAM_OTC = (
     os.getenv("TELEGRAM_OTC", "1").strip().lower()
@@ -3037,7 +3048,7 @@ TELEGRAM_OTC = (
 )
 
 TELEGRAM_FOREX = (
-    os.getenv("TELEGRAM_FOREX", "1").strip().lower()
+    os.getenv("TELEGRAM_FOREX", "0").strip().lower()
     not in ("0", "false", "nao", "não", "off")
 )
 
@@ -3395,14 +3406,11 @@ def telegram_processar_sinais():
 
         for par in pares_ciclo:
             try:
-                # Timeout curto de propósito: o painel do
-                # site usa a MESMA conexão. Se o robô demorar,
-                # o aluno vê 503 na tela.
                 candles = buscar_candles_com_timeout(
                     iq,
                     par,
                     CANDLE_COUNT,
-                    timeout_segundos=4,
+                    timeout_segundos=5,
                 )
 
                 if not candles:
