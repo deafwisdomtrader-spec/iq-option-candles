@@ -1,4 +1,4 @@
-import os 
+import os
 import time
 import threading
 import concurrent.futures
@@ -25,7 +25,7 @@ app = Flask(__name__)
 #
 # Ao subir uma alteração, mude este número. Se /status ainda
 # mostrar o número antigo, o deploy não chegou.
-VERSAO = "2026-08-31-v8-trava-fork"
+VERSAO = "2026-09-01-v9-mercados"
 
 # ============================================================
 # IMPORTANTE — START COMMAND NO RENDER
@@ -3002,6 +3002,68 @@ _telegram_ultima_entrada_enviada = 0
 _telegram_lock_cooldown = threading.Lock()
 TELEGRAM_MAX_PARES_CICLO = 4
 
+# ------------------------------------------------------------
+# QUAIS MERCADOS O TELEGRAM ACOMPANHA
+# ------------------------------------------------------------
+# Antes o grupo só recebia OTC. O mercado aberto já estava
+# configurado no painel do site, mas o robô nunca olhava para
+# ele.
+#
+# Fora do horário de pregão, os pares de Forex e as ações
+# voltam com status MERCADO FECHADO e simplesmente não geram
+# sinal. Nada quebra: eles só ficam quietos até abrir.
+#
+# Para desligar algum, use as variáveis no Render:
+#   TELEGRAM_FOREX=0     -> só OTC
+#   TELEGRAM_ACOES=1     -> liga ações também
+
+TELEGRAM_OTC = (
+    os.getenv("TELEGRAM_OTC", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+TELEGRAM_FOREX = (
+    os.getenv("TELEGRAM_FOREX", "1").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+# Ações vêm desligadas: os nomes da corretora ainda não foram
+# todos confirmados, e par com nome errado só gasta tempo do
+# ciclo à toa. Confira em /ativos antes de ligar.
+TELEGRAM_ACOES = (
+    os.getenv("TELEGRAM_ACOES", "0").strip().lower()
+    not in ("0", "false", "nao", "não", "off")
+)
+
+
+def pares_do_telegram():
+    """Lista completa que o grupo acompanha."""
+    lista = []
+
+    if TELEGRAM_OTC:
+        lista.extend(PARES)
+
+    if TELEGRAM_FOREX:
+        lista.extend(PARES_FOREX)
+
+    if TELEGRAM_ACOES:
+        lista.extend(PARES_ACOES)
+
+    return lista
+
+
+def mercado_do_par(par):
+    """Etiqueta do mercado, para o aluno saber onde operar."""
+    texto = str(par).upper()
+
+    if texto.endswith("-OTC"):
+        return "OTC"
+
+    if texto in PARES_ACOES:
+        return "Ações"
+
+    return "Forex"
+
 _lock_sinais_telegram = threading.Lock()
 _sinais_telegram_enviados = {}
 
@@ -3037,6 +3099,7 @@ def telegram_formatar_sinal(par, analise):
     return (
         f"{emoji} <b>{titulo}</b> · <b>{par}</b>\n"
         "─────────────\n"
+        f"🏛 Mercado  <b>{mercado_do_par(par)}</b>\n"
         f"⏰ Entrada  <b>{entrada}</b>\n"
         f"⏱ Duração  <b>M1</b>\n\n"
         f"{seta} Tendência  <b>{tendencia}</b>\n"
@@ -3296,18 +3359,23 @@ def telegram_processar_sinais():
     try:
         iq = conectar()
 
-        # Rotação: cada ciclo analisa poucos pares.
+        # Rotação: cada ciclo analisa poucos pares da lista
+        # completa (OTC + mercado aberto, conforme ligado).
+        lista = pares_do_telegram()
+
+        if not lista:
+            print("TELEGRAM SINAIS: nenhum mercado ligado.")
+            return
+
         indice = (
             int(time.time() // TELEGRAM_INTERVALO_SINAIS)
             * TELEGRAM_MAX_PARES_CICLO
-        ) % len(PARES)
+        ) % len(lista)
 
         pares_ciclo = [
-            PARES[
-                (indice + i) % len(PARES)
-            ]
+            lista[(indice + i) % len(lista)]
             for i in range(
-                min(TELEGRAM_MAX_PARES_CICLO, len(PARES))
+                min(TELEGRAM_MAX_PARES_CICLO, len(lista))
             )
         ]
 
@@ -3429,7 +3497,7 @@ def telegram_sinais_test():
 
         iq = conectar()
 
-        for par in PARES:
+        for par in pares_do_telegram():
             try:
                 candles = buscar_candles_com_timeout(
                     iq,
