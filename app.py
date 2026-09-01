@@ -166,11 +166,11 @@ def liberar_cors(resposta):
 # este número.
 # ============================================================
 
-VERSAO_APP = "2026-09-01.6"
+VERSAO_APP = "2026-09-01.7"
 
 VERSAO_NOTAS = (
     "aquecimento no boot, conexao 25s, cadeado com prazo, "
-    "reciclagem de pool, CORS liberado"
+    "reciclagem de pool, CORS liberado, rota /login-teste"
 )
 
 
@@ -2350,6 +2350,104 @@ def health():
 # Uso:  /ativos            -> tudo que está aberto
 #       /ativos?filtro=app -> só os que contêm "app" no nome
 # ============================================================
+
+# ============================================================
+# TESTE DE LOGIN
+# ============================================================
+#
+# Tenta conectar do zero e devolve a resposta CRUA da
+# corretora, com tempo generoso.
+#
+# Serve para separar duas coisas que dão o mesmo erro:
+#
+#   - login recusado (senha errada, 2FA, conta bloqueada)
+#   - login lento    (a corretora demora a responder)
+#
+# Nos dois casos a mensagem normal é só "timeout". Aqui dá
+# para ver o motivo que a própria IQ Option devolveu.
+# ============================================================
+
+@app.get("/login-teste")
+def login_teste():
+
+    inicio = time.time()
+
+    try:
+        email, password = obter_credenciais()
+    except Exception as erro:
+        return jsonify({
+            "ok": False,
+            "etapa": "credenciais",
+            "erro": str(erro)[:200],
+            "dica": (
+                "Confira as variaveis IQ_EMAIL e IQ_PASSWORD "
+                "no painel do Render."
+            ),
+        }), 200
+
+    # Mostra só o começo do email, para conferir se é a conta
+    # certa sem expor o endereço inteiro.
+    email_mascarado = (
+        email[:3] + "***@" + email.split("@")[-1]
+        if "@" in email
+        else "***"
+    )
+
+    def tentar():
+        cliente = IQ_Option(email, password)
+        return cliente.connect()
+
+    try:
+
+        futuro = _executor_candles.submit(tentar)
+
+        conectado, motivo = futuro.result(timeout=45)
+
+        duracao = round(time.time() - inicio, 1)
+
+        return jsonify({
+            "ok": bool(conectado),
+            "etapa": "login",
+            "conectado": bool(conectado),
+            "motivo_da_corretora": str(motivo)[:300],
+            "segundos": duracao,
+            "email_usado": email_mascarado,
+            "senha_tem_caracteres": len(password),
+            "dica": (
+                "Login funcionou. Se o painel ainda falha, o "
+                "problema é o tempo limite, nao a conta."
+                if conectado
+                else "Login RECUSADO. Veja o motivo acima."
+            ),
+        })
+
+    except concurrent.futures.TimeoutError:
+
+        registrar_thread_travada()
+
+        return jsonify({
+            "ok": False,
+            "etapa": "login",
+            "erro": "A corretora nao respondeu em 45 segundos.",
+            "segundos": 45,
+            "email_usado": email_mascarado,
+            "dica": (
+                "Nem em 45s houve resposta. Normalmente e "
+                "bloqueio de rede do servidor ou instabilidade "
+                "da corretora, nao senha errada."
+            ),
+        }), 200
+
+    except Exception as erro:
+
+        return jsonify({
+            "ok": False,
+            "etapa": "login",
+            "erro": str(erro)[:300],
+            "tipo": type(erro).__name__,
+            "email_usado": email_mascarado,
+        }), 200
+
 
 @app.get("/ativos")
 def listar_ativos():
