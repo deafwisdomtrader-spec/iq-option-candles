@@ -1401,7 +1401,7 @@ def registrar_thread_travada():
 
     return True
 
-def conectar_com_timeout(timeout_segundos=12):
+def conectar_com_timeout(timeout_segundos=8):
     """Conecta com limite de tempo.
 
     conectar() pode ficar pendurada dentro da biblioteca da
@@ -3902,8 +3902,27 @@ def candles():
         # chegar aqui. Somando, o pior caso fica em torno de
         # 30s — dentro do limite do Render, que devolve 504
         # quando a resposta demora demais.
-        ORCAMENTO_TOTAL = 18
-        TIMEOUT_POR_PAR = 6
+        # ------------------------------------------------
+        # POR QUE ESTES NÚMEROS SÃO TÃO APERTADOS
+        # ------------------------------------------------
+        # O gunicorn mata o worker que passa do tempo limite.
+        # Antes a conta era:
+        #
+        #   conectar        até 12s
+        #   5 pares x 6s    até 18s
+        #   -----------------------
+        #   total           até 30s   <- o limite exato
+        #
+        # Resultado no log: WORKER TIMEOUT, SIGKILL, worker
+        # novo, e assim sem parar. O monitor do Telegram
+        # nascia junto com o worker e morria antes de mandar
+        # qualquer sinal — o grupo ficava mudo com o serviço
+        # "no ar".
+        #
+        # Agora: 8s de conexão + 14s de busca = 22s no pior
+        # caso, com folga de 8s até o limite.
+        ORCAMENTO_TOTAL = 14
+        TIMEOUT_POR_PAR = 5
 
         inicio_lote = time.time()
 
@@ -4357,8 +4376,36 @@ def _loop_worker():
         except Exception:
             pass
 
-        # Pequena pausa para não sobrecarregar a IQ Option/Render.
-        time.sleep(5)
+        # ------------------------------------------------
+        # UMA VOLTA A CADA 3 MINUTOS
+        # ------------------------------------------------
+        # A conexão com a corretora é UMA só, dividida entre
+        # este worker e o painel do site. Rodando a cada 5
+        # segundos, o worker ficava com ela quase o tempo
+        # todo e o painel devolvia 503 e 502 ao aluno.
+        #
+        # 3 minutos combina com o resto do sistema:
+        #   - o intervalo entre sinais no grupo também é 3 min;
+        #   - a sequência de gale leva 3 min para fechar.
+        #
+        # Buscar mais que isso não adianta: o sinal não sairia
+        # de qualquer jeito, e ainda gastaria conexão e
+        # recursos do Render à toa.
+        #
+        # Acorda logo depois da virada do minuto, quando a
+        # vela acabou de fechar — assim a leitura é sempre de
+        # vela fechada, nunca de vela pela metade.
+        INTERVALO_WORKER = int(
+            os.getenv("INTERVALO_WORKER", "180")
+        )
+
+        agora = time.time()
+        proxima = (
+            (int(agora // INTERVALO_WORKER) + 1)
+            * INTERVALO_WORKER
+        ) + 2
+        espera = proxima - agora
+        time.sleep(espera if espera > 0 else INTERVALO_WORKER)
 
 
 def iniciar_worker_automatico():
