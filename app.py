@@ -31,8 +31,8 @@ app = Flask(__name__)
 # não estiverem, o envio é silenciosamente pulado — a análise
 # de sinais nunca pode quebrar por causa do Telegram.
 #
-# As imagens (call.webp, put.webp, win_dw.webp, win_g1.webp,
-# win_g2.webp, loss_dw.webp, empate.webp) precisam estar na raiz
+# As imagens (call_dw.webp, put_dw.webp, win_dw.webp, gale1_dw.webp,
+# gale2_dw.webp, loss_dw.webp, empate_dw.webp) precisam estar na raiz
 # do repositório, do lado do app.py — é de lá que elas são
 # lidas e enviadas pro Telegram.
 
@@ -42,13 +42,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DIRETORIO_APP = os.path.dirname(os.path.abspath(__file__))
 
 IMAGENS_TELEGRAM = {
-    "call": os.path.join(DIRETORIO_APP, "call.webp"),
-    "put": os.path.join(DIRETORIO_APP, "put.webp"),
+    "call": os.path.join(DIRETORIO_APP, "call_dw.webp"),
+    "put": os.path.join(DIRETORIO_APP, "put_dw.webp"),
     "win": os.path.join(DIRETORIO_APP, "win_dw.webp"),
-    "win_g1": os.path.join(DIRETORIO_APP, "win_g1.webp"),
-    "win_g2": os.path.join(DIRETORIO_APP, "win_g2.webp"),
+    "win_g1": os.path.join(DIRETORIO_APP, "gale1_dw.webp"),
+    "win_g2": os.path.join(DIRETORIO_APP, "gale2_dw.webp"),
     "loss": os.path.join(DIRETORIO_APP, "loss_dw.webp"),
-    "empate": os.path.join(DIRETORIO_APP, "empate.webp"),
+    "empate": os.path.join(DIRETORIO_APP, "empate_dw.webp"),
 }
 
 # Pool próprio, separado do de candles, pra um Telegram lento
