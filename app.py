@@ -246,6 +246,46 @@ def montar_caption_sinal(par, analise):
     )
 
 
+# ------------------------------------------------------------
+# ESPERA ENTRE SINAIS
+# ------------------------------------------------------------
+# Sem isto, todo par com sinal confirmado ia para o grupo na
+# hora. Como o robô olha 5 pares por vez, saíam 4 ou 5 sinais
+# quase juntos — o aluno não conseguia acompanhar nenhum.
+#
+# Com 3 minutos de espera, só o primeiro passa. Os outros são
+# descartados; se ainda forem bons, aparecem na próxima volta.
+
+TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "180")
+)
+
+_ultima_entrada_enviada = 0
+_lock_espera_entrada = threading.Lock()
+
+
+def pode_enviar_sinal_agora():
+    """True só se já passou a espera desde o último sinal."""
+
+    global _ultima_entrada_enviada
+
+    agora = time.time()
+
+    with _lock_espera_entrada:
+
+        if (
+            _ultima_entrada_enviada
+            and agora - _ultima_entrada_enviada
+            < TELEGRAM_ESPERA_ENTRE_ENTRADAS
+        ):
+            return False
+
+        # Marca ANTES de enviar. Se marcasse depois, dois
+        # pares analisados no mesmo lote passariam juntos.
+        _ultima_entrada_enviada = agora
+        return True
+
+
 def escolher_imagem_sinal(sinal):
     return IMAGENS_TELEGRAM["call" if sinal == "CALL" else "put"]
 
@@ -375,6 +415,67 @@ def montar_resultado_telegram(par, sinal, entrada_em, resultado):
     )
 
     return imagem, caption
+
+def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
+    """Mensagem do resultado já com a etapa do gale.
+
+    Diferente da versão antiga, a etapa NÃO é adivinhada
+    olhando o histórico: ela vem da própria conferência das
+    três velas da mesma entrada. Sem adivinhação, sem gale
+    falso.
+    """
+
+    hora_entrada = datetime.fromtimestamp(
+        int(entrada_em),
+        tz=FUSO_BR,
+    ).strftime("%H:%M")
+
+    try:
+        etapa = int(etapa)
+    except (TypeError, ValueError):
+        etapa = 0
+
+    if resultado == "WIN":
+
+        if etapa == 0:
+            imagem = IMAGENS_TELEGRAM["win"]
+            titulo = "WIN"
+            linha_etapa = ""
+            rodape = "\n🔥 Entrada vencedora."
+        elif etapa == 1:
+            imagem = IMAGENS_TELEGRAM["win_g1"]
+            titulo = "WIN 1G"
+            linha_etapa = "🔁 Recuperado em G1\n"
+            rodape = "\n🔥 Recuperado no gale 1."
+        else:
+            imagem = IMAGENS_TELEGRAM["win_g2"]
+            titulo = "WIN 2G"
+            linha_etapa = "🔁 Recuperado em G2\n"
+            rodape = "\n🔥 Recuperado no gale 2."
+
+        caption = (
+            f"✅ <b>{titulo}</b> · {par}\n"
+            "────────────\n"
+            f"↩️ Entrada das {hora_entrada}\n"
+            f"📌 Direção {sinal} · M1\n"
+            f"{linha_etapa}"
+            f"{rodape}"
+        )
+
+        return imagem, caption
+
+    # LOSS — só chega aqui depois de perder entrada, G1 e G2.
+    caption = (
+        f"❌ <b>LOSS</b> · {par}\n"
+        "────────────\n"
+        f"↩️ Entrada das {hora_entrada}\n"
+        f"📌 Direção {sinal} · M1\n"
+        "🔁 Etapas  entrada + G1 + G2\n"
+        "\n⛔ Sequência encerrada."
+    )
+
+    return IMAGENS_TELEGRAM["loss"], caption
+
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -2977,22 +3078,62 @@ def resultado_sinal(par):
         except Exception:
             gravado = False
 
-        # Só manda o Telegram na primeira vez que este
-        # resultado é gravado (gravado=True). Essa rota pode
-        # ser chamada várias vezes em segundo plano pro mesmo
-        # sinal — sem essa checagem o WIN/LOSS repetiria a
-        # cada consulta.
+        # ----------------------------------------------------
+        # LOSS SÓ DEPOIS DE PERDER AS TRÊS
+        # ----------------------------------------------------
+        # Antes, uma vela perdida sozinha já virava ❌ LOSS no
+        # grupo. O aluno via derrota antes da sequência acabar.
+        #
+        # Agora:
+        #   entrada ganha                -> WIN
+        #   perde e G1 ganha             -> WIN 1G
+        #   perde, perde e G2 ganha      -> WIN 2G
+        #   perde as três                -> LOSS
+        #
+        # Enquanto a sequência não fecha, nada é anunciado.
+        # m2 é o fechamento uma vela depois (G1) e m3 duas
+        # velas depois (G2), da MESMA entrada.
+        #
+        # Só manda o Telegram na primeira vez que o resultado é
+        # gravado (gravado=True). Essa rota é consultada várias
+        # vezes em segundo plano pro mesmo sinal.
         if gravado:
-            try:
-                imagem, caption = montar_resultado_telegram(
-                    par,
-                    sinal,
-                    inicio_candle,
-                    m1,
-                )
-                enviar_telegram_foto(imagem, caption)
-            except Exception:
-                pass
+
+            resultado_final = None
+            etapa_final = 0
+
+            if m1 == "WIN":
+                resultado_final = "WIN"
+                etapa_final = 0
+
+            elif m2 == "WIN":
+                resultado_final = "WIN"
+                etapa_final = 1
+
+            elif m3 == "WIN":
+                resultado_final = "WIN"
+                etapa_final = 2
+
+            elif m2 is not None and m3 is not None:
+                # As três fecharam e todas perderam.
+                resultado_final = "LOSS"
+                etapa_final = 2
+
+            # Se m2 ou m3 ainda são None, o gale não fechou.
+            # Nada é enviado: a próxima consulta decide.
+
+            if resultado_final:
+                try:
+                    imagem, caption = montar_resultado_gale(
+                        par,
+                        sinal,
+                        inicio_candle,
+                        resultado_final,
+                        etapa_final,
+                    )
+                    enviar_telegram_foto(imagem, caption)
+                except Exception:
+                    pass
 
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
@@ -3050,7 +3191,11 @@ def candles_par(par):
 
         try:
             sinal_e_novo = registrar_sinal(par, analise)
-            if sinal_e_novo and analise.get("sinal") in ("CALL", "PUT"):
+            if (
+                sinal_e_novo
+                and analise.get("sinal") in ("CALL", "PUT")
+                and pode_enviar_sinal_agora()
+            ):
                 enviar_telegram_foto(
                     escolher_imagem_sinal(analise.get("sinal")),
                     montar_caption_sinal(par, analise),
@@ -3586,6 +3731,7 @@ def candles():
                     if (
                         sinal_e_novo
                         and analise.get("sinal") in ("CALL", "PUT")
+                        and pode_enviar_sinal_agora()
                     ):
                         enviar_telegram_foto(
                             escolher_imagem_sinal(analise.get("sinal")),
