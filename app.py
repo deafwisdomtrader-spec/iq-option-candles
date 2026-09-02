@@ -3779,6 +3779,130 @@ def candles():
         }), 503
 
 
+
+# ============================================================
+# TRABALHO AUTOMÁTICO — SINAIS + RESULTADOS
+# ============================================================
+#
+# O navegador antes fazia duas coisas importantes:
+#   1) consultava /candles para descobrir sinais novos;
+#   2) consultava /resultado/<par> para fechar os sinais.
+#
+# Isso fazia o Telegram parar quando o navegador era fechado.
+# Este worker faz as mesmas chamadas internamente, sem depender
+# do navegador. O cron do Render em / apenas mantém o serviço
+# acordado; este worker é quem executa o trabalho.
+#
+# A proteção do SQLite já existente impede sinal duplicado e a
+# atualização do resultado só acontece uma vez.
+# ============================================================
+
+_WORKER_ATIVO = False
+_WORKER_LOCK = threading.Lock()
+
+
+def _buscar_pendentes_worker():
+    """Retorna sinais M1 ainda sem resultado e já fechados."""
+    if not _DB_PRONTO:
+        return []
+
+    agora = int(time.time())
+    limite = agora - TIMEFRAME
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linhas = conexao.execute(
+                """
+                SELECT par, entrada_em, sinal
+                  FROM historico_sinais
+                 WHERE resultado IS NULL
+                   AND entrada_em <= ?
+              ORDER BY entrada_em ASC
+                 LIMIT 20
+                """,
+                (limite,),
+            ).fetchall()
+            conexao.close()
+
+        return [
+            (
+                str(linha["par"]),
+                int(linha["entrada_em"]),
+                str(linha["sinal"]).upper(),
+            )
+            for linha in linhas
+            if str(linha["sinal"]).upper() in ("CALL", "PUT")
+        ]
+    except Exception:
+        return []
+
+
+def _processar_resultados_worker():
+    """Fecha automaticamente os sinais pendentes."""
+    for par, entrada_em, sinal in _buscar_pendentes_worker():
+        try:
+            # Reutiliza exatamente a mesma lógica da rota pública.
+            # Assim não criamos uma segunda regra de WIN/LOSS.
+            caminho = (
+                f"/resultado/{par}"
+                f"?inicio={entrada_em}&sinal={sinal}"
+            )
+            with app.test_request_context(caminho):
+                resultado_sinal(par)
+        except Exception:
+            pass
+
+
+def _processar_sinais_worker():
+    """Executa a mesma análise de pares usada pelo painel."""
+    try:
+        # OTC é o mercado contínuo usado para manter sinais
+        # disponíveis também quando o Forex está fechado.
+        with app.test_request_context("/candles?mercado=otc"):
+            candles()
+    except Exception:
+        pass
+
+
+def _loop_worker():
+    """Loop único: primeiro fecha resultados, depois procura sinais."""
+    global _WORKER_ATIVO
+
+    with _WORKER_LOCK:
+        if _WORKER_ATIVO:
+            return
+        _WORKER_ATIVO = True
+
+    while True:
+        try:
+            _processar_resultados_worker()
+            _processar_sinais_worker()
+        except Exception:
+            pass
+
+        # Pequena pausa para não sobrecarregar a IQ Option/Render.
+        time.sleep(5)
+
+
+def iniciar_worker_automatico():
+    """Inicia uma única thread automática por processo do app."""
+    try:
+        thread = threading.Thread(
+            target=_loop_worker,
+            name="dw-academy-worker",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        pass
+
+
+# Inicia também quando o app é carregado pelo Gunicorn/Render.
+# Assim não depende de __main__ nem do navegador.
+iniciar_worker_automatico()
+
+
 # ============================================================
 # EXECUÇÃO
 # ============================================================
