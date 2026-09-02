@@ -19,21 +19,37 @@ from iqoptionapi.stable_api import IQ_Option
 app = Flask(__name__)
 
 # ============================================================
-# TELEGRAM — NOTIFICAÇÃO DE SINAL
+# TELEGRAM — SINAL (IMAGEM + CARTÃO) E RESULTADO (COM GALE)
 # ============================================================
 #
-# Manda uma mensagem pro Telegram assim que um sinal CALL/PUT
-# é gerado pela primeira vez (nunca em repetição do mesmo
-# sinal, isso é controlado em registrar_sinal via o retorno
-# de "linha nova inserida").
+# Manda uma mensagem com FOTO pro Telegram: uma pro sinal
+# (seta CALL/PUT) e outra pro resultado (WIN/LOSS), igual ao
+# formato original do canal.
 #
 # As variáveis TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID já devem
 # estar configuradas no Render (Settings -> Environment). Se
 # não estiverem, o envio é silenciosamente pulado — a análise
 # de sinais nunca pode quebrar por causa do Telegram.
+#
+# As imagens (call.webp, put.webp, win.webp, win_g1.webp,
+# win_g2.webp, loss.webp, empate.webp) precisam estar na raiz
+# do repositório, do lado do app.py — é de lá que elas são
+# lidas e enviadas pro Telegram.
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+DIRETORIO_APP = os.path.dirname(os.path.abspath(__file__))
+
+IMAGENS_TELEGRAM = {
+    "call": os.path.join(DIRETORIO_APP, "call.webp"),
+    "put": os.path.join(DIRETORIO_APP, "put.webp"),
+    "win": os.path.join(DIRETORIO_APP, "win.webp"),
+    "win_g1": os.path.join(DIRETORIO_APP, "win_g1.webp"),
+    "win_g2": os.path.join(DIRETORIO_APP, "win_g2.webp"),
+    "loss": os.path.join(DIRETORIO_APP, "loss.webp"),
+    "empate": os.path.join(DIRETORIO_APP, "empate.webp"),
+}
 
 # Pool próprio, separado do de candles, pra um Telegram lento
 # nunca competir com a busca de dados por vagas de thread.
@@ -42,7 +58,7 @@ _executor_telegram = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-def _enviar_telegram_sync(mensagem):
+def _enviar_telegram_texto_sync(mensagem):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
@@ -72,60 +88,212 @@ def _enviar_telegram_sync(mensagem):
         return False
 
 
-def enviar_telegram(mensagem):
+def _enviar_telegram_foto_sync(caminho_imagem, caption):
+    """Manda a foto com legenda. Se o arquivo de imagem não
+    existir por algum motivo, cai pro envio só de texto — o
+    sinal nunca deixa de chegar por causa de uma imagem
+    faltando.
+    """
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    try:
+
+        if not caminho_imagem or not os.path.isfile(caminho_imagem):
+            return _enviar_telegram_texto_sync(caption)
+
+        url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/sendPhoto"
+        )
+
+        with open(caminho_imagem, "rb") as arquivo_imagem:
+
+            resposta = requests.post(
+                url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                files={"photo": arquivo_imagem},
+                timeout=15,
+            )
+
+        return resposta.ok
+
+    except Exception:
+
+        return _enviar_telegram_texto_sync(caption)
+
+
+def enviar_telegram_foto(caminho_imagem, caption):
     """Dispara o envio em segundo plano, sem travar a rota."""
 
     try:
-        _executor_telegram.submit(_enviar_telegram_sync, mensagem)
+        _executor_telegram.submit(
+            _enviar_telegram_foto_sync,
+            caminho_imagem,
+            caption,
+        )
     except Exception:
         pass
 
 
-def montar_mensagem_sinal(par, analise):
+def _mercado_do_par(par):
 
-    sinal = analise.get("sinal")
+    if par.endswith("-OTC"):
+        return "OTC"
 
-    emoji = "🟢" if sinal == "CALL" else "🔴"
+    if par in PARES_ACOES:
+        return "AÇÕES"
 
-    return (
-        f"{emoji} <b>{sinal}</b> — {par}\n"
-        f"Entrada: {analise.get('entrada', '--:--')}\n"
-        f"Confiança: {analise.get('confianca')}\n"
-        f"Qualidade: {analise.get('qualidade_sinal')}\n"
-        f"Tendência: {analise.get('tendencia')}\n"
-        f"Estratégia: {ESTRATEGIA}"
-    )
+    return "FOREX"
 
 
-def montar_linha_sinal_lote(par, analise):
-    """Versão compacta de um sinal, para entrar numa mensagem
-    que agrupa vários sinais da mesma rodada de busca.
+def montar_caption_sinal(par, analise):
+    """Cartão de sinal: mercado, entrada, duração, tendência,
+    força (em bolinhas) e RSI — igual ao formato original.
     """
 
     sinal = analise.get("sinal")
 
-    emoji = "🟢" if sinal == "CALL" else "🔴"
+    emoji_titulo = "🟢" if sinal == "CALL" else "🔴"
+    titulo = f"{sinal} CONFIRMADO"
+
+    confianca = analise.get("confianca") or 0
+    preenchidas = max(0, min(5, round((confianca / 8) * 5)))
+    forca_bolinhas = ("●" * preenchidas) + ("○" * (5 - preenchidas))
+
+    rsi = analise.get("rsi")
+    rsi_texto = str(rsi) if rsi is not None else "--"
 
     return (
-        f"{emoji} <b>{sinal}</b> — {par} "
-        f"({analise.get('entrada', '--:--')}) "
-        f"conf. {analise.get('confianca')} "
-        f"({analise.get('qualidade_sinal')})"
+        f"{emoji_titulo} <b>{titulo}</b> · {par}\n"
+        "────────────\n"
+        f"🏛 Mercado  {_mercado_do_par(par)}\n"
+        f"⏰ Entrada  {analise.get('entrada', '--:--')}\n"
+        f"⏱ Duração  M1\n\n"
+        f"📈 Tendência  {analise.get('tendencia')}\n"
+        f"⭐ Força  {forca_bolinhas} {confianca}\n"
+        f"🩸 RSI  {rsi_texto}\n\n"
+        "🔁 Martingale: até G2 (opcional)\n"
+        "⚠️ <i>Alerta técnico e educacional.</i>"
     )
 
 
-def montar_mensagem_lote(linhas):
-    """Junta várias linhas de sinal numa única mensagem, com
-    a estratégia mencionada uma vez só, no fim.
+def escolher_imagem_sinal(sinal):
+    return IMAGENS_TELEGRAM["call" if sinal == "CALL" else "put"]
 
-    Evita mandar um Telegram por par quando várias pares dão
-    sinal na mesma rodada de /candles — em vez de 4 ou 5
-    mensagens seguidas, chega só uma com tudo junto.
+
+def nivel_gale_atual(par, entrada_em):
+    """Conta quantas derrotas seguidas vieram IMEDIATAMENTE
+    antes desta entrada, pra saber se ela é direta (0), Gale 1
+    ou Gale 2. Olha só os 2 resultados anteriores mais recentes
+    do mesmo par — no primeiro WIN (ou se não tiver histórico)
+    a contagem para.
     """
 
-    corpo = "\n".join(linhas)
+    if not _DB_PRONTO:
+        return 0
 
-    return f"{corpo}\n\n<i>Estratégia: {ESTRATEGIA}</i>"
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            linhas = conexao.execute(
+                """
+                SELECT resultado FROM historico_sinais
+                 WHERE par = ?
+                   AND resultado IN ('WIN', 'LOSS')
+                   AND entrada_em < ?
+              ORDER BY entrada_em DESC
+                 LIMIT 2
+                """,
+                (str(par), int(entrada_em)),
+            ).fetchall()
+
+            conexao.close()
+
+    except Exception:
+
+        return 0
+
+    nivel = 0
+
+    for linha in linhas:
+
+        if linha["resultado"] == "LOSS":
+            nivel += 1
+        else:
+            break
+
+    return nivel
+
+
+def montar_resultado_telegram(par, sinal, entrada_em, resultado):
+    """Devolve (caminho_da_imagem, legenda) pro resultado,
+    já considerando em que Gale ele aconteceu.
+    """
+
+    nivel = nivel_gale_atual(par, entrada_em)
+
+    hora_entrada = datetime.fromtimestamp(
+        entrada_em,
+        tz=FUSO_BR,
+    ).strftime("%H:%M")
+
+    if resultado == "WIN":
+
+        if nivel == 0:
+            imagem = IMAGENS_TELEGRAM["win"]
+            titulo = "WIN"
+            rodape = ""
+        elif nivel == 1:
+            imagem = IMAGENS_TELEGRAM["win_g1"]
+            titulo = "WIN 1G"
+            rodape = "\n🔥 Recuperado no gale 1."
+        else:
+            imagem = IMAGENS_TELEGRAM["win_g2"]
+            titulo = "WIN 2G"
+            rodape = "\n🔥 Recuperado no gale 2."
+
+        recuperado = (
+            f"🔁 Recuperado em G{nivel}\n" if nivel > 0 else ""
+        )
+
+        caption = (
+            f"✅ <b>{titulo}</b> · {par}\n"
+            "────────────\n"
+            f"🔁 Entrada das {hora_entrada}\n"
+            f"🎯 Direção {sinal} · M1\n"
+            f"{recuperado}"
+            f"{rodape}"
+        )
+
+        return imagem, caption
+
+    # LOSS
+    imagem = IMAGENS_TELEGRAM["loss"]
+
+    if nivel < 2:
+        rodape = f"\n➡️ Segue pro Gale {nivel + 1}."
+    else:
+        rodape = "\n⛔ Sequência encerrada no Gale 2."
+
+    caption = (
+        f"❌ <b>LOSS</b> · {par}\n"
+        "────────────\n"
+        f"🔁 Entrada das {hora_entrada}\n"
+        f"🎯 Direção {sinal} · M1"
+        f"{rodape}"
+    )
+
+    return imagem, caption
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -2728,6 +2896,23 @@ def resultado_sinal(par):
         except Exception:
             gravado = False
 
+        # Só manda o Telegram na primeira vez que este
+        # resultado é gravado (gravado=True). Essa rota pode
+        # ser chamada várias vezes em segundo plano pro mesmo
+        # sinal — sem essa checagem o WIN/LOSS repetiria a
+        # cada consulta.
+        if gravado:
+            try:
+                imagem, caption = montar_resultado_telegram(
+                    par,
+                    sinal,
+                    inicio_candle,
+                    m1,
+                )
+                enviar_telegram_foto(imagem, caption)
+            except Exception:
+                pass
+
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
     # corretora. Sem isso não há como saber se uma divergência
@@ -2785,7 +2970,10 @@ def candles_par(par):
         try:
             sinal_e_novo = registrar_sinal(par, analise)
             if sinal_e_novo and analise.get("sinal") in ("CALL", "PUT"):
-                enviar_telegram(montar_mensagem_sinal(par, analise))
+                enviar_telegram_foto(
+                    escolher_imagem_sinal(analise.get("sinal")),
+                    montar_caption_sinal(par, analise),
+                )
         except Exception:
             pass
 
@@ -3244,12 +3432,6 @@ def candles():
 
         resultados = []
 
-        # Acumula os sinais novos desta rodada pra mandar UMA
-        # única mensagem no Telegram no final, em vez de uma
-        # por par — evita a enxurrada de mensagens seguidas
-        # quando vários pares dão sinal na mesma busca.
-        sinais_novos_lote = []
-
         # ORÇAMENTO DE TEMPO
         #
         # O gunicorn mata o worker por volta dos 30 segundos.
@@ -3315,17 +3497,18 @@ def candles():
 
                 # Guarda o contexto do sinal para o histórico.
                 # Falhar aqui não pode derrubar a resposta.
-                # Só entra no lote do Telegram quando é linha
-                # NOVA, pra rotação repetida do mesmo par/candle
-                # não mandar o mesmo sinal de novo.
+                # Só notifica o Telegram quando é linha NOVA,
+                # pra rotação repetida do mesmo par/candle não
+                # mandar o mesmo sinal de novo.
                 try:
                     sinal_e_novo = registrar_sinal(par, analise)
                     if (
                         sinal_e_novo
                         and analise.get("sinal") in ("CALL", "PUT")
                     ):
-                        sinais_novos_lote.append(
-                            montar_linha_sinal_lote(par, analise)
+                        enviar_telegram_foto(
+                            escolher_imagem_sinal(analise.get("sinal")),
+                            montar_caption_sinal(par, analise),
                         )
                 except Exception:
                     pass
@@ -3475,13 +3658,6 @@ def candles():
                         texto_erro,
 
                 })
-
-        # Manda UMA mensagem com todos os sinais novos desta
-        # rodada, em vez de uma por par.
-        if sinais_novos_lote:
-            enviar_telegram(
-                montar_mensagem_lote(sinais_novos_lote)
-            )
 
         return jsonify({
 
