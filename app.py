@@ -88,20 +88,54 @@ def _enviar_telegram_texto_sync(mensagem):
         return False
 
 
-def _enviar_telegram_foto_sync(caminho_imagem, caption):
-    """Manda a foto com legenda. Se o arquivo de imagem não
-    existir por algum motivo, cai pro envio só de texto — o
-    sinal nunca deixa de chegar por causa de uma imagem
-    faltando.
+def _enviar_telegram_sticker_sync(caminho_imagem):
+    """Manda a imagem como STICKER (sem moldura, sem fundo
+    branco). É assim que o Telegram exibe imagem "colada" no
+    fundo do chat, em vez da caixa clara que sendPhoto sempre
+    desenha atrás da imagem.
+    """
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    if not caminho_imagem or not os.path.isfile(caminho_imagem):
+        return False
+
+    try:
+
+        url = (
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/sendSticker"
+        )
+
+        with open(caminho_imagem, "rb") as arquivo_imagem:
+
+            resposta = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID},
+                files={"sticker": arquivo_imagem},
+                timeout=15,
+            )
+
+        return resposta.ok
+
+    except Exception:
+
+        return False
+
+
+def _enviar_telegram_photo_sync(caminho_imagem):
+    """Reserva: só usado se o arquivo for rejeitado como
+    sticker (ex: não bate com o tamanho/tipo exigido pelo
+    Telegram). Melhor a imagem chegar com moldura do que não
+    chegar de jeito nenhum.
     """
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
     try:
-
-        if not caminho_imagem or not os.path.isfile(caminho_imagem):
-            return _enviar_telegram_texto_sync(caption)
 
         url = (
             "https://api.telegram.org/bot"
@@ -113,11 +147,7 @@ def _enviar_telegram_foto_sync(caminho_imagem, caption):
 
             resposta = requests.post(
                 url,
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                },
+                data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"photo": arquivo_imagem},
                 timeout=15,
             )
@@ -126,15 +156,37 @@ def _enviar_telegram_foto_sync(caminho_imagem, caption):
 
     except Exception:
 
-        return _enviar_telegram_texto_sync(caption)
+        return False
+
+
+def _enviar_cartao_telegram_sync(caminho_imagem, caption):
+    """Manda o ícone como STICKER primeiro (mensagem própria,
+    sem legenda — sticker não aceita legenda no Telegram) e
+    depois o cartão de texto, como mensagem separada logo em
+    seguida. É o mesmo padrão de duas mensagens do canal
+    original: ícone em cima, cartão embaixo.
+    """
+
+    if caminho_imagem and os.path.isfile(caminho_imagem):
+
+        enviado_como_sticker = _enviar_telegram_sticker_sync(
+            caminho_imagem
+        )
+
+        if not enviado_como_sticker:
+            _enviar_telegram_photo_sync(caminho_imagem)
+
+    _enviar_telegram_texto_sync(caption)
 
 
 def enviar_telegram_foto(caminho_imagem, caption):
-    """Dispara o envio em segundo plano, sem travar a rota."""
+    """Dispara o envio (sticker + cartão) em segundo plano,
+    sem travar a rota.
+    """
 
     try:
         _executor_telegram.submit(
-            _enviar_telegram_foto_sync,
+            _enviar_cartao_telegram_sync,
             caminho_imagem,
             caption,
         )
