@@ -31,8 +31,8 @@ app = Flask(__name__)
 # não estiverem, o envio é silenciosamente pulado — a análise
 # de sinais nunca pode quebrar por causa do Telegram.
 #
-# As imagens (call.webp, put.webp, win.webp, win_g1.webp,
-# win_g2.webp, loss.webp, empate.webp) precisam estar na raiz
+# As imagens (call.webp, put.webp, win_dw.webp, win_g1.webp,
+# win_g2.webp, loss_dw.webp, empate.webp) precisam estar na raiz
 # do repositório, do lado do app.py — é de lá que elas são
 # lidas e enviadas pro Telegram.
 
@@ -44,10 +44,10 @@ DIRETORIO_APP = os.path.dirname(os.path.abspath(__file__))
 IMAGENS_TELEGRAM = {
     "call": os.path.join(DIRETORIO_APP, "call.webp"),
     "put": os.path.join(DIRETORIO_APP, "put.webp"),
-    "win": os.path.join(DIRETORIO_APP, "win.webp"),
+    "win": os.path.join(DIRETORIO_APP, "win_dw.webp"),
     "win_g1": os.path.join(DIRETORIO_APP, "win_g1.webp"),
     "win_g2": os.path.join(DIRETORIO_APP, "win_g2.webp"),
-    "loss": os.path.join(DIRETORIO_APP, "loss.webp"),
+    "loss": os.path.join(DIRETORIO_APP, "loss_dw.webp"),
     "empate": os.path.join(DIRETORIO_APP, "empate.webp"),
 }
 
