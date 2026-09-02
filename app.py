@@ -597,6 +597,22 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
 
         return imagem, caption
 
+    if resultado == "EMPATE":
+
+        # Vela sem movimento. Na maioria das corretoras o valor
+        # volta, então não é derrota. Não existe imagem própria
+        # para isto; se o arquivo não estiver no servidor, só o
+        # texto é enviado — o que já basta.
+        caption = (
+            f"⚪ <b>EMPATE</b> · {par}\n"
+            "────────────\n"
+            f"↩️ Entrada das {hora_entrada}\n"
+            f"📌 Direção {sinal} · M1\n"
+            "\n➖ Vela fechou no mesmo preço."
+        )
+
+        return IMAGENS_TELEGRAM.get("empate"), caption
+
     # LOSS — só chega aqui depois de perder entrada, G1 e G2.
     caption = (
         f"❌ <b>LOSS</b> · {par}\n"
@@ -3191,6 +3207,49 @@ def resultado_sinal(par):
     m2 = avaliar(2)
     m3 = avaliar(3)
 
+    # ----------------------------------------------------
+    # ETAPAS DO GALE — DIFERENTE DE M2 E M3
+    # ----------------------------------------------------
+    # m2 e m3 medem a MESMA entrada com expiração maior:
+    # comparam a abertura da vela de entrada com o fechamento
+    # de 2 ou 3 velas depois.
+    #
+    # Gale é outra coisa: é uma ENTRADA NOVA na vela seguinte.
+    # Vale a abertura DELA contra o fechamento DELA.
+    #
+    # Usar m2 no lugar do G1 daria resultado errado no grupo.
+
+    def avaliar_gale(velas_depois):
+
+        vela = por_inicio.get(
+            inicio_candle + (velas_depois * TIMEFRAME)
+        )
+
+        if vela is None:
+            return None
+
+        # Ainda não fechou.
+        if time.time() < vela["from"] + TIMEFRAME:
+            return None
+
+        if vela["close"] > vela["open"]:
+            direcao_vela = "ALTA"
+        elif vela["close"] < vela["open"]:
+            direcao_vela = "BAIXA"
+        else:
+            return "EMPATE"
+
+        if sinal == "CALL" and direcao_vela == "ALTA":
+            return "WIN"
+
+        if sinal == "PUT" and direcao_vela == "BAIXA":
+            return "WIN"
+
+        return "LOSS"
+
+    g1 = avaliar_gale(1)
+    g2 = avaliar_gale(2)
+
     # Grava o resultado no histórico.
     #
     # O UPDATE só atinge a linha daquele par + entrada + sinal,
@@ -3201,61 +3260,82 @@ def resultado_sinal(par):
     gravado = False
 
     if m1 in ("WIN", "LOSS"):
-        try:
-            gravado = registrar_resultado_historico(
-                par,
-                inicio_candle,
-                sinal,
-                m1,
-            )
-        except Exception:
-            gravado = False
 
         # ----------------------------------------------------
         # LOSS SÓ DEPOIS DE PERDER AS TRÊS
         # ----------------------------------------------------
-        # Antes, uma vela perdida sozinha já virava ❌ LOSS no
-        # grupo. O aluno via derrota antes da sequência acabar.
+        #   entrada ganha            -> WIN
+        #   perde e G1 ganha         -> WIN 1G
+        #   perde, perde, G2 ganha   -> WIN 2G
+        #   perde as três            -> LOSS
         #
-        # Agora:
-        #   entrada ganha                -> WIN
-        #   perde e G1 ganha             -> WIN 1G
-        #   perde, perde e G2 ganha      -> WIN 2G
-        #   perde as três                -> LOSS
-        #
-        # Enquanto a sequência não fecha, nada é anunciado.
-        # m2 é o fechamento uma vela depois (G1) e m3 duas
-        # velas depois (G2), da MESMA entrada.
-        #
-        # Só manda o Telegram na primeira vez que o resultado é
-        # gravado (gravado=True). Essa rota é consultada várias
-        # vezes em segundo plano pro mesmo sinal.
-        if gravado:
+        # ATENÇÃO AO BANCO: o resultado só é gravado quando a
+        # sequência FECHA. Enquanto ela corre, a linha continua
+        # sem resultado — e é justamente isso que faz o worker
+        # voltar nela no próximo ciclo. Se gravasse antes, a
+        # linha sairia da fila e o WIN 1G nunca chegaria ao
+        # grupo.
 
-            resultado_final = None
+        resultado_final = None
+        etapa_final = 0
+
+        if m1 == "WIN":
+            resultado_final = "WIN"
             etapa_final = 0
 
-            if m1 == "WIN":
-                resultado_final = "WIN"
-                etapa_final = 0
+        elif g1 == "WIN":
+            resultado_final = "WIN"
+            etapa_final = 1
 
-            elif m2 == "WIN":
-                resultado_final = "WIN"
-                etapa_final = 1
+        elif g1 == "EMPATE":
+            resultado_final = "EMPATE"
+            etapa_final = 1
 
-            elif m3 == "WIN":
+        elif g1 == "LOSS":
+
+            if g2 == "WIN":
                 resultado_final = "WIN"
                 etapa_final = 2
 
-            elif m2 is not None and m3 is not None:
-                # As três fecharam e todas perderam.
+            elif g2 == "EMPATE":
+                resultado_final = "EMPATE"
+                etapa_final = 2
+
+            elif g2 == "LOSS":
                 resultado_final = "LOSS"
                 etapa_final = 2
 
-            # Se m2 ou m3 ainda são None, o gale não fechou.
-            # Nada é enviado: a próxima consulta decide.
+        # Válvula de segurança: se depois de 15 minutos a
+        # sequência ainda não fechou (mercado fechou, vela não
+        # veio), encerra com o que se sabe. Sem isto a linha
+        # ficaria para sempre na fila do worker.
+        if (
+            resultado_final is None
+            and time.time() - inicio_candle > 900
+        ):
+            resultado_final = "LOSS" if m1 == "LOSS" else "WIN"
+            etapa_final = 0
 
-            if resultado_final:
+        if resultado_final:
+
+            # Grava a vela da ENTRADA no histórico — é ela que
+            # mede a estratégia. Um "WIN 2G" foi, na origem,
+            # uma leitura errada; contar como acerto ensinaria
+            # o sistema a repetir o erro.
+            try:
+                gravado = registrar_resultado_historico(
+                    par,
+                    inicio_candle,
+                    sinal,
+                    m1,
+                )
+            except Exception:
+                gravado = False
+
+            # Só manda o Telegram na primeira gravação. A rota
+            # é consultada várias vezes pro mesmo sinal.
+            if gravado:
+
                 try:
                     imagem, caption = montar_resultado_gale(
                         par,
@@ -3268,7 +3348,6 @@ def resultado_sinal(par):
                 except Exception:
                     pass
 
-                # Sequência encerrada: libera o próximo sinal.
                 try:
                     encerrar_sequencia(par, inicio_candle)
                 except Exception:
