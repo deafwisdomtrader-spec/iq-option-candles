@@ -263,16 +263,61 @@ TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
 _ultima_entrada_enviada = 0
 _lock_espera_entrada = threading.Lock()
 
+# ------------------------------------------------------------
+# UMA OPERAÇÃO POR VEZ
+# ------------------------------------------------------------
+# Só a espera de 3 minutos não bastava. A sequência do gale
+# leva 3 minutos para resolver (entrada + G1 + G2), então um
+# sinal novo chegava BEM NO MEIO da anterior. O aluno via duas
+# operações misturadas e não sabia qual estava acompanhando.
+#
+# Agora o robô segura o próximo sinal até o resultado da
+# sequência aberta ser anunciado. Uma operação por vez, do
+# começo ao fim.
+#
+# O tempo máximo é uma válvula de segurança: se o resultado
+# não chegar (mercado fechou, conexão caiu), a trava solta
+# sozinha em vez de deixar o grupo mudo para sempre.
 
-def pode_enviar_sinal_agora():
-    """True só se já passou a espera desde o último sinal."""
+SEQUENCIA_TEMPO_MAXIMO = int(
+    os.getenv("SEQUENCIA_TEMPO_MAXIMO", "600")
+)
+
+_sequencia_aberta = None
+
+
+def pode_enviar_sinal_agora(par=None, entrada_em=None):
+    """True só se não houver sequência aberta e a espera
+    mínima já tiver passado.
+    """
 
     global _ultima_entrada_enviada
+    global _sequencia_aberta
 
     agora = time.time()
 
     with _lock_espera_entrada:
 
+        # 1) Tem operação em andamento?
+        if _sequencia_aberta:
+
+            idade = agora - _sequencia_aberta["criado_em"]
+
+            if idade < SEQUENCIA_TEMPO_MAXIMO:
+                return False
+
+            # Passou do tempo máximo: provavelmente o resultado
+            # nunca vai chegar. Libera para o grupo não morrer.
+            print(
+                "TELEGRAM: sequência de",
+                _sequencia_aberta.get("par"),
+                "sem resultado há",
+                int(idade),
+                "s — liberando.",
+            )
+            _sequencia_aberta = None
+
+        # 2) Espera mínima entre entradas.
         if (
             _ultima_entrada_enviada
             and agora - _ultima_entrada_enviada
@@ -283,7 +328,95 @@ def pode_enviar_sinal_agora():
         # Marca ANTES de enviar. Se marcasse depois, dois
         # pares analisados no mesmo lote passariam juntos.
         _ultima_entrada_enviada = agora
+
+        if par and entrada_em:
+            _sequencia_aberta = {
+                "par": str(par),
+                "entrada_em": int(entrada_em),
+                "criado_em": agora,
+            }
+
         return True
+
+
+def encerrar_sequencia(par, entrada_em):
+    """Libera o robô para o próximo sinal.
+
+    Chamado quando o resultado (WIN, WIN 1G, WIN 2G ou LOSS)
+    já foi anunciado no grupo.
+    """
+
+    global _sequencia_aberta
+
+    with _lock_espera_entrada:
+
+        aberta = _sequencia_aberta
+
+        if not aberta:
+            return
+
+        if (
+            aberta.get("par") == str(par)
+            and int(aberta.get("entrada_em", 0)) == int(entrada_em)
+        ):
+            _sequencia_aberta = None
+
+
+# ------------------------------------------------------------
+# ANTECEDÊNCIA DA ENTRADA
+# ------------------------------------------------------------
+# A mensagem chegava às 16:54 mandando entrar às 16:54. Quando
+# o aluno lia, a vela já estava correndo — não dava tempo de
+# abrir a corretora e clicar.
+#
+# Empurrando 1 vela para frente, a mensagem chega com cerca de
+# 1 minuto de aviso.
+#
+# TROCA CONSCIENTE: a análise lê a vela que acabou de fechar.
+# Quanto mais longe a entrada, mais velha fica essa leitura.
+# Sem tempo de aviso, porém, o sinal não serve para nada.
+#
+# Para 2 minutos de aviso, ponha VELAS_ANTECEDENCIA=2 no
+# Render.
+#
+# Isto vale SÓ para o Telegram. O painel do site continua
+# exatamente como está.
+
+VELAS_ANTECEDENCIA = int(
+    os.getenv("VELAS_ANTECEDENCIA", "1")
+)
+
+
+def adiantar_entrada(analise, velas=None):
+    """Devolve uma CÓPIA com a entrada algumas velas à frente.
+
+    O resultado WIN/LOSS é conferido na vela REAL da entrada,
+    porque é esta cópia que vai para o banco — e é do banco
+    que o worker tira o horário para conferir. A conferência
+    segue honesta.
+    """
+
+    if velas is None:
+        velas = VELAS_ANTECEDENCIA
+
+    if velas <= 0:
+        return analise
+
+    entrada_em = analise.get("entrada_em")
+
+    if not entrada_em:
+        return analise
+
+    novo = dict(analise)
+    novo_ts = int(entrada_em) + (velas * TIMEFRAME)
+
+    novo["entrada_em"] = novo_ts
+    novo["entrada"] = datetime.fromtimestamp(
+        novo_ts,
+        tz=FUSO_BR,
+    ).strftime("%H:%M")
+
+    return novo
 
 
 def escolher_imagem_sinal(sinal):
@@ -3135,6 +3268,12 @@ def resultado_sinal(par):
                 except Exception:
                     pass
 
+                # Sequência encerrada: libera o próximo sinal.
+                try:
+                    encerrar_sequencia(par, inicio_candle)
+                except Exception:
+                    pass
+
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
     # corretora. Sem isso não há como saber se uma divergência
@@ -3190,15 +3329,22 @@ def candles_par(par):
         )
 
         try:
-            sinal_e_novo = registrar_sinal(par, analise)
+            # Adianta ANTES de gravar: é este horário que vai
+            # para o banco, e é dele que o worker tira a vela
+            # para conferir o resultado.
+            analise_tg = adiantar_entrada(analise)
+            sinal_e_novo = registrar_sinal(par, analise_tg)
             if (
                 sinal_e_novo
-                and analise.get("sinal") in ("CALL", "PUT")
-                and pode_enviar_sinal_agora()
+                and analise_tg.get("sinal") in ("CALL", "PUT")
+                and pode_enviar_sinal_agora(
+                    par,
+                    analise_tg.get("entrada_em"),
+                )
             ):
                 enviar_telegram_foto(
-                    escolher_imagem_sinal(analise.get("sinal")),
-                    montar_caption_sinal(par, analise),
+                    escolher_imagem_sinal(analise_tg.get("sinal")),
+                    montar_caption_sinal(par, analise_tg),
                 )
         except Exception:
             pass
@@ -3727,15 +3873,19 @@ def candles():
                 # pra rotação repetida do mesmo par/candle não
                 # mandar o mesmo sinal de novo.
                 try:
-                    sinal_e_novo = registrar_sinal(par, analise)
+                    analise_tg = adiantar_entrada(analise)
+                    sinal_e_novo = registrar_sinal(par, analise_tg)
                     if (
                         sinal_e_novo
-                        and analise.get("sinal") in ("CALL", "PUT")
-                        and pode_enviar_sinal_agora()
+                        and analise_tg.get("sinal") in ("CALL", "PUT")
+                        and pode_enviar_sinal_agora(
+                            par,
+                            analise_tg.get("entrada_em"),
+                        )
                     ):
                         enviar_telegram_foto(
-                            escolher_imagem_sinal(analise.get("sinal")),
-                            montar_caption_sinal(par, analise),
+                            escolher_imagem_sinal(analise_tg.get("sinal")),
+                            montar_caption_sinal(par, analise_tg),
                         )
                 except Exception:
                     pass
