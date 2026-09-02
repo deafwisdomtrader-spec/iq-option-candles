@@ -53,8 +53,15 @@ IMAGENS_TELEGRAM = {
 
 # Pool próprio, separado do de candles, pra um Telegram lento
 # nunca competir com a busca de dados por vagas de thread.
+#
+# max_workers=1 DE PROPÓSITO: cada card é sticker + texto, em
+# duas chamadas separadas à API do Telegram. Com mais de uma
+# vaga, cards de pares diferentes rodavam em paralelo e os
+# stickers chegavam todos juntos, antes dos textos — bagunçado.
+# Com 1 vaga só, um card inteiro (sticker + texto) termina
+# antes do próximo começar, então a ordem sempre sai certinha.
 _executor_telegram = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4
+    max_workers=1
 )
 
 
