@@ -223,7 +223,10 @@ def montar_caption_sinal(par, analise):
     titulo = f"{sinal} CONFIRMADO"
 
     confianca = analise.get("confianca") or 0
-    preenchidas = max(0, min(5, round((confianca / 8) * 5)))
+    # int(x + 0.5), não round(): o round() do Python arredonda
+    # 2.5 para 2 e 4.5 para 4 (regra do banqueiro), o que fazia
+    # forças diferentes desenharem a mesma barra.
+    preenchidas = max(0, min(5, int((confianca / 8) * 5 + 0.5)))
     forca_bolinhas = ("●" * preenchidas) + ("○" * (5 - preenchidas))
 
     rsi = analise.get("rsi")
@@ -248,11 +251,15 @@ def escolher_imagem_sinal(sinal):
 
 
 def nivel_gale_atual(par, entrada_em):
-    """Conta quantas derrotas seguidas vieram IMEDIATAMENTE
-    antes desta entrada, pra saber se ela é direta (0), Gale 1
-    ou Gale 2. Olha só os 2 resultados anteriores mais recentes
-    do mesmo par — no primeiro WIN (ou se não tiver histórico)
-    a contagem para.
+    """Conta derrotas em velas IMEDIATAMENTE anteriores.
+
+    A versão antiga só olhava "as 2 últimas derrotas do par",
+    sem conferir QUANDO elas foram. Um LOSS de horas atrás
+    fazia uma entrada nova, sem relação nenhuma, aparecer no
+    grupo como "WIN 2G" — o aluno via um gale que nunca houve.
+
+    Gale de verdade é vela colada na anterior. Se existir
+    buraco de tempo, a sequência quebrou: é entrada nova.
     """
 
     if not _DB_PRONTO:
@@ -266,14 +273,19 @@ def nivel_gale_atual(par, entrada_em):
 
             linhas = conexao.execute(
                 """
-                SELECT resultado FROM historico_sinais
+                SELECT entrada_em, resultado FROM historico_sinais
                  WHERE par = ?
                    AND resultado IN ('WIN', 'LOSS')
                    AND entrada_em < ?
+                   AND entrada_em >= ?
               ORDER BY entrada_em DESC
                  LIMIT 2
                 """,
-                (str(par), int(entrada_em)),
+                (
+                    str(par),
+                    int(entrada_em),
+                    int(entrada_em) - (2 * TIMEFRAME),
+                ),
             ).fetchall()
 
             conexao.close()
@@ -283,13 +295,19 @@ def nivel_gale_atual(par, entrada_em):
         return 0
 
     nivel = 0
+    esperado = int(entrada_em) - TIMEFRAME
 
     for linha in linhas:
 
-        if linha["resultado"] == "LOSS":
-            nivel += 1
-        else:
+        # Buraco no tempo: não é sequência de gale.
+        if int(linha["entrada_em"]) != esperado:
             break
+
+        if linha["resultado"] != "LOSS":
+            break
+
+        nivel += 1
+        esperado -= TIMEFRAME
 
     return nivel
 
@@ -339,8 +357,12 @@ def montar_resultado_telegram(par, sinal, entrada_em, resultado):
     # LOSS
     imagem = IMAGENS_TELEGRAM["loss"]
 
+    # A mensagem antiga prometia "Segue pro Gale 1", mas o robô
+    # NÃO emite sinal de gale. O aluno ficava esperando uma
+    # entrada que nunca chegava. O texto agora diz só o que é
+    # verdade: o gale existe, é opcional e é decisão dele.
     if nivel < 2:
-        rodape = f"\n➡️ Segue pro Gale {nivel + 1}."
+        rodape = "\n🔁 Martingale: até G2 (opcional)"
     else:
         rodape = "\n⛔ Sequência encerrada no Gale 2."
 
@@ -3800,6 +3822,85 @@ def candles():
 _WORKER_ATIVO = False
 _WORKER_LOCK = threading.Lock()
 
+# ------------------------------------------------------------
+# UM WORKER SÓ — TRAVA DE ARQUIVO
+# ------------------------------------------------------------
+# _WORKER_ATIVO é uma variável de memória, e memória NÃO é
+# compartilhada entre processos. Se o gunicorn subir com mais
+# de um worker, cada um cria o seu loop e o grupo recebe a
+# mesma mensagem duas ou três vezes.
+#
+# A trava abaixo é do sistema de arquivos: só um processo
+# consegue segurá-la. Os outros seguem servindo HTTP normal,
+# sem worker. Se o dono morrer, o sistema solta a trava e
+# outro assume na próxima tentativa.
+#
+# CUIDADO COM O FORK: um arquivo aberto é HERDADO pelos
+# processos filhos. Sem conferir o PID, todo worker nascido de
+# um fork acharia que já tem a trava — porque vê o arquivo
+# aberto pelo pai — e voltaríamos à duplicata.
+
+ARQUIVO_TRAVA_WORKER = os.path.join(
+    DIRETORIO_APP,
+    "worker.lock",
+)
+
+_trava_worker_aberta = None
+_trava_worker_pid = None
+
+
+def sou_o_dono_do_worker():
+    """True só para o processo que conquistou a trava."""
+
+    global _trava_worker_aberta
+    global _trava_worker_pid
+
+    pid_atual = os.getpid()
+
+    if (
+        _trava_worker_aberta is not None
+        and _trava_worker_pid == pid_atual
+    ):
+        return True
+
+    # Herdada do pai pelo fork: não vale, descarta.
+    if _trava_worker_aberta is not None:
+        try:
+            _trava_worker_aberta.close()
+        except Exception:
+            pass
+        _trava_worker_aberta = None
+        _trava_worker_pid = None
+
+    try:
+
+        import fcntl
+
+        arquivo = open(ARQUIVO_TRAVA_WORKER, "w")
+
+        try:
+            fcntl.flock(arquivo, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            arquivo.close()
+            return False
+
+        arquivo.write(str(pid_atual))
+        arquivo.flush()
+
+        # Guardado de propósito para o arquivo NÃO fechar.
+        # Fechar solta a trava.
+        _trava_worker_aberta = arquivo
+        _trava_worker_pid = pid_atual
+
+        print("WORKER: este processo assumiu, pid", pid_atual)
+        return True
+
+    except Exception:
+
+        # Sem fcntl ou outro problema: não trava nada, para
+        # não deixar o serviço sem worker nenhum.
+        return True
+
 
 def _buscar_pendentes_worker():
     """Retorna sinais M1 ainda sem resultado e já fechados."""
@@ -3886,21 +3987,66 @@ def _loop_worker():
 
 
 def iniciar_worker_automatico():
-    """Inicia uma única thread automática por processo do app."""
+    """Sobe o worker — só no processo DONO, e só uma vez.
+
+    Também recupera a thread se ela tiver morrido: com
+    --preload as threads criadas antes da divisão em workers
+    morrem no fork, sem deixar erro nenhum no log.
+    """
+
+    vivas = {
+        t.name for t in threading.enumerate() if t.is_alive()
+    }
+
+    if "dw-academy-worker" in vivas:
+        return
+
+    with _WORKER_LOCK:
+
+        # Confere de novo dentro do lock: outra requisição
+        # pode ter subido a thread no meio do caminho.
+        vivas = {
+            t.name for t in threading.enumerate() if t.is_alive()
+        }
+
+        if "dw-academy-worker" in vivas:
+            return
+
+        if not sou_o_dono_do_worker():
+            return
+
+        try:
+            thread = threading.Thread(
+                target=_loop_worker,
+                name="dw-academy-worker",
+                daemon=True,
+            )
+            thread.start()
+            print("WORKER: iniciado, pid", os.getpid())
+        except Exception:
+            pass
+
+
+@app.before_request
+def _garantir_worker():
+    """Sobe o worker na primeira visita ao serviço.
+
+    POR QUE NÃO NO CARREGAMENTO DO MÓDULO:
+    com o gunicorn em --preload, o código de carregamento roda
+    no processo PAI, antes da divisão em workers. Duas coisas
+    dão errado ao mesmo tempo:
+
+      1. A thread morre no fork e o robô fica mudo;
+      2. O PAI fica segurando a trava para sempre, e nenhum
+         worker consegue assumir.
+
+    Aqui isto roda sempre dentro de um worker de verdade, a
+    trava é disputada de forma limpa e apenas um vence.
+    """
     try:
-        thread = threading.Thread(
-            target=_loop_worker,
-            name="dw-academy-worker",
-            daemon=True,
-        )
-        thread.start()
+        iniciar_worker_automatico()
     except Exception:
         pass
-
-
-# Inicia também quando o app é carregado pelo Gunicorn/Render.
-# Assim não depende de __main__ nem do navegador.
-iniciar_worker_automatico()
 
 
 # ============================================================
