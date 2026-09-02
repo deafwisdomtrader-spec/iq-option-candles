@@ -96,6 +96,37 @@ def montar_mensagem_sinal(par, analise):
         f"Estratégia: {ESTRATEGIA}"
     )
 
+
+def montar_linha_sinal_lote(par, analise):
+    """Versão compacta de um sinal, para entrar numa mensagem
+    que agrupa vários sinais da mesma rodada de busca.
+    """
+
+    sinal = analise.get("sinal")
+
+    emoji = "🟢" if sinal == "CALL" else "🔴"
+
+    return (
+        f"{emoji} <b>{sinal}</b> — {par} "
+        f"({analise.get('entrada', '--:--')}) "
+        f"conf. {analise.get('confianca')} "
+        f"({analise.get('qualidade_sinal')})"
+    )
+
+
+def montar_mensagem_lote(linhas):
+    """Junta várias linhas de sinal numa única mensagem, com
+    a estratégia mencionada uma vez só, no fim.
+
+    Evita mandar um Telegram por par quando várias pares dão
+    sinal na mesma rodada de /candles — em vez de 4 ou 5
+    mensagens seguidas, chega só uma com tudo junto.
+    """
+
+    corpo = "\n".join(linhas)
+
+    return f"{corpo}\n\n<i>Estratégia: {ESTRATEGIA}</i>"
+
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
@@ -3213,6 +3244,12 @@ def candles():
 
         resultados = []
 
+        # Acumula os sinais novos desta rodada pra mandar UMA
+        # única mensagem no Telegram no final, em vez de uma
+        # por par — evita a enxurrada de mensagens seguidas
+        # quando vários pares dão sinal na mesma busca.
+        sinais_novos_lote = []
+
         # ORÇAMENTO DE TEMPO
         #
         # O gunicorn mata o worker por volta dos 30 segundos.
@@ -3278,17 +3315,17 @@ def candles():
 
                 # Guarda o contexto do sinal para o histórico.
                 # Falhar aqui não pode derrubar a resposta.
-                # Só notifica o Telegram quando é linha NOVA,
-                # pra rotação repetida do mesmo par/candle não
-                # mandar o mesmo sinal várias vezes.
+                # Só entra no lote do Telegram quando é linha
+                # NOVA, pra rotação repetida do mesmo par/candle
+                # não mandar o mesmo sinal de novo.
                 try:
                     sinal_e_novo = registrar_sinal(par, analise)
                     if (
                         sinal_e_novo
                         and analise.get("sinal") in ("CALL", "PUT")
                     ):
-                        enviar_telegram(
-                            montar_mensagem_sinal(par, analise)
+                        sinais_novos_lote.append(
+                            montar_linha_sinal_lote(par, analise)
                         )
                 except Exception:
                     pass
@@ -3438,6 +3475,13 @@ def candles():
                         texto_erro,
 
                 })
+
+        # Manda UMA mensagem com todos os sinais novos desta
+        # rodada, em vez de uma por par.
+        if sinais_novos_lote:
+            enviar_telegram(
+                montar_mensagem_lote(sinais_novos_lote)
+            )
 
         return jsonify({
 
