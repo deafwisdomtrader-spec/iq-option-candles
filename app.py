@@ -129,32 +129,6 @@ _ultima_conexao = 0
 # CREDENCIAIS
 # ============================================================
 
-VERSAO_APP = "2026-09-02.1"
-
-VERSAO_NOTAS = (
-    "Telegram + correcoes de estabilidade: aquecimento sem "
-    "limite, cadeado com prazo, reciclagem de pool, CORS, "
-    "health sem travar"
-)
-
-
-@app.after_request
-def liberar_cors(resposta):
-    """Permite que o navegador leia esta API de qualquer página.
-
-    É seguro: a API é somente leitura de dados públicos de
-    mercado, sem login e sem dado pessoal. Sem estes
-    cabeçalhos, a página de diagnóstico acusava falha mesmo
-    com o servidor funcionando.
-    """
-
-    resposta.headers["Access-Control-Allow-Origin"] = "*"
-    resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    resposta.headers["Access-Control-Allow-Headers"] = "Content-Type"
-
-    return resposta
-
-
 def obter_credenciais():
 
     email = os.getenv("IQ_EMAIL")
@@ -196,25 +170,6 @@ def invalidar_conexao():
         _iq = None
 
 
-def invalidar_conexao():
-    """Marca a conexão atual como inutilizável.
-
-    NUNCA espera pelo cadeado: esta função é chamada justamente
-    quando uma conexão travou, e a thread travada ainda segura
-    o _lock. Esperar por ele congelaria o worker.
-    """
-
-    global _iq
-
-    pegou = _lock.acquire(blocking=False)
-
-    try:
-        _iq = None
-    finally:
-        if pegou:
-            _lock.release()
-
-
 def conectar():
 
     global _iq
@@ -222,19 +177,7 @@ def conectar():
 
     email, password = obter_credenciais()
 
-    # Cadeado COM PRAZO.
-    #
-    # A conexão de rede acontece dentro do cadeado. Se ela
-    # travar, todas as outras requisições ficavam presas na
-    # fila, enchiam o pool de threads e o worker morria.
-    if not _lock.acquire(timeout=20):
-
-        raise TimeoutError(
-            "Outra conexão com a corretora está em andamento "
-            "e não liberou em 20s."
-        )
-
-    try:
+    with _lock:
 
         # Tenta reutilizar a conexão existente
         if _iq is not None:
@@ -280,91 +223,6 @@ def conectar():
         )
 
         return _iq
-
-    finally:
-
-        # Libera sempre, mesmo se algo acima levantar exceção.
-        _lock.release()
-
-
-# ============================================================
-# AQUECIMENTO DA CONEXÃO
-# ============================================================
-#
-# Esta é a correção que fez o serviço voltar a conectar.
-#
-# O login na IQ Option, a partir do Render, pode levar mais de
-# 40 segundos. Se isso acontecer durante uma requisição, ela
-# estoura o tempo e devolve erro — mesmo estando tudo certo.
-#
-# Aqui a conexão é aberta assim que o processo sobe, numa
-# thread separada e SEM limite de tempo: ninguém está
-# esperando resposta. Quando a primeira requisição chegar, a
-# sessão já está pronta e é só reutilizada.
-#
-# Se falhar, tenta de novo sozinho, com intervalos crescentes.
-# ============================================================
-
-_aquecimento = {
-    "estado": "nao iniciado",
-    "tentativas": 0,
-    "erro": None,
-    "segundos": None,
-}
-
-
-def aquecer_conexao():
-
-    esperas = [0, 20, 60, 120, 300]
-
-    for numero, espera in enumerate(esperas, start=1):
-
-        if espera:
-            time.sleep(espera)
-
-        _aquecimento["tentativas"] = numero
-        _aquecimento["estado"] = "conectando"
-
-        inicio = time.time()
-
-        try:
-
-            conectar()
-
-            _aquecimento["estado"] = "conectado"
-            _aquecimento["erro"] = None
-            _aquecimento["segundos"] = round(
-                time.time() - inicio, 1
-            )
-
-            return
-
-        except Exception as erro:
-
-            _aquecimento["estado"] = "falhou"
-            _aquecimento["erro"] = str(erro)[:200]
-            _aquecimento["segundos"] = round(
-                time.time() - inicio, 1
-            )
-
-    _aquecimento["estado"] = "desistiu"
-
-
-def iniciar_aquecimento():
-
-    try:
-
-        threading.Thread(
-            target=aquecer_conexao,
-            name="aquecimento-iq",
-            daemon=True,
-        ).start()
-
-    except Exception:
-        pass
-
-
-iniciar_aquecimento()
 
 
 # ============================================================
@@ -491,78 +349,9 @@ def buscar_candles(
 # abandonadas, mas continuam ocupando uma vaga do pool. Com
 # apenas 3 vagas, três travamentos deixavam o serviço inteiro
 # sem conseguir buscar mais nada.
-MAX_WORKERS_POOL = 12
-
-# Quantas threads podem ficar penduradas antes de reciclar.
-LIMITE_THREADS_TRAVADAS = 6
-
 _executor_candles = concurrent.futures.ThreadPoolExecutor(
-    max_workers=MAX_WORKERS_POOL
+    max_workers=12
 )
-
-_threads_travadas = 0
-_pool_lock = threading.Lock()
-
-
-def registrar_thread_travada():
-    """Conta uma thread abandonada e recicla o pool se preciso.
-
-    Thread travada nunca morre: ela ocupa uma vaga para sempre.
-    Sem esta reciclagem, o pool enchia, toda busca ficava
-    esperando uma vaga que nunca aparecia, e o gunicorn matava
-    o worker (erro 502).
-    """
-
-    global _executor_candles
-    global _threads_travadas
-
-    with _pool_lock:
-
-        _threads_travadas += 1
-
-        if _threads_travadas < LIMITE_THREADS_TRAVADAS:
-            return False
-
-        antigo = _executor_candles
-
-        _executor_candles = concurrent.futures.ThreadPoolExecutor(
-            max_workers=MAX_WORKERS_POOL
-        )
-
-        _threads_travadas = 0
-
-    try:
-        antigo.shutdown(wait=False)
-    except Exception:
-        pass
-
-    invalidar_conexao()
-
-    return True
-
-
-def conectar_com_timeout(timeout_segundos=25):
-    """Conecta com limite de tempo, para uso nas rotas.
-
-    O aquecimento em segundo plano não usa esta função: lá a
-    conexão pode demorar o quanto precisar.
-    """
-
-    futuro = _executor_candles.submit(conectar)
-
-    try:
-
-        return futuro.result(timeout=timeout_segundos)
-
-    except concurrent.futures.TimeoutError:
-
-        invalidar_conexao()
-        registrar_thread_travada()
-
-        raise TimeoutError(
-            "Conexao com a corretora demorou mais de "
-            f"{timeout_segundos}s e foi abandonada."
-        )
 
 
 def buscar_candles_com_timeout(
@@ -586,8 +375,6 @@ def buscar_candles_com_timeout(
         )
 
     except concurrent.futures.TimeoutError:
-
-        registrar_thread_travada()
 
         raise TimeoutError(
             f"Busca de candles para {par} "
@@ -2877,7 +2664,7 @@ def telegram_processar_resultados():
         if not candidatos:
             return
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         for chave, pendente in candidatos:
             try:
@@ -3595,7 +3382,7 @@ def telegram_processar_sinais():
         return
 
     try:
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         # Rotação: cada ciclo analisa poucos pares da lista
         # completa (OTC + mercado aberto, conforme ligado).
@@ -3733,7 +3520,7 @@ def telegram_sinais_test():
                 ),
             }), 503
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         for par in pares_do_telegram():
             try:
@@ -4223,13 +4010,21 @@ def inicio():
 @app.get("/health")
 def health():
 
-    # Esta rota NÃO pode tocar na biblioteca da corretora.
-    #
-    # check_connect() pode ficar pendurada, igual get_candles.
-    # Quando isso acontecia, nem o /health respondia — e ficava
-    # impossível saber se o serviço estava vivo.
-    #
-    # Agora ela informa apenas o estado interno do processo.
+    conectado = False
+
+    cliente = _iq
+
+    if cliente is not None:
+
+        try:
+
+            conectado = bool(
+                cliente.check_connect()
+            )
+
+        except Exception:
+
+            conectado = False
 
     return jsonify({
 
@@ -4240,23 +4035,8 @@ def health():
 
         "versao": VERSAO,
 
-        "versao_app": VERSAO_APP,
-
-        "versao_notas": VERSAO_NOTAS,
-
-        # Se existe um objeto de conexão em memória. NÃO
-        # garante que a sessão esteja viva — para isso, use
-        # /candles.
-        "conexao_em_memoria":
-            _iq is not None,
-
-        # Como foi a conexão feita em segundo plano. É aqui
-        # que aparece o motivo real de uma falha de login.
-        "aquecimento":
-            _aquecimento,
-
-        "threads_travadas":
-            _threads_travadas,
+        "iq_conectada":
+            conectado,
 
         "telegram_configurado":
             telegram_configurado(),
@@ -4297,7 +4077,7 @@ def listar_ativos():
 
     try:
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         # get_all_open_time() pode ficar 30s parada dentro da
         # biblioteca esperando a lista de opções digitais. Isso
@@ -4446,7 +4226,7 @@ def resultado_sinal(par):
 
     try:
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         # Timeout curto: esta rota é chamada em segundo plano
         # e não pode competir com a busca dos cards, que é o
@@ -4584,7 +4364,7 @@ def candles_par(par):
 
     try:
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         candles = buscar_candles_com_timeout(
             iq,
@@ -4818,7 +4598,7 @@ def operar(par):
 
     try:
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         posicao = abrir_posicao(
             iq,
@@ -4892,7 +4672,7 @@ def candles():
 
     try:
 
-        iq = conectar_com_timeout()
+        iq = conectar()
 
         pares_param = request.args.get(
             "pares",
@@ -5166,7 +4946,7 @@ def candles():
                     invalidar_conexao()
 
                     try:
-                        iq = conectar_com_timeout()
+                        iq = conectar()
                     except Exception:
                         iq = None
 
