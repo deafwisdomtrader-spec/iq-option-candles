@@ -3116,13 +3116,38 @@ def resultado_sinal(par):
 
         iq = conectar_com_timeout()
 
+        # ----------------------------------------------------
+        # REMENDO 3 — SÓ AS VELAS NECESSÁRIAS
+        # ----------------------------------------------------
+        # Antes pedia sempre 100 velas (CANDLE_COUNT). Uma
+        # entrada de 3 minutos atrás precisa de umas 10 — as
+        # outras 90 eram tempo e banda jogados fora, disputando
+        # a MESMA conexão que os cards que o aluno está olhando
+        # na tela. Era uma das causas do painel travar em
+        # "BUSCANDO DADOS".
+        #
+        # Pendentes velhos (o worker às vezes pega um de meia
+        # hora atrás) continuam recebendo o suficiente para
+        # alcançar a vela, até o teto de 100.
+        #
+        # A folga de 8 cobre o G1 e o G2, que ficam depois da
+        # vela de entrada.
+        idade_velas = int(
+            (time.time() - inicio_candle) / TIMEFRAME
+        )
+
+        velas_necessarias = max(
+            20,
+            min(CANDLE_COUNT, idade_velas + 8)
+        )
+
         # Timeout curto: esta rota é chamada em segundo plano
         # e não pode competir com a busca dos cards, que é o
         # que o usuário está esperando na tela.
         candles = buscar_candles_com_timeout(
             iq,
             par,
-            CANDLE_COUNT,
+            velas_necessarias,
             timeout_segundos=8
         )
 
@@ -3721,6 +3746,11 @@ def operar(par):
 @app.get("/candles")
 def candles():
 
+    # REMENDO 2 (parte 1) — marca quando a requisição começou.
+    # É com isto que descobrimos quanto a CONEXÃO custou, para
+    # dar ao lote de pares todo o tempo que realmente sobra.
+    inicio_requisicao = time.time()
+
     try:
 
         iq = conectar_com_timeout()
@@ -3883,45 +3913,37 @@ def candles():
 
         resultados = []
 
-        # ORÇAMENTO DE TEMPO
+        # ------------------------------------------------
+        # REMENDO 2 (parte 2) — ORÇAMENTO QUE SOBRA DE VERDADE
+        # ------------------------------------------------
+        # O gunicorn mata o worker que passa do tempo limite,
+        # por volta dos 30 segundos. Por isso existe um teto.
         #
-        # O gunicorn mata o worker por volta dos 30 segundos.
-        # Com 5 pares a 15s cada, a soma podia chegar a 75s e
-        # a requisição inteira voltava como 502, derrubando
-        # todos os pares — inclusive os que já tinham
-        # respondido bem.
+        # Antes o orçamento era FIXO em 14s, calculado supondo
+        # que a conexão tinha gasto 8s. Só que a conexão é
+        # persistente: quase sempre ela já está aberta e gasta
+        # perto de zero. O orçamento continuava apertado sem
+        # motivo, e os últimos pares do grupo voltavam com
+        # status PULADO — card vazio na tela do aluno — com o
+        # relógio ainda sobrando.
         #
-        # Agora cada par tem 7s, e existe um teto total de 22s
-        # para a chamada inteira. Quando o teto estoura, os
-        # pares restantes voltam com status PULADO em vez de
-        # arriscar o 502.
+        # Agora medimos quanto a conexão realmente custou e
+        # damos o resto ao lote:
+        #
+        #   conexão já aberta (0s)  -> 22s para os 5 pares
+        #   conexão fria    (8s)    -> 14s, igual a antes
+        #
+        # O pior caso continua em 22s no total, com folga de
+        # 8s até o limite do gunicorn.
+        TETO_RESPOSTA = 22
 
-        # Orçamento apertado de propósito.
-        #
-        # A conexão já pode ter consumido até 12s antes de
-        # chegar aqui. Somando, o pior caso fica em torno de
-        # 30s — dentro do limite do Render, que devolve 504
-        # quando a resposta demora demais.
-        # ------------------------------------------------
-        # POR QUE ESTES NÚMEROS SÃO TÃO APERTADOS
-        # ------------------------------------------------
-        # O gunicorn mata o worker que passa do tempo limite.
-        # Antes a conta era:
-        #
-        #   conectar        até 12s
-        #   5 pares x 6s    até 18s
-        #   -----------------------
-        #   total           até 30s   <- o limite exato
-        #
-        # Resultado no log: WORKER TIMEOUT, SIGKILL, worker
-        # novo, e assim sem parar. O monitor do Telegram
-        # nascia junto com o worker e morria antes de mandar
-        # qualquer sinal — o grupo ficava mudo com o serviço
-        # "no ar".
-        #
-        # Agora: 8s de conexão + 14s de busca = 22s no pior
-        # caso, com folga de 8s até o limite.
-        ORCAMENTO_TOTAL = 14
+        gasto_conexao = time.time() - inicio_requisicao
+
+        ORCAMENTO_TOTAL = max(
+            6,
+            TETO_RESPOSTA - gasto_conexao
+        )
+
         TIMEOUT_POR_PAR = 5
 
         inicio_lote = time.time()
@@ -3936,10 +3958,17 @@ def candles():
                 resultados.append({
                     "par": par,
                     "timeframe": "M1",
-                    "candles": [],
                     "quantidade": 0,
                     "sinal": "AGUARDANDO",
                     "status": "PULADO",
+                    # REMENDO 4 — campos de horário sempre
+                    # presentes. Sem eles o painel criava um
+                    # pendente com horário nulo, que ficava
+                    # entalado na lista.
+                    "entrada_em": None,
+                    "expira_em": None,
+                    "entrada": "--:--",
+                    "hora": "--:--",
                     "erro": (
                         "Tempo da requisicao esgotado. "
                         "Este par entra na proxima atualizacao."
@@ -3996,8 +4025,18 @@ def candles():
                     "timeframe":
                         "M1",
 
-                    "candles":
-                        dados,
+                    # ------------------------------------
+                    # REMENDO 1 — AS 100 VELAS NÃO VÃO MAIS
+                    # ------------------------------------
+                    # Antes ia "candles": dados aqui, com as
+                    # 100 velas de CADA um dos 5 pares, a cada
+                    # 2 minutos. O sinais.js nunca leu esse
+                    # campo — eram cerca de 98% do tamanho do
+                    # JSON, puro peso no 4G do aluno.
+                    #
+                    # Para depurar uma vela específica use
+                    # /candles/<par>, que continua mandando
+                    # tudo.
 
                     "quantidade":
                         len(dados),
@@ -4117,9 +4156,6 @@ def candles():
                     "timeframe":
                         "M1",
 
-                    "candles":
-                        [],
-
                     "quantidade":
                         0,
 
@@ -4128,6 +4164,20 @@ def candles():
 
                     "status":
                         "ERRO",
+
+                    # REMENDO 4 — mesmos campos de horário do
+                    # PULADO, pelo mesmo motivo.
+                    "entrada_em":
+                        None,
+
+                    "expira_em":
+                        None,
+
+                    "entrada":
+                        "--:--",
+
+                    "hora":
+                        "--:--",
 
                     "erro":
                         texto_erro,
