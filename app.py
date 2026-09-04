@@ -4513,7 +4513,7 @@ def _garantir_worker():
          worker consegue assumir.
 
     Aqui isto roda sempre dentro de um worker de verdade, a
-    trava é disputada de forma limpa e apenas um vence. 
+    trava é disputada de forma limpa e apenas um vence.
     """
     try:
         iniciar_worker_automatico()
