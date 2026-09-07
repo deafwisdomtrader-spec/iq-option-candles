@@ -3457,11 +3457,15 @@ def candles_par(par):
             par=par
         )
 
+        # Mesma antecedência da rota de vários pares, para as
+        # duas nunca discordarem sobre qual é a vela de
+        # entrada. Ver o comentário longo lá.
+        analise_tg = adiantar_entrada(analise)
+
         try:
             # Adianta ANTES de gravar: é este horário que vai
             # para o banco, e é dele que o worker tira a vela
             # para conferir o resultado.
-            analise_tg = adiantar_entrada(analise)
             sinal_e_novo = registrar_sinal(par, analise_tg)
             if (
                 sinal_e_novo
@@ -3527,13 +3531,13 @@ def candles_par(par):
                 analise.get("hora"),
 
             "expira_em":
-                analise.get("expira_em"),
+                analise_tg.get("entrada_em"),
 
             "entrada":
-                analise.get("entrada"),
+                analise_tg.get("entrada"),
 
             "entrada_em":
-                analise.get("entrada_em"),
+                analise_tg.get("entrada_em"),
 
             "preco":
                 analise.get("preco"),
@@ -4019,13 +4023,42 @@ def candles():
                     par=par
                 )
 
+                # ------------------------------------------
+                # MESMA ENTRADA PARA O SITE E PARA O GRUPO
+                # ------------------------------------------
+                # Antes o adiantamento valia SÓ para o
+                # Telegram. O painel recebia a entrada crua,
+                # que abre no mesmo instante em que a vela
+                # analisada fecha.
+                #
+                # Na prática o card nascia mandando entrar num
+                # minuto que JÁ estava correndo, e o aluno via
+                # "⚠️ tarde — 13s" em vez de "ENTRAR AGORA".
+                # Não dava tempo de abrir a corretora e clicar.
+                #
+                # Havia um segundo problema, mais silencioso:
+                # o painel conferia o resultado numa vela e o
+                # banco gravava OUTRA, porque o Telegram usava
+                # a versão adiantada. Duas contagens para o
+                # mesmo sinal.
+                #
+                # Agora os dois usam a mesma vela de entrada.
+                #
+                # TROCA CONSCIENTE (a mesma do Telegram): a
+                # análise lê a vela que acabou de fechar, então
+                # empurrar a entrada deixa essa leitura um
+                # minuto mais velha. Sem tempo de aviso, porém,
+                # o sinal não serve para nada.
+                #
+                # Controlado por VELAS_ANTECEDENCIA no Render.
+                analise_tg = adiantar_entrada(analise)
+
                 # Guarda o contexto do sinal para o histórico.
                 # Falhar aqui não pode derrubar a resposta.
                 # Só notifica o Telegram quando é linha NOVA,
                 # pra rotação repetida do mesmo par/candle não
                 # mandar o mesmo sinal de novo.
                 try:
-                    analise_tg = adiantar_entrada(analise)
                     sinal_e_novo = registrar_sinal(par, analise_tg)
                     if (
                         sinal_e_novo
@@ -4078,14 +4111,19 @@ def candles():
                     "hora":
                         analise.get("hora"),
 
+                    # expira_em é, para o front, o instante em
+                    # que a vela de ENTRADA abre. Como a
+                    # entrada foi adiantada, ele acompanha.
+                    # Se os dois discordassem, o contador do
+                    # card cairia na vela errada.
                     "expira_em":
-                        analise.get("expira_em"),
+                        analise_tg.get("entrada_em"),
 
                     "entrada":
-                        analise.get("entrada"),
+                        analise_tg.get("entrada"),
 
                     "entrada_em":
-                        analise.get("entrada_em"),
+                        analise_tg.get("entrada_em"),
 
                     "rsi":
                         analise.get("rsi"),
