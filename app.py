@@ -4399,15 +4399,141 @@ def _processar_resultados_worker():
             pass
 
 
-def _processar_sinais_worker():
-    """Executa a mesma análise de pares usada pelo painel."""
+# ------------------------------------------------------------
+# MERCADO ABERTO NO TELEGRAM (segunda a sexta)
+# ------------------------------------------------------------
+# Antes o worker chamava SEMPRE "?mercado=otc". Era por isso
+# que o grupo só recebia sinal OTC: o mercado aberto nunca
+# chegava a ser analisado.
+#
+# Isso também deixava de fora os pares que NÃO têm versão OTC
+# na IQ Option — AUDUSD, USDCAD, AUDJPY, EURCAD, GBPAUD,
+# CADJPY e EURAUD só existem no Forex normal.
+#
+# ALTERNÂNCIA, NÃO SOMA
+#
+# Uma volta OTC, a volta seguinte Forex. Poderia ser os dois
+# na mesma volta, mas isso dobraria o tempo de conexão em cada
+# ciclo — e a conexão com a corretora é UMA só, dividida com o
+# painel do site. Alternando, o custo por volta continua igual
+# ao de hoje.
+#
+# O preço disso: cada mercado é olhado a cada 6 minutos em vez
+# de 3. Como o grupo já espera 3 minutos entre sinais e trava
+# durante a sequência de gale, na prática quase não se perde
+# entrada.
+
+_worker_proximo_mercado = "forex"
+
+# Quando o Forex volta todo fechado, não adianta insistir de 6
+# em 6 minutos. Descansa e volta a tentar depois.
+_forex_fechado_ate = 0
+
+FOREX_DESCANSO = 1800
+
+
+def _mercado_da_vez():
+    """Decide qual mercado o worker analisa nesta volta."""
+
+    global _worker_proximo_mercado
+
+    # Sábado (5) e domingo (6): o mercado aberto não existe.
+    # Só OTC, que roda 24 horas.
     try:
-        # OTC é o mercado contínuo usado para manter sinais
-        # disponíveis também quando o Forex está fechado.
-        with app.test_request_context("/candles?mercado=otc"):
-            candles()
+        dia = datetime.now(tz=FUSO_BR).weekday()
     except Exception:
-        pass
+        dia = 0
+
+    if dia >= 5:
+        return "otc"
+
+    # Dia útil, mas fora do horário de pregão (madrugada,
+    # sexta à noite): descobrimos isso na última tentativa.
+    if time.time() < _forex_fechado_ate:
+        return "otc"
+
+    if _worker_proximo_mercado == "forex":
+        _worker_proximo_mercado = "otc"
+        return "forex"
+
+    _worker_proximo_mercado = "forex"
+    return "otc"
+
+
+def _ler_json_resposta(resposta):
+    """Lê o JSON de uma resposta do Flask.
+
+    A rota pode devolver a resposta sozinha ou uma tupla
+    (resposta, código). Trata os dois casos.
+    """
+
+    if isinstance(resposta, tuple):
+        resposta = resposta[0]
+
+    try:
+        return resposta.get_json()
+    except Exception:
+        return None
+
+
+def _processar_sinais_worker():
+    """Executa a mesma análise de pares usada pelo painel.
+
+    Alterna entre OTC e mercado aberto, para o Telegram deixar
+    de ser só OTC.
+    """
+
+    mercado = _mercado_da_vez()
+
+    try:
+        with app.test_request_context(
+            "/candles?mercado=" + mercado
+        ):
+            resposta = candles()
+    except Exception:
+        return
+
+    if mercado != "forex":
+        return
+
+    # HORÁRIO DE PREGÃO SEM TABELA FIXA
+    #
+    # Em vez de chutar o horário de abertura e fechamento (que
+    # muda com o horário de verão dos Estados Unidos), a gente
+    # simplesmente OLHA a resposta: se todos os pares voltaram
+    # MERCADO FECHADO, o pregão não está aberto.
+    #
+    # Nesse caso o Forex descansa 30 minutos e o worker fica
+    # só no OTC — sem gastar conexão à toa.
+    global _forex_fechado_ate
+
+    dados = _ler_json_resposta(resposta)
+
+    if not dados:
+        return
+
+    resultados = dados.get("resultados") or []
+
+    if not resultados:
+        return
+
+    fechados = [
+        item for item in resultados
+        if str(item.get("status") or "").startswith(
+            "MERCADO FECHADO"
+        )
+    ]
+
+    if len(fechados) == len(resultados):
+
+        _forex_fechado_ate = time.time() + FOREX_DESCANSO
+
+        print(
+            "WORKER: mercado aberto fechado agora — "
+            "só OTC pelos próximos",
+            FOREX_DESCANSO // 60,
+            "min.",
+        )
 
 
 def _loop_worker():
