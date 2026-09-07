@@ -687,18 +687,43 @@ PARES_FOREX = [
 # IMPORTANTE: não existe versão -OTC para ações. Fora do
 # pregão elas retornam MERCADO FECHADO, o que é o correto.
 PARES_ACOES = [
+    # SÓ NOMES CONFIRMADOS.
+    #
+    # Estes três responderam ok:true em teste direto pela rota
+    # /candles/<nome>. Os outros nove que estavam aqui
+    # (AMAZON, GOOGLE, MICROSOFT, NETFLIX, INTEL, ALIBABA,
+    # COCA-COLA, MCDON, VISA) eram PALPITE — nunca foram
+    # testados.
+    #
+    # POR QUE ISSO DERRUBAVA O PAINEL INTEIRO
+    #
+    # Quando se pede um ativo que não existe com aquele nome,
+    # a biblioteca da IQ Option costuma TRAVAR em vez de dar
+    # erro. Cada par travado gasta todo o tempo do orçamento e
+    # abandona uma thread do pool.
+    #
+    # A rotação pega 5 pares por vez. Com 9 nomes duvidosos em
+    # 12, quase toda rodada pegava vários travados, a chamada
+    # estourava e o painel de ações mostrava "SERVIDOR
+    # ACORDANDO" para sempre.
+    #
+    # E como 6 threads travadas fazem o pool ser reciclado e a
+    # conexão ser invalidada, o painel de ações quebrado ainda
+    # atrapalhava o de Forex, que estava saudável.
+    #
+    # COMO ADICIONAR MAIS AÇÕES COM SEGURANÇA
+    #
+    #   1. Abra /ativos no navegador, com a bolsa aberta.
+    #   2. Copie os nomes EXATOS que aparecerem lá.
+    #   3. Acrescente aqui, poucos por vez.
+    #   4. Confira cada um em /candles/<nome> antes de
+    #      confiar. Se não voltar ok:true, tire da lista.
+    #
+    # Nunca adicione um nome sem testar: um só já basta para
+    # travar a rodada.
     "APPLE",
     "FACEBOOK",
     "TESLA",
-    "AMAZON",
-    "GOOGLE",
-    "MICROSOFT",
-    "NETFLIX",
-    "INTEL",
-    "ALIBABA",
-    "COCA-COLA",
-    "MCDON",
-    "VISA",
 ]
 
 
