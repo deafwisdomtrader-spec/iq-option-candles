@@ -3975,6 +3975,29 @@ def candles():
 
         TIMEOUT_POR_PAR = 5
 
+        # ------------------------------------------------
+        # VELAS SOB ENCOMENDA (?velas=N)
+        # ------------------------------------------------
+        # O painel de cards não usa as velas — por isso elas
+        # saíram da resposta, e o JSON ficou ~98% menor.
+        #
+        # Mas a página do gráfico (Sinal IA) DESENHA os candles:
+        # sem eles o quadro fica em "AGUARDANDO CANDLES REAIS"
+        # para sempre. Ela agora pede o que precisa com ?velas=N.
+        #
+        # Quem não pede continua recebendo a resposta leve. É
+        # esse o ponto: o peso só existe para quem usa.
+        #
+        # O teto de 100 é o mesmo CANDLE_COUNT da busca — pedir
+        # mais que isso não traria nada e só serviria para alguém
+        # de fora inflar a resposta.
+        try:
+            velas_pedidas = int(request.args.get("velas", 0))
+        except (TypeError, ValueError):
+            velas_pedidas = 0
+
+        velas_pedidas = max(0, min(CANDLE_COUNT, velas_pedidas))
+
         inicio_lote = time.time()
 
         for par in pares:
@@ -4086,15 +4109,20 @@ def candles():
                     # ------------------------------------
                     # REMENDO 1 — AS 100 VELAS NÃO VÃO MAIS
                     # ------------------------------------
-                    # Antes ia "candles": dados aqui, com as
+                    # Antes ia "candles": dados sempre, com as
                     # 100 velas de CADA um dos 5 pares, a cada
-                    # 2 minutos. O sinais.js nunca leu esse
-                    # campo — eram cerca de 98% do tamanho do
-                    # JSON, puro peso no 4G do aluno.
+                    # 2 minutos. O painel de cards nunca leu
+                    # esse campo — eram cerca de 98% do tamanho
+                    # do JSON, puro peso no 4G do aluno.
                     #
-                    # Para depurar uma vela específica use
-                    # /candles/<par>, que continua mandando
-                    # tudo.
+                    # Agora só vai para quem pedir, com
+                    # ?velas=N, e apenas as N últimas. É a
+                    # página do gráfico que usa isso.
+                    **(
+                        {"candles": dados[-velas_pedidas:]}
+                        if velas_pedidas
+                        else {}
+                    ),
 
                     "quantidade":
                         len(dados),
