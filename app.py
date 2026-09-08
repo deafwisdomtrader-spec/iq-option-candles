@@ -3996,13 +3996,38 @@ def candles():
 
             TAMANHO_GRUPO = 5
 
-            # ROTAÇÃO DOS PARES: 120 segundos (2 minutos).
-            # Isso é SEPARADO da busca de dados, que roda a
-            # cada 120s no front-end. Com os dois em 120s,
-            # cada grupo de pares recebe uma busca antes de
-            # dar lugar ao próximo.
+            # ------------------------------------------------------
+            # ROTAÇÃO DOS PARES: 180 segundos (3 minutos)
+            # ------------------------------------------------------
+            # Era 120s. O motivo da troca é a sequência de gale:
+            #
+            #   entrada  ->  60s
+            #   G1       ->  60s
+            #   G2       ->  60s
+            #                ----
+            #                180s
+            #
+            # Com 120s o grupo trocava ANTES de a sequência fechar.
+            # O par saía da tela no meio do G2 e o aluno ficava sem
+            # ver onde a recuperação terminou.
+            #
+            # 180 também é o mesmo intervalo do worker do Telegram
+            # (INTERVALO_WORKER) e da espera entre sinais no grupo.
+            # Com tudo no mesmo compasso, uma volta do robô equivale
+            # a uma operação inteira.
+            #
+            # IMPORTANTE: o front-end precisa buscar no mesmo ritmo.
+            # Se o site continuar pedindo de 120 em 120s, ele faz uma
+            # busca a mais por rodada e recebe o mesmo grupo duas
+            # vezes — não quebra, mas é pedido à toa no servidor.
+            #
+            # Isto NÃO substitui o ?fixos=: um sinal que nasce no fim
+            # da janela ainda pode perder o G2. O fixos é quem trava
+            # o par até a sequência acabar.
+            ROTACAO_SEG = 180
+
             indice_rotativo = int(
-                time.time() // 120
+                time.time() // ROTACAO_SEG
             ) % len(lista_base)
 
             pares = [
