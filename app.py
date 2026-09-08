@@ -852,6 +852,42 @@ def iniciar_db():
                 ON historico_sinais (par, sinal, forca, resultado)
             """)
 
+            # ------------------------------------------------------
+            # COLUNAS DO RESULTADO QUE O GRUPO VIU
+            # ------------------------------------------------------
+            # O SQLite não tem "ADD COLUMN IF NOT EXISTS": rodar de novo
+            # numa tabela que já tem a coluna dá erro. Por isso cada uma
+            # vai no seu próprio try — a segunda vez simplesmente falha
+            # em silêncio, que é o comportamento desejado.
+            for coluna, tipo in (
+                ("resultado_final", "TEXT"),
+                ("etapa_final", "INTEGER"),
+            ):
+                try:
+                    conexao.execute(
+                        "ALTER TABLE historico_sinais "
+                        f"ADD COLUMN {coluna} {tipo}"
+                    )
+                except Exception:
+                    pass
+
+            # ------------------------------------------------------
+            # RELATÓRIOS JÁ ENVIADOS
+            # ------------------------------------------------------
+            # Uma linha por relatório mandado, com a chave
+            # "AAAA-MM-DD|SESSÃO". O worker roda de 3 em 3 minutos e
+            # tentaria mandar o mesmo relatório a cada volta; o INSERT
+            # OR IGNORE só passa na primeira vez.
+            #
+            # Fica no banco, não na memória: assim um reinício do
+            # servidor não faz o grupo receber o relatório duas vezes.
+            conexao.execute("""
+                CREATE TABLE IF NOT EXISTS relatorios_enviados (
+                    chave      TEXT PRIMARY KEY,
+                    enviado_em INTEGER
+                )
+            """)
+
             conexao.commit()
             conexao.close()
 
@@ -1020,6 +1056,67 @@ def registrar_resultado_historico(par, entrada_em, sinal, resultado):
             conexao.close()
 
         return alterou
+
+    except Exception:
+
+        return False
+
+
+def registrar_final_historico(par, entrada_em, sinal, final, etapa):
+    """Guarda o resultado que o GRUPO viu, com o gale considerado.
+
+    POR QUE ISTO EXISTE
+    -------------------
+    A coluna 'resultado' guarda o m1: só a vela de entrada, sem gale.
+    É ela que alimenta o aprendizado, e está certo assim — um "WIN 2G"
+    nasceu de uma leitura errada, e contar como acerto ensinaria o
+    sistema a repetir o erro.
+
+    Mas o grupo não viu isso. O grupo viu "WIN 1G" e entendeu vitória.
+    Um relatório montado só com o m1 mostraria ❌ num sinal que o aluno
+    acompanhou como ganho — e ele reclamaria, com razão.
+
+    Então guardamos os dois. Cada um serve a uma pergunta diferente:
+      resultado       -> a estratégia acertou de primeira?
+      resultado_final -> a operação, com gale, terminou ganhando?
+
+    Função separada de propósito: assim o caminho que já funciona não
+    muda em nada.
+    """
+
+    if not _DB_PRONTO:
+        return False
+
+    if final not in ("WIN", "LOSS", "EMPATE"):
+        return False
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            conexao.execute(
+                """
+                UPDATE historico_sinais
+                   SET resultado_final = ?, etapa_final = ?
+                 WHERE par = ?
+                   AND entrada_em = ?
+                   AND sinal = ?
+                """,
+                (
+                    str(final),
+                    int(etapa or 0),
+                    str(par),
+                    int(entrada_em),
+                    str(sinal),
+                ),
+            )
+
+            conexao.commit()
+            conexao.close()
+
+        return True
 
     except Exception:
 
@@ -3386,6 +3483,20 @@ def resultado_sinal(par):
             # é consultada várias vezes pro mesmo sinal.
             if gravado:
 
+                # Guarda também o resultado que o GRUPO vai ver, com o
+                # gale já considerado. É ele que alimenta o relatório de
+                # sessão — sem isto, um "WIN 1G" apareceria lá como ❌.
+                try:
+                    registrar_final_historico(
+                        par,
+                        inicio_candle,
+                        sinal,
+                        resultado_final,
+                        etapa_final,
+                    )
+                except Exception:
+                    pass
+
                 try:
                     imagem, caption = montar_resultado_gale(
                         par,
@@ -4627,6 +4738,276 @@ def _processar_sinais_worker():
         )
 
 
+# ============================================================
+# RELATÓRIO DE SESSÃO (de 6 em 6 horas)
+# ============================================================
+#
+# Quatro sessões por dia, no horário do Brasil:
+#
+#   MADRUGADA  00:00 - 06:00
+#   MANHÃ      06:00 - 12:00
+#   TARDE      12:00 - 18:00
+#   NOITE      18:00 - 24:00
+#
+# Assim que uma sessão fecha, o grupo recebe a lista do que
+# aconteceu nela e o placar do período.
+#
+# QUAL RESULTADO ENTRA NA LISTA
+#
+# O que o grupo VIU: resultado_final, com o gale considerado.
+# Um WIN 1G aparece como ✅, porque foi assim que o aluno
+# acompanhou. Sinais gravados antes desta versão não têm esse
+# campo — nesses casos usamos o m1, que é o que existe.
+#
+# Isto NÃO é a taxa da estratégia. A estratégia é medida pelo
+# m1, em /historico. São duas perguntas diferentes, e o rodapé
+# do relatório diz isso em voz alta.
+#
+# Para desligar: RELATORIO_SESSAO=0 no Render.
+
+RELATORIO_SESSAO = os.getenv("RELATORIO_SESSAO", "1") != "0"
+
+# Telegram corta mensagem em 4096 caracteres. Com sessão cheia a
+# lista estoura, então mostramos as últimas e avisamos quantas
+# ficaram de fora.
+RELATORIO_MAX_LINHAS = 40
+
+NOMES_SESSAO = ["MADRUGADA", "MANHÃ", "TARDE", "NOITE"]
+
+
+def _sessao_recem_fechada(agora=None):
+    """Devolve (inicio, fim, nome, chave) da última sessão fechada.
+
+    Chamado a cada volta do worker. Como a chave inclui a data e o
+    nome, e ela é gravada no banco, o relatório sai uma vez só —
+    mesmo que o worker rode dezenas de vezes dentro da sessão, e
+    mesmo que o servidor reinicie no meio.
+    """
+
+    agora = agora or datetime.now(tz=FUSO_BR)
+
+    # Em qual sessão estamos agora (0 a 3).
+    atual = agora.hour // 6
+
+    # A que acabou de fechar é a anterior. Às 00:30 a fechada é a
+    # NOITE de ONTEM — por isso o recuo de um dia aqui.
+    indice = atual - 1
+    dia = agora.date()
+
+    if indice < 0:
+        indice = 3
+        dia = (agora - timedelta(days=1)).date()
+
+    inicio = datetime(
+        dia.year, dia.month, dia.day,
+        indice * 6, 0, 0, tzinfo=FUSO_BR,
+    )
+
+    fim = inicio + timedelta(hours=6)
+
+    nome = NOMES_SESSAO[indice]
+    chave = f"{dia.isoformat()}|{nome}"
+
+    return int(inicio.timestamp()), int(fim.timestamp()), nome, chave
+
+
+def _marcar_relatorio_enviado(chave):
+    """True só na PRIMEIRA vez que esta chave aparece.
+
+    É o INSERT OR IGNORE que garante o envio único: a segunda
+    tentativa não altera linha nenhuma e devolve False.
+    """
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            cursor = conexao.execute(
+                "INSERT OR IGNORE INTO relatorios_enviados "
+                "(chave, enviado_em) VALUES (?, ?)",
+                (str(chave), int(time.time())),
+            )
+
+            conexao.commit()
+            novo = cursor.rowcount > 0
+            conexao.close()
+
+        return novo
+
+    except Exception:
+
+        return False
+
+
+def _buscar_operacoes_da_sessao(inicio, fim):
+    """Sinais com resultado dentro da janela, em ordem de horário."""
+
+    if not _DB_PRONTO:
+        return []
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            linhas = conexao.execute(
+                """
+                SELECT par, entrada_em, sinal, resultado,
+                       resultado_final, etapa_final
+                  FROM historico_sinais
+                 WHERE entrada_em >= ?
+                   AND entrada_em <  ?
+                   AND resultado IN ('WIN', 'LOSS')
+              ORDER BY entrada_em ASC
+                """,
+                (int(inicio), int(fim)),
+            ).fetchall()
+
+            conexao.close()
+
+        return [dict(linha) for linha in linhas]
+
+    except Exception:
+
+        return []
+
+
+def montar_relatorio_sessao(operacoes, nome, inicio, fim):
+    """Texto do relatório. Devolve None quando não há o que contar."""
+
+    if not operacoes:
+        return None
+
+    linhas = []
+    wins = 0
+    losses = 0
+
+    for op in operacoes:
+
+        # O que o grupo viu. Sinal antigo não tem o campo: cai no m1.
+        final = op.get("resultado_final") or op.get("resultado")
+
+        # Empate não é vitória nem derrota: fica fora da conta, mas
+        # aparece na lista para o aluno reconhecer a operação dele.
+        if final == "WIN":
+            marca = "✅"
+            wins += 1
+        elif final == "EMPATE":
+            marca = "➖"
+        else:
+            marca = "❌"
+            losses += 1
+
+        etapa = op.get("etapa_final") or 0
+
+        selo = ""
+        if final == "WIN" and etapa:
+            selo = f" G{etapa}"
+
+        hora = datetime.fromtimestamp(
+            int(op["entrada_em"]), tz=FUSO_BR
+        ).strftime("%H:%M")
+
+        linhas.append(
+            f"{hora}  {op['par']}  {marca}{selo}"
+        )
+
+    total = wins + losses
+
+    if total == 0:
+        return None
+
+    taxa = (wins / total) * 100
+
+    cortadas = 0
+    if len(linhas) > RELATORIO_MAX_LINHAS:
+        cortadas = len(linhas) - RELATORIO_MAX_LINHAS
+        linhas = linhas[-RELATORIO_MAX_LINHAS:]
+
+    dia = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%d/%m/%Y")
+    h1 = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%H:%M")
+    h2 = datetime.fromtimestamp(fim, tz=FUSO_BR).strftime("%H:%M")
+
+    cabecalho = (
+        f"📊 <b>Relatório da Sessão {nome}</b>\n"
+        f"{dia} · {h1} às {h2}\n"
+        "────────────\n"
+    )
+
+    if cortadas:
+        cabecalho += (
+            f"<i>(mostrando as {RELATORIO_MAX_LINHAS} últimas de "
+            f"{total + cortadas})</i>\n"
+        )
+
+    corpo = "\n".join(linhas)
+
+    # A linha do empate é a diferença entre lucro e prejuízo com
+    # pagamento de 86%. Sem ela, uma taxa de 50% pareceria neutra
+    # quando na verdade é perda.
+    veredito = (
+        "acima do ponto de empate"
+        if taxa >= 53.8
+        else "ABAIXO do ponto de empate"
+    )
+
+    rodape = (
+        "\n────────────\n"
+        f"✅ Wins: {wins}\n"
+        f"❌ Losses: {losses}\n"
+        f"🎯 Taxa: {taxa:.1f}% — {veredito}\n"
+        f"📈 Total de operações: {total}\n"
+        "\n<i>Conta o resultado com gale, do jeito que saiu aqui no "
+        "grupo. Empate não entra na conta. Com pagamento de 86%, "
+        "53,8% é só o empate.</i>"
+    )
+
+    return cabecalho + corpo + rodape
+
+
+def enviar_relatorio_sessao():
+    """Manda o relatório da sessão que acabou de fechar."""
+
+    if not RELATORIO_SESSAO:
+        return
+
+    try:
+        inicio, fim, nome, chave = _sessao_recem_fechada()
+    except Exception:
+        return
+
+    operacoes = _buscar_operacoes_da_sessao(inicio, fim)
+
+    texto = montar_relatorio_sessao(operacoes, nome, inicio, fim)
+
+    # Sessão sem nenhuma operação fechada não gera mensagem. Melhor o
+    # silêncio do que encher o grupo de relatório vazio de madrugada.
+    #
+    # A chave também NÃO é marcada nesse caso: se algum resultado
+    # ainda estiver para ser conferido, a próxima volta do worker
+    # pega e manda.
+    if not texto:
+        return
+
+    # Marca ANTES de enviar. Se marcasse depois, uma falha do Telegram
+    # no meio do caminho faria a próxima volta tentar de novo — e o
+    # grupo poderia receber o mesmo relatório duas vezes.
+    if not _marcar_relatorio_enviado(chave):
+        return
+
+    try:
+        _executor_telegram.submit(_enviar_telegram_texto_sync, texto)
+        print("RELATÓRIO: sessão", nome, "enviada ao grupo.")
+    except Exception:
+        pass
+
+
 def _loop_worker():
     """Loop único: primeiro fecha resultados, depois procura sinais."""
     global _WORKER_ATIVO
@@ -4640,6 +5021,20 @@ def _loop_worker():
         try:
             _processar_resultados_worker()
             _processar_sinais_worker()
+        except Exception:
+            pass
+
+        # O relatório é tentado a cada volta, mas só sai UMA vez por
+        # sessão — quem garante isso é a chave gravada no banco.
+        #
+        # Tentar sempre é de propósito: se o servidor estiver fora do
+        # ar às 18:00, o relatório da TARDE sai assim que ele voltar,
+        # em vez de se perder.
+        #
+        # Fica fora do try acima para que uma falha na busca de sinais
+        # não impeça o relatório de ser enviado.
+        try:
+            enviar_relatorio_sessao()
         except Exception:
             pass
 
