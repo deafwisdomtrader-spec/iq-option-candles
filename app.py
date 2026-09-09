@@ -3020,11 +3020,38 @@ def listar_ativos():
         #
         # Rodando numa thread com timeout curto, se travar a
         # gente abandona a thread e responde normalmente.
-        futuro = _executor_candles.submit(
-            iq.get_all_open_time
-        )
+        # A biblioteca leva cerca de 30s nesta chamada
+        # (ERROR: get_digital_underlying_list_data late 30 sec),
+        # e o gunicorn mata o worker se a resposta demorar demais.
+        #
+        # Em vez de jogar a busca fora quando estoura o tempo, a
+        # gente GUARDA a thread. Ela continua rodando sozinha; na
+        # proxima chamada o resultado ja esta pronto e sai na hora.
+        global _ativos_futuro
 
-        todos = futuro.result(timeout=25)
+        if _ativos_futuro is None or _ativos_futuro.done():
+            if _ativos_futuro is not None and _ativos_futuro.done():
+                try:
+                    todos = _ativos_futuro.result(timeout=1)
+                    _ativos_futuro = None
+                    raise _AtivosProntos(todos)
+                except _AtivosProntos:
+                    raise
+                except Exception:
+                    pass
+            _ativos_futuro = _executor_candles.submit(
+                iq.get_all_open_time
+            )
+
+        futuro = _ativos_futuro
+
+        todos = futuro.result(timeout=ATIVOS_TIMEOUT)
+
+        _ativos_futuro = None
+
+    except _AtivosProntos as pronto:
+
+        todos = pronto.dados
 
     except concurrent.futures.TimeoutError:
 
@@ -3032,8 +3059,10 @@ def listar_ativos():
             "ok": False,
             "etapa": "listagem",
             "erro": (
-                "A corretora demorou mais de 12s para "
-                "devolver a lista de ativos. Tente de novo."
+                f"A corretora demorou mais de {ATIVOS_TIMEOUT}s. "
+                "A busca continua rodando aqui — espere uns 20 "
+                "segundos e abra esta pagina de novo, que a lista "
+                "sai na hora."
             ),
         }), 200
 
@@ -4721,6 +4750,25 @@ def _processar_resultados_worker():
 # durante a sequência de gale, na prática quase não se perde
 # entrada.
 
+# ---- Busca da lista de ativos ----
+#
+# A corretora leva ~30s para devolver a lista de opcoes digitais.
+# Guardamos a thread entre uma chamada e outra para nao jogar o
+# trabalho fora quando o tempo estoura.
+
+ATIVOS_TIMEOUT = 25
+
+_ativos_futuro = None
+
+
+class _AtivosProntos(Exception):
+    """A lista ja estava pronta de uma chamada anterior."""
+
+    def __init__(self, dados):
+        super().__init__("lista pronta")
+        self.dados = dados
+
+
 _worker_proximo_mercado = "forex"
 
 # Quando o Forex volta todo fechado, não adianta insistir de 6
@@ -4730,19 +4778,51 @@ _forex_fechado_ate = 0
 FOREX_DESCANSO = 1800
 
 
+def _forex_no_horario():
+    """O Forex aberto costuma estar funcionando agora?
+
+    Horario informado pelo produtor (horario de Brasilia):
+
+        segunda a quinta -> aberto ate as 18h,
+                            fecha, e volta as 22h
+        sexta            -> aberto ate as 18h e nao volta
+        sabado           -> fechado o dia todo
+        domingo          -> volta a partir das 22h
+
+    Antes o codigo so conhecia sabado e domingo. Nos outros
+    dias ele insistia no Forex de madrugada e no comeco da
+    noite, gastava conexao a toa e so descobria que estava
+    fechado depois de tentar.
+    """
+
+    try:
+        agora = datetime.now(tz=FUSO_BR)
+    except Exception:
+        return True
+
+    dia = agora.weekday()   # 0 = segunda ... 6 = domingo
+    hora = agora.hour
+
+    if dia == 5:            # sabado
+        return False
+
+    if dia == 6:            # domingo: so a noite
+        return hora >= 22
+
+    if dia == 4:            # sexta: fecha as 18h e nao volta
+        return hora < 18
+
+    # segunda a quinta
+    return hora < 18 or hora >= 22
+
+
 def _mercado_da_vez():
     """Decide qual mercado o worker analisa nesta volta."""
 
     global _worker_proximo_mercado
 
-    # Sábado (5) e domingo (6): o mercado aberto não existe.
-    # Só OTC, que roda 24 horas.
-    try:
-        dia = datetime.now(tz=FUSO_BR).weekday()
-    except Exception:
-        dia = 0
-
-    if dia >= 5:
+    # Fora do horario de pregao existe só OTC, que roda 24h.
+    if not _forex_no_horario():
         return "otc"
 
     # Dia útil, mas fora do horário de pregão (madrugada,
