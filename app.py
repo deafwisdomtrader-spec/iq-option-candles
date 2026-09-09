@@ -257,7 +257,7 @@ def montar_caption_sinal(par, analise):
 # descartados; se ainda forem bons, aparecem na próxima volta.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "180")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "0")
 )
 
 _ultima_entrada_enviada = 0
@@ -862,6 +862,7 @@ def iniciar_db():
             for coluna, tipo in (
                 ("resultado_final", "TEXT"),
                 ("etapa_final", "INTEGER"),
+                ("avisado_tg", "INTEGER"),
             ):
                 try:
                     conexao.execute(
@@ -1120,6 +1121,59 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
 
     except Exception:
 
+        return False
+
+
+def marcar_avisado_telegram(par, entrada_em, sinal):
+    """Marca que a ENTRADA deste sinal foi anunciada no grupo.
+
+    So um sinal marcado aqui pode ter o resultado anunciado depois.
+    Sem isso, o grupo recebia WIN/LOSS de entradas que nunca viu:
+    a trava deixa uma operacao por vez, mas TODOS os sinais eram
+    gravados no banco e conferidos pelo worker.
+    """
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            conexao.execute(
+                """
+                UPDATE historico_sinais
+                   SET avisado_tg = 1
+                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                """,
+                (str(par), int(entrada_em), str(sinal)),
+            )
+            conexao.commit()
+            conexao.close()
+        return True
+    except Exception:
+        return False
+
+
+def foi_avisado_telegram(par, entrada_em, sinal):
+    """True so se a ENTRADA deste sinal foi ao grupo."""
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linha = conexao.execute(
+                """
+                SELECT avisado_tg FROM historico_sinais
+                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                 LIMIT 1
+                """,
+                (str(par), int(entrada_em), str(sinal)),
+            ).fetchone()
+            conexao.close()
+        return bool(linha and linha["avisado_tg"])
+    except Exception:
         return False
 
 
@@ -2970,7 +3024,7 @@ def listar_ativos():
             iq.get_all_open_time
         )
 
-        todos = futuro.result(timeout=12)
+        todos = futuro.result(timeout=25)
 
     except concurrent.futures.TimeoutError:
 
@@ -3497,17 +3551,24 @@ def resultado_sinal(par):
                 except Exception:
                     pass
 
-                try:
-                    imagem, caption = montar_resultado_gale(
-                        par,
-                        sinal,
-                        inicio_candle,
-                        resultado_final,
-                        etapa_final,
-                    )
-                    enviar_telegram_foto(imagem, caption)
-                except Exception:
-                    pass
+                # SO MANDA O RESULTADO SE A ENTRADA FOI AO GRUPO.
+                #
+                # Antes o resultado saia sempre. Como a trava deixa
+                # uma operacao por vez, varios sinais ficavam so
+                # gravados no banco sem serem anunciados -- e o grupo
+                # recebia WIN/LOSS de entradas que nunca viu.
+                if foi_avisado_telegram(par, inicio_candle, sinal):
+                    try:
+                        imagem, caption = montar_resultado_gale(
+                            par,
+                            sinal,
+                            inicio_candle,
+                            resultado_final,
+                            etapa_final,
+                        )
+                        enviar_telegram_foto(imagem, caption)
+                    except Exception:
+                        pass
 
                 try:
                     encerrar_sequencia(par, inicio_candle)
@@ -3589,6 +3650,11 @@ def candles_par(par):
                 enviar_telegram_foto(
                     escolher_imagem_sinal(analise_tg.get("sinal")),
                     montar_caption_sinal(par, analise_tg),
+                )
+                marcar_avisado_telegram(
+                    par,
+                    analise_tg.get("entrada_em"),
+                    analise_tg.get("sinal"),
                 )
         except Exception:
             pass
@@ -4230,6 +4296,11 @@ def candles():
                         enviar_telegram_foto(
                             escolher_imagem_sinal(analise_tg.get("sinal")),
                             montar_caption_sinal(par, analise_tg),
+                        )
+                        marcar_avisado_telegram(
+                            par,
+                            analise_tg.get("entrada_em"),
+                            analise_tg.get("sinal"),
                         )
                 except Exception:
                     pass
