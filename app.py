@@ -122,7 +122,7 @@ def _enviar_telegram_sticker_sync(caminho_imagem):
                 url,
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"sticker": arquivo_imagem},
-                timeout=15,
+                timeout=8,
             )
 
         return resposta.ok
@@ -156,7 +156,7 @@ def _enviar_telegram_photo_sync(caminho_imagem):
                 url,
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"photo": arquivo_imagem},
-                timeout=15,
+                timeout=8,
             )
 
         return resposta.ok
@@ -186,19 +186,52 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption):
     _enviar_telegram_texto_sync(caption)
 
 
+# Quantos cartoes podem estar esperando na fila.
+#
+# A fila tem uma vaga so, de proposito, para o icone e o texto
+# nao chegarem trocados. O problema e quando o Telegram demora:
+# os cartoes se empilham e o grupo recebe tudo junto, minutos
+# depois, fora de hora.
+#
+# Com teto, cartao velho demais e descartado em vez de sair
+# atrasado. Melhor nao mandar do que mandar uma entrada que ja
+# passou da hora.
+_FILA_TELEGRAM_MAXIMA = 4
+
+_fila_telegram = 0
+_lock_fila_telegram = threading.Lock()
+
+
 def enviar_telegram_foto(caminho_imagem, caption):
     """Dispara o envio (sticker + cartão) em segundo plano,
     sem travar a rota.
     """
 
+    global _fila_telegram
+
+    with _lock_fila_telegram:
+        if _fila_telegram >= _FILA_TELEGRAM_MAXIMA:
+            print(
+                "TELEGRAM: fila cheia (",
+                _fila_telegram,
+                ") — cartao descartado para nao chegar atrasado.",
+            )
+            return
+        _fila_telegram += 1
+
+    def _tarefa():
+        global _fila_telegram
+        try:
+            _enviar_cartao_telegram_sync(caminho_imagem, caption)
+        finally:
+            with _lock_fila_telegram:
+                _fila_telegram -= 1
+
     try:
-        _executor_telegram.submit(
-            _enviar_cartao_telegram_sync,
-            caminho_imagem,
-            caption,
-        )
+        _executor_telegram.submit(_tarefa)
     except Exception:
-        pass
+        with _lock_fila_telegram:
+            _fila_telegram -= 1
 
 
 def _mercado_do_par(par):
@@ -279,8 +312,17 @@ _lock_espera_entrada = threading.Lock()
 # não chegar (mercado fechou, conexão caiu), a trava solta
 # sozinha em vez de deixar o grupo mudo para sempre.
 
+# 600s eram 10 minutos de grupo mudo quando algo dava errado.
+#
+# A operacao inteira leva no maximo 4 minutos: vela de entrada,
+# G1, G2, mais folga para conferir. Passou de 5 minutos, o
+# resultado nao vem mais mesmo — nao adianta segurar o grupo.
+#
+# Com 300s o aluno espera metade do tempo no pior caso, e o
+# caminho normal (entrada, resultado, proxima) nao muda em nada.
+
 SEQUENCIA_TEMPO_MAXIMO = int(
-    os.getenv("SEQUENCIA_TEMPO_MAXIMO", "600")
+    os.getenv("SEQUENCIA_TEMPO_MAXIMO", "300")
 )
 
 _sequencia_aberta = None
@@ -1124,6 +1166,32 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
         return False
 
 
+# ------------------------------------------------------------
+# QUEM JA FOI ANUNCIADO NO GRUPO
+# ------------------------------------------------------------
+# O banco continua guardando (serve depois de reiniciar), mas
+# esta lista na memoria e a fonte principal.
+#
+# Por que: o resultado so vai ao grupo se a entrada foi
+# anunciada. Quando a gravacao no banco falhava por qualquer
+# motivo, a marca nao existia e o resultado NUNCA saia — o
+# aluno via entrada atras de entrada, sem nenhum resultado, e
+# a trava so soltava por tempo, 10 minutos depois.
+#
+# Com a lista na memoria isso nao acontece mais: mesmo sem
+# banco, dentro da mesma execucao o robo sabe o que anunciou.
+
+_AVISADOS_TG = set()
+_AVISADOS_TG_LIMITE = 500
+
+
+def _chave_aviso(par, entrada_em, sinal):
+    try:
+        return (str(par).upper(), int(entrada_em), str(sinal).upper())
+    except Exception:
+        return None
+
+
 def marcar_avisado_telegram(par, entrada_em, sinal):
     """Marca que a ENTRADA deste sinal foi anunciada no grupo.
 
@@ -1133,8 +1201,18 @@ def marcar_avisado_telegram(par, entrada_em, sinal):
     gravados no banco e conferidos pelo worker.
     """
 
+    chave = _chave_aviso(par, entrada_em, sinal)
+
+    if chave is not None:
+        _AVISADOS_TG.add(chave)
+
+        # Nao deixa a lista crescer sem fim numa execucao longa
+        if len(_AVISADOS_TG) > _AVISADOS_TG_LIMITE:
+            for velha in list(_AVISADOS_TG)[:100]:
+                _AVISADOS_TG.discard(velha)
+
     if not _DB_PRONTO:
-        return False
+        return True
 
     try:
         with _db_lock:
@@ -1149,13 +1227,19 @@ def marcar_avisado_telegram(par, entrada_em, sinal):
             )
             conexao.commit()
             conexao.close()
-        return True
     except Exception:
-        return False
+        pass
+
+    return True
 
 
 def foi_avisado_telegram(par, entrada_em, sinal):
     """True so se a ENTRADA deste sinal foi ao grupo."""
+
+    chave = _chave_aviso(par, entrada_em, sinal)
+
+    if chave is not None and chave in _AVISADOS_TG:
+        return True
 
     if not _DB_PRONTO:
         return False
