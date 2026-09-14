@@ -1,4 +1,4 @@
-import os  
+import os 
 import time
 import json
 import sqlite3
@@ -928,6 +928,20 @@ def iniciar_db():
                 CREATE TABLE IF NOT EXISTS relatorios_enviados (
                     chave      TEXT PRIMARY KEY,
                     enviado_em INTEGER
+                )
+            """)
+
+            # ------------------------------------------------------
+            # CONTROLE DA LIMPEZA DIÁRIA
+            # ------------------------------------------------------
+            # Mesma ideia da tabela acima: uma linha por dia já
+            # limpo. O worker roda de 3 em 3 minutos e tentaria
+            # limpar a cada volta; o INSERT OR IGNORE deixa passar
+            # só a primeira do dia.
+            conexao.execute("""
+                CREATE TABLE IF NOT EXISTS manutencao_feita (
+                    chave     TEXT PRIMARY KEY,
+                    feita_em  INTEGER
                 )
             """)
 
@@ -5268,6 +5282,162 @@ def enviar_relatorio_sessao():
         pass
 
 
+# ============================================================
+# LIMPEZA DIÁRIA DO BANCO
+# ============================================================
+#
+# Roda uma vez por dia, sozinha. Faz três coisas:
+#
+# 1. APAGA PENDENTES MORTOS
+#    Sinal com resultado em branco que já passou da hora de ser
+#    conferido. A vela dele saiu do histórico da corretora, então
+#    ele nunca mais fecha.
+#
+#    Isso não é só sujeira: o worker busca os pendentes com
+#    "ORDER BY entrada_em ASC LIMIT 20", ou seja, os MAIS ANTIGOS
+#    primeiro. Vinte mortos na frente da fila e nenhum sinal novo
+#    chega a ser conferido. A limpeza destrava isso.
+#
+# 2. APAGA HISTÓRICO VELHO
+#    O aprendizado usa as últimas 200 operações de cada combinação
+#    (JANELA_HISTORICO). Guardar mais de 90 dias não muda decisão
+#    nenhuma — só ocupa disco.
+#
+# 3. DEVOLVE O ESPAÇO (VACUUM)
+#    O SQLite não encolhe o arquivo sozinho depois de apagar. Sem
+#    o VACUUM o disco continua ocupado pelo que já foi excluído.
+#
+# Para desligar: LIMPEZA_DIARIA=0 no Render.
+
+LIMPEZA_DIARIA = os.getenv("LIMPEZA_DIARIA", "1") != "0"
+
+# Dias de histórico guardados. Abaixo de 30 o aprendizado começa a
+# perder amostra; por isso o piso.
+LIMPEZA_DIAS_HISTORICO = max(
+    30,
+    int(os.getenv("LIMPEZA_DIAS_HISTORICO", "90"))
+)
+
+# Depois de quantas horas um pendente é dado como perdido.
+#
+# Seis horas é bem além de qualquer chance: a conferência busca no
+# máximo 100 velas de 1 minuto, ou seja, alcança cerca de 100
+# minutos para trás. Passando disso, a vela não existe mais para
+# consultar.
+LIMPEZA_HORAS_PENDENTE = max(
+    2,
+    int(os.getenv("LIMPEZA_HORAS_PENDENTE", "6"))
+)
+
+
+def _marcar_manutencao(chave):
+    """True só na primeira vez do dia."""
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            cursor = conexao.execute(
+                "INSERT OR IGNORE INTO manutencao_feita "
+                "(chave, feita_em) VALUES (?, ?)",
+                (str(chave), int(time.time())),
+            )
+            conexao.commit()
+            novo = cursor.rowcount > 0
+            conexao.close()
+        return novo
+    except Exception:
+        return False
+
+
+def limpar_banco():
+    """Limpeza diária. Nunca levanta exceção."""
+
+    if not LIMPEZA_DIARIA or not _DB_PRONTO:
+        return
+
+    try:
+        hoje = datetime.now(tz=FUSO_BR).date().isoformat()
+    except Exception:
+        return
+
+    if not _marcar_manutencao("limpeza|" + hoje):
+        return
+
+    agora = int(time.time())
+    corte_pendente = agora - (LIMPEZA_HORAS_PENDENTE * 3600)
+    corte_historico = agora - (LIMPEZA_DIAS_HISTORICO * 86400)
+
+    pendentes = 0
+    antigos = 0
+    relatorios = 0
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+
+            # 1) Pendentes que nunca vão fechar.
+            cur = conexao.execute(
+                """
+                DELETE FROM historico_sinais
+                 WHERE resultado IS NULL
+                   AND entrada_em < ?
+                """,
+                (corte_pendente,),
+            )
+            pendentes = cur.rowcount
+
+            # 2) Histórico além da janela guardada.
+            cur = conexao.execute(
+                "DELETE FROM historico_sinais WHERE entrada_em < ?",
+                (corte_historico,),
+            )
+            antigos = cur.rowcount
+
+            # 3) Controle de relatórios antigos. Serve só para não
+            #    repetir envio; passado um mês, não tem utilidade.
+            cur = conexao.execute(
+                "DELETE FROM relatorios_enviados WHERE enviado_em < ?",
+                (agora - (60 * 86400),),
+            )
+            relatorios = cur.rowcount
+
+            # 4) Marcas de limpeza de meses atrás.
+            conexao.execute(
+                "DELETE FROM manutencao_feita WHERE feita_em < ?",
+                (agora - (60 * 86400),),
+            )
+
+            conexao.commit()
+            conexao.close()
+
+    except Exception as erro:
+        print("LIMPEZA: falhou —", str(erro)[:120])
+        return
+
+    # O VACUUM vai FORA da transação: o SQLite recusa rodar ele
+    # dentro de uma, e num banco grande pode demorar alguns
+    # segundos. Por isso também fica no seu próprio try — falhar
+    # aqui não desfaz nada do que já foi apagado.
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            conexao.isolation_level = None
+            conexao.execute("VACUUM")
+            conexao.close()
+    except Exception:
+        pass
+
+    print(
+        "LIMPEZA:", hoje,
+        "— pendentes mortos:", pendentes,
+        "| histórico velho:", antigos,
+        "| relatórios:", relatorios,
+    )
+
+
 def _loop_worker():
     """Loop único: primeiro fecha resultados, depois procura sinais."""
     global _WORKER_ATIVO
@@ -5295,6 +5465,16 @@ def _loop_worker():
         # não impeça o relatório de ser enviado.
         try:
             enviar_relatorio_sessao()
+        except Exception:
+            pass
+
+        # Limpeza do banco. Tentada a cada volta, acontece uma vez
+        # por dia — a marca no banco é quem segura.
+        #
+        # Depois do relatório de propósito: se um dia der ruim, o
+        # grupo já recebeu a mensagem antes de qualquer exclusão.
+        try:
+            limpar_banco()
         except Exception:
             pass
 
