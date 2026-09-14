@@ -1692,6 +1692,21 @@ def buscar_candles(
 
 MAX_WORKERS_POOL = 12
 
+# Tempo máximo para conectar à corretora.
+#
+# A primeira conexão é lenta (login + handshake + lista de ativos)
+# e passa de 8s com facilidade. Com o limite antigo o serviço
+# nunca chegava a conectar: devolvia timeout em toda tentativa.
+#
+# As chamadas seguintes reaproveitam a sessão guardada e voltam a
+# ser instantâneas — o custo dos 20s é de uma vez só.
+#
+# Teto de 25: o gunicorn mata o worker por volta dos 30 segundos.
+CONEXAO_TIMEOUT = max(
+    5,
+    min(25, int(os.getenv("CONEXAO_TIMEOUT", "20")))
+)
+
 # Quantas threads podem ficar penduradas antes de reciclar.
 LIMITE_THREADS_TRAVADAS = 6
 
@@ -1736,7 +1751,7 @@ def registrar_thread_travada():
 
     return True
 
-def conectar_com_timeout(timeout_segundos=8):
+def conectar_com_timeout(timeout_segundos=None):
     """Conecta com limite de tempo.
 
     conectar() pode ficar pendurada dentro da biblioteca da
@@ -1747,7 +1762,30 @@ def conectar_com_timeout(timeout_segundos=8):
 
     Se estourar, a conexão é invalidada para a próxima
     tentativa começar do zero.
+
+    ----------------------------------------------------------
+    POR QUE O LIMITE SUBIU DE 8 PARA 20 SEGUNDOS
+    ----------------------------------------------------------
+    A PRIMEIRA conexão do dia é lenta: a biblioteca faz login,
+    handshake e carrega a lista de ativos da corretora. Isso
+    passa de 8 segundos com facilidade, e o serviço devolvia
+    "Conexao com a corretora demorou mais de 8s" para sempre —
+    nunca chegava a conectar.
+
+    Uma vez conectado, a sessão fica guardada e as chamadas
+    seguintes reaproveitam: aí voltam a ser instantâneas. Ou
+    seja, os 20s custam caro uma vez só.
+
+    Vinte e não mais porque o gunicorn mata o worker por volta
+    dos 30. Com 20 aqui e o orçamento de candles medindo o que
+    sobra (TETO_RESPOSTA), a soma continua cabendo.
+
+    Dá pra regular sem mexer no código: CONEXAO_TIMEOUT no
+    Render.
     """
+
+    if timeout_segundos is None:
+        timeout_segundos = CONEXAO_TIMEOUT
 
     futuro = _executor_candles.submit(conectar)
 
@@ -4354,7 +4392,20 @@ def candles():
         #
         # O pior caso continua em 22s no total, com folga de
         # 8s até o limite do gunicorn.
-        TETO_RESPOSTA = 22
+        # Teto do tempo TOTAL da resposta: conexão + busca dos pares.
+        #
+        # Era 22. Subiu para 26 porque a conexão pode agora levar até
+        # 20s na primeira vez (CONEXAO_TIMEOUT). Com 22, sobrariam 2s
+        # para os 5 pares — caía no mínimo de 6 e a resposta estouraria
+        # os 26 mesmo assim, sem ninguém ter medido isso.
+        #
+        # Com 26 a conta fecha honesta:
+        #   conexão fria (20s) + mínimo dos pares (6s) = 26s
+        #   conexão já aberta (~0s) + pares (26s)      = 26s
+        #
+        # O gunicorn mata por volta dos 30, então sobram 4s de folga
+        # nos dois casos.
+        TETO_RESPOSTA = 26
 
         gasto_conexao = time.time() - inicio_requisicao
 
@@ -5510,6 +5561,25 @@ def _loop_worker():
 
     while True:
         try:
+            # ------------------------------------------------------
+            # CONEXÃO ANTES DE QUALQUER ALUNO PEDIR
+            # ------------------------------------------------------
+            # A primeira conexão é a lenta. Se ela acontecer só quando
+            # um aluno abre o painel, é ELE quem espera os 20 segundos
+            # — e muitas vezes leva o erro de tempo esgotado.
+            #
+            # O worker sobe junto com o servidor, então fazemos a
+            # primeira conexão aqui, antes de qualquer visita. Quando o
+            # aluno chegar, a sessão já está pronta e a resposta é
+            # imediata.
+            #
+            # Falhar aqui não é problema: a rota tenta de novo por
+            # conta própria.
+            try:
+                conectar_com_timeout()
+            except Exception:
+                pass
+
             _processar_resultados_worker()
             _processar_sinais_worker()
         except Exception:
