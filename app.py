@@ -1432,12 +1432,48 @@ def invalidar_conexao():
 
     Chamando isto após uma falha de busca, a próxima chamada é
     obrigada a abrir uma conexão nova.
+
+    ------------------------------------------------------------
+    POR QUE NÃO ESPERA PELO CADEADO
+    ------------------------------------------------------------
+    Antes era "with _lock:", que espera o tempo que for preciso.
+    Isso derrubava o servidor inteiro, assim:
+
+      1. conectar_com_timeout() estoura os 8s e abandona a thread
+      2. a thread abandonada NÃO morre — fica pendurada dentro da
+         biblioteca da corretora, ainda segurando o _lock
+      3. chamamos invalidar_conexao() pra limpar a sessão
+      4. ela para no "with _lock:" esperando um cadeado que nunca
+         vai ser solto
+      5. o gunicorn espera 30s, não recebe resposta, e mata o
+         worker com SIGKILL
+      6. nasce outro worker e tudo se repete
+
+    O resultado era Internal Server Error e o serviço caindo em
+    loop.
+
+    Agora tentamos pegar o cadeado por 2 segundos. Se estiver
+    preso, seguimos sem ele: a atribuição de None é uma operação
+    única em Python, então fazê-la sem o cadeado não corrompe
+    nada. O pior caso é uma conexão nova criada à toa — muito
+    melhor que o servidor morrer.
     """
 
     global _iq
 
-    with _lock:
+    pegou = _lock.acquire(timeout=2)
+
+    try:
         _iq = None
+    finally:
+        if pegou:
+            _lock.release()
+
+    if not pegou:
+        print(
+            "CONEXAO: cadeado preso por uma thread travada — "
+            "sessao invalidada mesmo assim."
+        )
 
 
 def conectar():
@@ -1447,7 +1483,25 @@ def conectar():
 
     email, password = obter_credenciais()
 
-    with _lock:
+    # ----------------------------------------------------------
+    # NÃO EMPILHAR TENTATIVAS DE CONEXÃO
+    # ----------------------------------------------------------
+    # O cadeado fica preso durante TODA a conexão, que pode levar
+    # bem mais que os 8s do nosso limite. Com "with _lock:", cada
+    # nova chamada ficava parada na fila — e como cada uma ocupa
+    # uma vaga do pool de threads, as vagas acabavam e o serviço
+    # parava de responder.
+    #
+    # Esperando no máximo 10s: se outra conexão já está em
+    # andamento, desistimos desta. Melhor um erro claro agora do
+    # que uma fila que entope o servidor.
+    if not _lock.acquire(timeout=10):
+        raise RuntimeError(
+            "Já existe uma conexão em andamento com a corretora. "
+            "Tente de novo em alguns segundos."
+        )
+
+    try:
 
         # Tenta reutilizar a conexão existente
         if _iq is not None:
@@ -1493,6 +1547,13 @@ def conectar():
         )
 
         return _iq
+
+    finally:
+        # SEMPRE solta o cadeado, inclusive quando a conexão falha
+        # ou levanta erro no meio. Sem este finally, um erro dentro
+        # do bloco deixaria o cadeado preso para sempre e nenhuma
+        # conexão nova seria possível até o servidor reiniciar.
+        _lock.release()
 
 
 # ============================================================
