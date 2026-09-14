@@ -783,6 +783,83 @@ _iq = None
 _lock = threading.Lock()
 _ultima_conexao = 0
 
+# ------------------------------------------------------------
+# CADEADO QUE PODE SER ABANDONADO
+# ------------------------------------------------------------
+# A biblioteca da corretora às vezes TRAVA por dentro e a thread
+# nunca termina. Com um cadeado comum, ela leva o cadeado junto:
+# não solta nunca, e nenhuma conexão nova é possível até o
+# servidor reiniciar. No log isso aparecia assim, repetindo sem
+# parar:
+#
+#   CONEXAO: cadeado preso por uma thread travada
+#   "GET /candles?mercado=forex" 503
+#
+# O "finally" não resolve esse caso — ele só roda quando a função
+# termina, e ela não termina.
+#
+# Guardando QUANDO o cadeado foi pego, dá para reconhecer a
+# situação: se passou muito mais tempo que qualquer conexão
+# honesta levaria, a thread está morta para todos os efeitos.
+# Aí abandonamos o cadeado e criamos outro.
+#
+# A thread velha continua pendurada em algum lugar da memória,
+# mas não atrapalha mais ninguém. O pool também é reciclado, que
+# é o mesmo tratamento que já existia para threads abandonadas.
+_lock_pego_em = 0
+_lock_troca = threading.Lock()
+
+# Depois disso, o cadeado é dado como perdido.
+# Conexão honesta cabe em CONEXAO_TIMEOUT; o dobro mais folga é
+# tempo de sobra para não abandonar um cadeado ainda em uso.
+CADEADO_PERDIDO_SEG = 60
+
+
+def _cadeado_travado():
+    """True quando o cadeado está preso há tempo demais."""
+    if _lock_pego_em <= 0:
+        return False
+    return (time.time() - _lock_pego_em) > CADEADO_PERDIDO_SEG
+
+
+def _abandonar_cadeado():
+    """Joga fora o cadeado preso e põe um novo no lugar.
+
+    A troca acontece dentro de _lock_troca para dois pedidos
+    simultâneos não criarem dois cadeados diferentes — o que
+    deixaria duas conexões rodando ao mesmo tempo.
+    """
+
+    global _lock, _lock_pego_em, _executor_candles
+
+    with _lock_troca:
+
+        # Outro pedido pode ter trocado enquanto esperávamos aqui.
+        if not _cadeado_travado():
+            return False
+
+        _lock = threading.Lock()
+        _lock_pego_em = 0
+
+    # A thread travada segue segurando o cadeado velho, e ocupa
+    # uma vaga do pool para sempre. Reciclar o pool devolve as
+    # vagas — mesmo tratamento que registrar_thread_travada já dá.
+    try:
+        antigo = _executor_candles
+        _executor_candles = concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_WORKERS_POOL
+        )
+        antigo.shutdown(wait=False)
+    except Exception:
+        pass
+
+    print(
+        "CONEXAO: cadeado abandonado apos",
+        CADEADO_PERDIDO_SEG,
+        "s travado. Conexao liberada."
+    )
+    return True
+
 
 # ============================================================
 # BANCO DE HISTÓRICO (SQLite)
@@ -1463,16 +1540,25 @@ def invalidar_conexao():
 
     pegou = _lock.acquire(timeout=2)
 
+    # Preso há tempo demais: a thread dona travou. Troca o cadeado
+    # pra o serviço voltar a funcionar em vez de ficar devolvendo
+    # 503 até alguém reiniciar o servidor.
+    if not pegou and _cadeado_travado():
+        _abandonar_cadeado()
+        pegou = _lock.acquire(timeout=2)
+
     try:
         _iq = None
     finally:
         if pegou:
-            _lock.release()
+            try:
+                _lock.release()
+            except RuntimeError:
+                pass
 
     if not pegou:
         print(
-            "CONEXAO: cadeado preso por uma thread travada — "
-            "sessao invalidada mesmo assim."
+            "CONEXAO: cadeado ocupado — sessao invalidada mesmo assim."
         )
 
 
@@ -1484,22 +1570,36 @@ def conectar():
     email, password = obter_credenciais()
 
     # ----------------------------------------------------------
-    # NÃO EMPILHAR TENTATIVAS DE CONEXÃO
+    # PEGAR O CADEADO, OU RECONHECER QUE ELE ESTÁ PERDIDO
     # ----------------------------------------------------------
-    # O cadeado fica preso durante TODA a conexão, que pode levar
-    # bem mais que os 8s do nosso limite. Com "with _lock:", cada
-    # nova chamada ficava parada na fila — e como cada uma ocupa
-    # uma vaga do pool de threads, as vagas acabavam e o serviço
-    # parava de responder.
+    # Espera 10s. Se não conseguir, olha HÁ QUANTO TEMPO ele está
+    # preso: passando de CADEADO_PERDIDO_SEG, a thread que o segura
+    # travou dentro da biblioteca e nunca vai soltar. Aí trocamos o
+    # cadeado por um novo e tentamos de novo.
     #
-    # Esperando no máximo 10s: se outra conexão já está em
-    # andamento, desistimos desta. Melhor um erro claro agora do
-    # que uma fila que entope o servidor.
-    if not _lock.acquire(timeout=10):
+    # Sem isso, uma única thread travada deixava o serviço inteiro
+    # devolvendo 503 até o servidor reiniciar.
+    global _lock, _lock_pego_em
+
+    pegou = _lock.acquire(timeout=10)
+
+    if not pegou and _cadeado_travado():
+        _abandonar_cadeado()
+        pegou = _lock.acquire(timeout=10)
+
+    if not pegou:
         raise RuntimeError(
             "Já existe uma conexão em andamento com a corretora. "
             "Tente de novo em alguns segundos."
         )
+
+    _lock_pego_em = time.time()
+
+    # Guardado agora, porque _lock pode ser trocado por outro
+    # pedido enquanto esta conexão roda. Soltar o cadeado NOVO
+    # enquanto seguramos o VELHO liberaria dois donos ao mesmo
+    # tempo.
+    meu_cadeado = _lock
 
     try:
 
@@ -1549,11 +1649,20 @@ def conectar():
         return _iq
 
     finally:
-        # SEMPRE solta o cadeado, inclusive quando a conexão falha
-        # ou levanta erro no meio. Sem este finally, um erro dentro
-        # do bloco deixaria o cadeado preso para sempre e nenhuma
-        # conexão nova seria possível até o servidor reiniciar.
-        _lock.release()
+        # Solta o cadeado que ESTE pedido pegou — não o global, que
+        # pode ter sido trocado no meio do caminho por outro pedido
+        # que deu este aqui como perdido.
+        #
+        # A marca de tempo só é zerada se ninguém trocou o cadeado:
+        # se trocou, a marca já pertence a outra conexão.
+        _lock_pego_em_meu = meu_cadeado is _lock
+        try:
+            meu_cadeado.release()
+        except RuntimeError:
+            # Já solto (cadeado abandonado): nada a fazer.
+            pass
+        if _lock_pego_em_meu:
+            _lock_pego_em = 0
 
 
 # ============================================================
