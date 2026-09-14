@@ -1,4 +1,5 @@
-import os  
+import os
+import sys 
 import time
 import json
 import sqlite3
@@ -813,6 +814,63 @@ _lock_troca = threading.Lock()
 # Conexão honesta cabe em CONEXAO_TIMEOUT; o dobro mais folga é
 # tempo de sobra para não abandonar um cadeado ainda em uso.
 CADEADO_PERDIDO_SEG = 60
+
+# ------------------------------------------------------------
+# FREIO DEPOIS DE FALHAS SEGUIDAS
+# ------------------------------------------------------------
+# Quando a corretora para de aceitar conexão, CADA tentativa
+# deixa uma thread pendurada — a biblioteca trava por dentro e
+# nunca devolve. O worker tenta de 3 em 3 minutos e cada visita
+# ao painel tenta de novo. Em pouco tempo são dezenas de threads
+# mortas e uma enxurrada de tentativas na corretora.
+#
+# Isso pode piorar a situação: corretora costuma bloquear
+# temporariamente quem insiste demais. Ou seja, o remédio vira
+# parte da doença.
+#
+# Depois de algumas falhas seguidas, paramos de tentar por uns
+# minutos. O serviço responde com um erro claro em vez de travar,
+# e a corretora tem tempo de liberar.
+#
+# Um único sucesso zera a contagem.
+FALHAS_ATE_FREIO = int(os.getenv("FALHAS_ATE_FREIO", "3"))
+FREIO_SEGUNDOS = int(os.getenv("FREIO_SEGUNDOS", "300"))
+
+_falhas_seguidas = 0
+_freio_ate = 0
+
+
+def _registrar_falha_conexao():
+    """Conta a falha e liga o freio quando passa do limite."""
+
+    global _falhas_seguidas, _freio_ate
+
+    _falhas_seguidas += 1
+
+    if _falhas_seguidas >= FALHAS_ATE_FREIO and _freio_ate <= time.time():
+        _freio_ate = time.time() + FREIO_SEGUNDOS
+        print(
+            "CONEXAO:", _falhas_seguidas,
+            "falhas seguidas — parando de tentar por",
+            FREIO_SEGUNDOS // 60, "min."
+        )
+
+
+def _registrar_sucesso_conexao():
+    """Um sucesso apaga o histórico de falhas."""
+
+    global _falhas_seguidas, _freio_ate
+
+    if _falhas_seguidas:
+        print("CONEXAO: voltou a funcionar.")
+
+    _falhas_seguidas = 0
+    _freio_ate = 0
+
+
+def _no_freio():
+    """True enquanto estamos descansando das falhas."""
+    return time.time() < _freio_ate
 
 
 def _cadeado_travado():
@@ -1896,14 +1954,36 @@ def conectar_com_timeout(timeout_segundos=None):
     if timeout_segundos is None:
         timeout_segundos = CONEXAO_TIMEOUT
 
+    # No freio: nem tenta. Cada tentativa nesse estado só deixaria
+    # mais uma thread pendurada e mais um pedido na corretora.
+    if _no_freio():
+        falta = int(_freio_ate - time.time())
+        raise RuntimeError(
+            "A corretora recusou várias conexões seguidas. "
+            f"Nova tentativa em {falta}s."
+        )
+
+    # Cadeado travado por uma thread morta? Limpa ANTES de tentar.
+    #
+    # Sem isto, a primeira tentativa depois do descanso gastava os
+    # 10s de espera pelo cadeado e sobrava pouco tempo para a
+    # conexão em si — então falhava mesmo com a corretora já
+    # funcionando, e o freio ligava de novo. Ficava preso num
+    # ciclo que nunca se recuperava.
+    if _cadeado_travado():
+        _abandonar_cadeado()
+
     futuro = _executor_candles.submit(conectar)
 
     try:
 
-        return futuro.result(timeout=timeout_segundos)
+        resultado = futuro.result(timeout=timeout_segundos)
+        _registrar_sucesso_conexao()
+        return resultado
 
     except concurrent.futures.TimeoutError:
 
+        _registrar_falha_conexao()
         invalidar_conexao()
         registrar_thread_travada()
 
@@ -1911,6 +1991,13 @@ def conectar_com_timeout(timeout_segundos=None):
             "Conexao com a corretora demorou mais de "
             f"{timeout_segundos}s e foi abandonada."
         )
+
+    except Exception:
+
+        # Falha que não foi de tempo (credencial recusada, rede
+        # caída). Conta igual: o que importa é que não conectou.
+        _registrar_falha_conexao()
+        raise
 
 
 def buscar_candles_com_timeout(
@@ -3286,6 +3373,20 @@ def health():
 
         "iq_conectada":
             conectado,
+
+        # Quantas tentativas seguidas falharam. Zero = tudo bem.
+        "falhas_seguidas":
+            _falhas_seguidas,
+
+        # Segundos até voltar a tentar. Zero = não está no freio.
+        "descansando_seg":
+            max(0, int(_freio_ate - time.time())),
+
+        # Versão do Python. Serve pra conferir num relance se o
+        # .python-version pegou — foi uma troca automática do
+        # Render que já derrubou este serviço uma vez.
+        "python":
+            sys.version.split()[0],
 
         "timestamp":
             int(time.time()),
