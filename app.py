@@ -5915,6 +5915,690 @@ def _garantir_worker():
 
 
 # ============================================================
+# DIAGNÓSTICO — UMA PÁGINA COM O ESTADO DE TUDO
+# ============================================================
+#
+# COMO INSTALAR
+#
+#   1. Cole TODO este arquivo no FINAL do app.py, depois da
+#      rota /candles e antes do bloco "if __name__".
+#
+#   2. Faça as três edições pequenas descritas abaixo. Sem
+#      elas a página funciona, mas os campos "último erro" e
+#      "última volta do robô" ficam vazios.
+#
+#   3. Abra no navegador:
+#
+#        /diagnostico          -> só olha, não mexe em nada
+#        /diagnostico?testar=1 -> apaga o freio e tenta logar
+#                                 na IQ Option na hora
+#        /diagnostico?json=1   -> os mesmos dados em JSON
+#
+# ------------------------------------------------------------
+# EDIÇÃO 1 — guardar o motivo da falha
+# ------------------------------------------------------------
+# Hoje o motivo que a corretora dá é jogado fora. Troque a
+# primeira linha de _registrar_falha_conexao por estas quatro:
+#
+#   def _registrar_falha_conexao(motivo=None):
+#       """Conta a falha e liga o freio quando passa do limite."""
+#
+#       global _falhas_seguidas, _freio_ate
+#       global _ultimo_erro_conexao, _ultimo_erro_em
+#
+#       if motivo:
+#           _ultimo_erro_conexao = str(motivo)[:300]
+#           _ultimo_erro_em = int(time.time())
+#
+#       _falhas_seguidas += 1
+#       ...  (o resto continua igual)
+#
+# ------------------------------------------------------------
+# EDIÇÃO 2 — passar o motivo, em conectar_com_timeout
+# ------------------------------------------------------------
+# Dois lugares, os dois dentro de conectar_com_timeout:
+#
+#   except concurrent.futures.TimeoutError:
+#
+#       _registrar_falha_conexao(
+#           "Tempo esgotado: a corretora não respondeu em "
+#           + str(timeout_segundos) + "s."
+#       )
+#       invalidar_conexao()
+#       ...
+#
+#   except Exception as erro:          <- era "except Exception:"
+#
+#       _registrar_falha_conexao(str(erro))
+#       raise
+#
+# ------------------------------------------------------------
+# EDIÇÃO 3 — batida do coração do robô
+# ------------------------------------------------------------
+# Dentro de _loop_worker, logo depois do "while True:", uma
+# linha só:
+#
+#   while True:
+#       globals()["_worker_ultima_volta"] = int(time.time())
+#       try:
+#           ...
+#
+# Serve para saber se o robô está vivo. Ele deve dar uma volta
+# a cada 3 minutos; se a última foi há mais que isso, a thread
+# morreu.
+# ============================================================
+
+
+_APP_INICIADO_EM = int(time.time())
+
+# Preenchidos pelas edições 1 e 3. Ficam assim se você não as
+# fizer — a página avisa em vez de mentir.
+_ultimo_erro_conexao = None
+_ultimo_erro_em = 0
+_worker_ultima_volta = 0
+
+
+def _g(nome, padrao=None):
+    """Lê uma variável global sem quebrar se ela não existir.
+
+    A página de diagnóstico nunca pode ser a causa de um erro
+    novo. Se algum dia uma variável mudar de nome, o campo
+    aparece vazio e o resto continua funcionando.
+    """
+    return globals().get(nome, padrao)
+
+
+def _tempo_curto(segundos):
+    """Segundos viram '3 min 20 s', '2 h 5 min', '4 dias'."""
+
+    try:
+        segundos = int(segundos)
+    except (TypeError, ValueError):
+        return "--"
+
+    if segundos < 0:
+        return "--"
+
+    if segundos < 60:
+        return str(segundos) + " s"
+
+    if segundos < 3600:
+        return str(segundos // 60) + " min " + str(segundos % 60) + " s"
+
+    if segundos < 86400:
+        return str(segundos // 3600) + " h " + str((segundos % 3600) // 60) + " min"
+
+    return str(segundos // 86400) + " dias"
+
+
+def _hora_br(timestamp):
+    if not timestamp:
+        return "--"
+    try:
+        return datetime.fromtimestamp(
+            int(timestamp), tz=FUSO_BR
+        ).strftime("%d/%m %H:%M:%S")
+    except Exception:
+        return "--"
+
+
+def _email_mascarado():
+    """Mostra o começo do e-mail, o suficiente para conferir se
+    é a conta certa, sem expor a conta inteira numa página que
+    qualquer um pode abrir.
+    """
+
+    email = os.getenv("IQ_EMAIL") or ""
+
+    if not email:
+        return "não configurado"
+
+    if "@" in email:
+        nome, dominio = email.split("@", 1)
+        return nome[:2] + "***@" + dominio
+
+    return email[:2] + "***"
+
+
+def _bloco_servidor():
+
+    agora = int(time.time())
+
+    return {
+        "titulo": "Servidor no Render",
+        "estado": "ok",
+        "resumo": "No ar. Se esta página abriu, o Render está de pé.",
+        "linhas": [
+            ("No ar há", _tempo_curto(agora - _APP_INICIADO_EM)),
+            ("Processo (pid)", str(os.getpid())),
+            ("Python", sys.version.split()[0]),
+            ("Hora aqui no servidor", _hora_br(agora)),
+        ],
+        "acao": None,
+    }
+
+
+def _bloco_corretora():
+
+    iq = _g("_iq")
+
+    conectada = False
+
+    if iq is not None:
+        try:
+            conectada = bool(iq.check_connect())
+        except Exception:
+            conectada = False
+
+    falhas = _g("_falhas_seguidas", 0)
+    freio_ate = _g("_freio_ate", 0)
+    descansando = max(0, int(freio_ate - time.time()))
+
+    erro = _g("_ultimo_erro_conexao")
+    erro_em = _g("_ultimo_erro_em", 0)
+
+    lock_pego_em = _g("_lock_pego_em", 0)
+    travado_ha = (
+        int(time.time() - lock_pego_em) if lock_pego_em else 0
+    )
+
+    if conectada:
+        estado = "ok"
+        resumo = "Conectada. Os sinais podem nascer."
+        acao = None
+    elif descansando > 0:
+        estado = "espera"
+        resumo = (
+            "Parada de castigo. Falhou "
+            + str(falhas)
+            + " vezes seguidas e está esperando "
+            + _tempo_curto(descansando)
+            + " antes de tentar de novo."
+        )
+        acao = (
+            "Não espere: abra /diagnostico?testar=1 para apagar "
+            "o castigo e tentar logar agora."
+        )
+    else:
+        estado = "ruim"
+        resumo = "Sem conexão. Nenhum sinal sai enquanto isso."
+        acao = (
+            "Abra /diagnostico?testar=1 para ver o motivo exato "
+            "que a corretora responde."
+        )
+
+    linhas = [
+        ("Conectada agora", "sim" if conectada else "não"),
+        ("Falhas seguidas", str(falhas)),
+        (
+            "Castigo (freio)",
+            "solto" if descansando == 0 else _tempo_curto(descansando) + " restando",
+        ),
+        ("Conta usada", _email_mascarado()),
+        (
+            "Senha configurada",
+            "sim" if os.getenv("IQ_PASSWORD") else "NÃO — falta IQ_PASSWORD no Render",
+        ),
+        (
+            "Cadeado da conexão",
+            "livre" if travado_ha == 0 else "preso há " + _tempo_curto(travado_ha),
+        ),
+        ("Threads travadas", str(_g("_threads_travadas", 0))),
+    ]
+
+    if erro:
+        linhas.append(("Último erro", erro))
+        linhas.append(("Foi em", _hora_br(erro_em)))
+    else:
+        linhas.append(
+            (
+                "Último erro",
+                "nada guardado (faça a edição 1 do cabeçalho deste arquivo)",
+            )
+        )
+
+    return {
+        "titulo": "IQ Option",
+        "estado": estado,
+        "resumo": resumo,
+        "linhas": linhas,
+        "acao": acao,
+    }
+
+
+def _bloco_worker():
+
+    viva = any(
+        t.name == "dw-academy-worker" and t.is_alive()
+        for t in threading.enumerate()
+    )
+
+    ultima = _g("_worker_ultima_volta", 0)
+    parado_ha = int(time.time() - ultima) if ultima else 0
+
+    # O robô dá uma volta a cada 3 minutos. Seis minutos sem
+    # dar sinal de vida já é problema.
+    atrasado = ultima and parado_ha > 360
+
+    sequencia = _g("_sequencia_aberta")
+
+    if sequencia:
+        texto_sequencia = (
+            str(sequencia.get("par"))
+            + " · aberta há "
+            + _tempo_curto(time.time() - sequencia.get("criado_em", 0))
+        )
+    else:
+        texto_sequencia = "nenhuma"
+
+    forex_ate = _g("_forex_fechado_ate", 0)
+    forex_descanso = max(0, int(forex_ate - time.time()))
+
+    if not viva:
+        estado = "ruim"
+        resumo = (
+            "A thread do robô não está rodando. O Telegram fica "
+            "mudo assim, mesmo com a corretora funcionando."
+        )
+        acao = (
+            "Abra qualquer página do serviço para ele tentar "
+            "subir de novo. Se continuar morto, reinicie o "
+            "serviço no Render."
+        )
+    elif atrasado:
+        estado = "ruim"
+        resumo = (
+            "A thread existe, mas a última volta foi há "
+            + _tempo_curto(parado_ha)
+            + ". Ela deveria dar uma volta a cada 3 minutos."
+        )
+        acao = "Provavelmente está presa esperando a corretora."
+    else:
+        estado = "ok"
+        resumo = "Rodando. Ele é quem procura sinal e manda no grupo."
+        acao = None
+
+    return {
+        "titulo": "Robô automático",
+        "estado": estado,
+        "resumo": resumo,
+        "linhas": [
+            ("Thread viva", "sim" if viva else "não"),
+            (
+                "Última volta",
+                _tempo_curto(parado_ha) + " atrás" if ultima else "nunca registrada",
+            ),
+            ("Dono do worker (pid)", str(_g("_trava_worker_pid") or "--")),
+            ("Próximo mercado", str(_g("_worker_proximo_mercado", "--"))),
+            (
+                "Forex descansando",
+                "não" if forex_descanso == 0 else _tempo_curto(forex_descanso) + " restando",
+            ),
+            ("Operação em andamento", texto_sequencia),
+        ],
+        "acao": acao,
+    }
+
+
+def _bloco_telegram():
+
+    tem_token = bool(_g("TELEGRAM_BOT_TOKEN"))
+    tem_chat = bool(_g("TELEGRAM_CHAT_ID"))
+
+    imagens = _g("IMAGENS_TELEGRAM", {})
+
+    faltando = [
+        nome
+        for nome, caminho in imagens.items()
+        if not (caminho and os.path.isfile(caminho))
+    ]
+
+    if not tem_token or not tem_chat:
+        estado = "ruim"
+        resumo = "Falta configuração. Nada é enviado ao grupo."
+        acao = (
+            "No Render, em Environment, confira TELEGRAM_BOT_TOKEN "
+            "e TELEGRAM_CHAT_ID."
+        )
+    elif faltando:
+        estado = "espera"
+        resumo = (
+            "Configurado, mas "
+            + str(len(faltando))
+            + " imagem(ns) não estão no servidor. O texto vai, a "
+            "figura não."
+        )
+        acao = "Suba os arquivos que faltam na raiz do repositório."
+    else:
+        estado = "ok"
+        resumo = "Configurado e com todas as imagens no lugar."
+        acao = None
+
+    return {
+        "titulo": "Telegram",
+        "estado": estado,
+        "resumo": resumo,
+        "linhas": [
+            ("Token do bot", "configurado" if tem_token else "FALTANDO"),
+            ("Grupo (chat id)", "configurado" if tem_chat else "FALTANDO"),
+            ("Imagens faltando", ", ".join(faltando) if faltando else "nenhuma"),
+            ("Cartões na fila", str(_g("_fila_telegram", 0))),
+            (
+                "Espera entre entradas",
+                _tempo_curto(_g("TELEGRAM_ESPERA_ENTRE_ENTRADAS", 0)),
+            ),
+            (
+                "Antecedência do aviso",
+                str(_g("VELAS_ANTECEDENCIA", 0)) + " vela(s)",
+            ),
+        ],
+        "acao": acao,
+    }
+
+
+def _bloco_banco():
+
+    pronto = bool(_g("_DB_PRONTO"))
+
+    total = 0
+    pendentes = 0
+    wins = 0
+    losses = 0
+    ultimo_sinal = "--"
+    ultimo_resultado = "--"
+
+    if pronto:
+        try:
+            with _db_lock:
+                conexao = _conectar_db()
+
+                linha = conexao.execute(
+                    "SELECT COUNT(*) AS n FROM historico_sinais"
+                ).fetchone()
+                total = linha["n"] if linha else 0
+
+                linha = conexao.execute(
+                    "SELECT COUNT(*) AS n FROM historico_sinais "
+                    "WHERE resultado IS NULL"
+                ).fetchone()
+                pendentes = linha["n"] if linha else 0
+
+                corte = int(time.time()) - 86400
+
+                linha = conexao.execute(
+                    """
+                    SELECT
+                      SUM(resultado = 'WIN')  AS w,
+                      SUM(resultado = 'LOSS') AS l
+                      FROM historico_sinais
+                     WHERE entrada_em >= ?
+                    """,
+                    (corte,),
+                ).fetchone()
+
+                if linha:
+                    wins = linha["w"] or 0
+                    losses = linha["l"] or 0
+
+                linha = conexao.execute(
+                    "SELECT par, entrada_em, sinal FROM historico_sinais "
+                    "ORDER BY entrada_em DESC LIMIT 1"
+                ).fetchone()
+
+                if linha:
+                    ultimo_sinal = (
+                        str(linha["par"])
+                        + " "
+                        + str(linha["sinal"])
+                        + " · "
+                        + _hora_br(linha["entrada_em"])
+                    )
+
+                linha = conexao.execute(
+                    "SELECT par, resultado, resolvido_em FROM historico_sinais "
+                    "WHERE resultado IS NOT NULL "
+                    "ORDER BY resolvido_em DESC LIMIT 1"
+                ).fetchone()
+
+                if linha:
+                    ultimo_resultado = (
+                        str(linha["par"])
+                        + " "
+                        + str(linha["resultado"])
+                        + " · "
+                        + _hora_br(linha["resolvido_em"])
+                    )
+
+                conexao.close()
+
+        except Exception as erro:
+            ultimo_sinal = "erro ao ler: " + str(erro)[:80]
+
+    if not pronto:
+        estado = "ruim"
+        resumo = "Sem banco. O robô roda, mas não aprende nem confere resultado."
+        acao = "Disco somente leitura no Render? Confira HISTORICO_DB."
+    elif pendentes > 40:
+        estado = "espera"
+        resumo = (
+            str(pendentes)
+            + " sinais esperando resultado. Acima de 40 costuma ser "
+            "fila entupida com sinal morto."
+        )
+        acao = "A limpeza diária resolve sozinha. Se não resolver, me avise."
+    else:
+        estado = "ok"
+        resumo = "Gravando normalmente."
+        acao = None
+
+    return {
+        "titulo": "Banco de histórico",
+        "estado": estado,
+        "resumo": resumo,
+        "linhas": [
+            ("Arquivo", str(_g("CAMINHO_DB", "--"))),
+            ("Sinais guardados", str(total)),
+            ("Esperando resultado", str(pendentes)),
+            ("Últimas 24 h", str(wins) + " win · " + str(losses) + " loss"),
+            ("Último sinal gravado", ultimo_sinal),
+            ("Último resultado", ultimo_resultado),
+        ],
+        "acao": None if estado == "ok" else acao,
+    }
+
+
+def _bloco_teste():
+    """Apaga o castigo e tenta logar na corretora AGORA.
+
+    É o único bloco que mexe em alguma coisa, e só roda com
+    ?testar=1 na URL. Serve para não esperar meia hora depois
+    de corrigir a senha.
+    """
+
+    global _falhas_seguidas, _freio_ate
+
+    _falhas_seguidas = 0
+    _freio_ate = 0
+
+    invalidar_conexao()
+
+    inicio = time.time()
+
+    try:
+        conectar_com_timeout()
+        duracao = round(time.time() - inicio, 1)
+
+        return {
+            "titulo": "Teste de login",
+            "estado": "ok",
+            "resumo": "Entrou na IQ Option em " + str(duracao) + "s.",
+            "linhas": [
+                ("Castigo", "apagado"),
+                ("Resultado", "conexão aberta"),
+            ],
+            "acao": (
+                "Pronto. Espere uns 3 minutos e o primeiro sinal "
+                "deve aparecer no grupo."
+            ),
+        }
+
+    except Exception as erro:
+        duracao = round(time.time() - inicio, 1)
+
+        return {
+            "titulo": "Teste de login",
+            "estado": "ruim",
+            "resumo": "A corretora recusou, depois de " + str(duracao) + "s.",
+            "linhas": [
+                ("Castigo", "apagado antes de tentar"),
+                ("Tipo do erro", type(erro).__name__),
+                ("Resposta da corretora", str(erro)[:300]),
+            ],
+            "acao": (
+                "Copie a linha acima. É ela que diz se é senha "
+                "errada, código de verificação ou bloqueio."
+            ),
+        }
+
+
+_CSS = """
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px 16px 64px;
+  font: 17px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #15202b; background: #fbfbfa;
+}
+.wrap { max-width: 640px; margin: 0 auto; }
+h1 { font-size: 26px; margin: 0 0 4px; font-weight: 650; }
+.quando { color: #6b7883; margin: 0 0 28px; font-size: 15px; }
+.peca {
+  border-left: 5px solid #c8d0d6;
+  padding: 2px 0 2px 16px; margin: 0 0 26px;
+}
+.peca.ok     { border-left-color: #0f7b3f; }
+.peca.espera { border-left-color: #a8740a; }
+.peca.ruim   { border-left-color: #b3261e; }
+.peca h2 { font-size: 19px; margin: 0 0 2px; font-weight: 620; }
+.estado { font-weight: 640; font-size: 15px; }
+.ok     .estado { color: #0f7b3f; }
+.espera .estado { color: #a8740a; }
+.ruim   .estado { color: #b3261e; }
+.resumo { margin: 4px 0 12px; }
+table { width: 100%; border-collapse: collapse; }
+td { padding: 6px 0; vertical-align: top; border-top: 1px solid #ebe9e5; }
+td.rot { color: #6b7883; width: 42%; padding-right: 12px; font-size: 15px; }
+td.val { word-break: break-word; }
+.acao {
+  margin: 12px 0 0; padding: 10px 12px;
+  background: #f1f0ec; border-radius: 6px; font-size: 15px;
+}
+.botoes { margin: 0 0 32px; }
+a.botao {
+  display: inline-block; margin: 0 10px 10px 0; padding: 10px 16px;
+  background: #15202b; color: #fff; text-decoration: none;
+  border-radius: 6px; font-size: 15px;
+}
+a.botao.claro { background: #fff; color: #15202b; border: 1px solid #c8d0d6; }
+a.botao:focus-visible { outline: 3px solid #a8740a; outline-offset: 2px; }
+"""
+
+_PALAVRA_ESTADO = {
+    "ok": "funcionando",
+    "espera": "atenção",
+    "ruim": "parado",
+}
+
+
+@app.get("/diagnostico")
+def diagnostico():
+
+    import html as _html
+
+    testar = request.args.get("testar") == "1"
+
+    blocos = []
+
+    if testar:
+        blocos.append(_bloco_teste())
+
+    for montar in (
+        _bloco_servidor,
+        _bloco_corretora,
+        _bloco_worker,
+        _bloco_telegram,
+        _bloco_banco,
+    ):
+        try:
+            blocos.append(montar())
+        except Exception as erro:
+            blocos.append({
+                "titulo": montar.__name__,
+                "estado": "ruim",
+                "resumo": "Não consegui ler esta parte.",
+                "linhas": [("Erro", str(erro)[:200])],
+                "acao": None,
+            })
+
+    if request.args.get("json") == "1":
+        return jsonify({
+            "ok": True,
+            "gerado_em": _hora_br(int(time.time())),
+            "blocos": blocos,
+        })
+
+    partes = [
+        "<!doctype html><html lang='pt-BR'><head>",
+        "<meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+        "<title>Diagnóstico do robô</title>",
+        "<style>", _CSS, "</style></head><body><div class='wrap'>",
+        "<h1>Diagnóstico do robô</h1>",
+        "<p class='quando'>Gerado em ", _hora_br(int(time.time())), "</p>",
+        "<p class='botoes'>",
+        "<a class='botao' href='/diagnostico'>Atualizar</a>",
+        "<a class='botao claro' href='/diagnostico?testar=1'>",
+        "Testar login agora</a>",
+        "</p>",
+    ]
+
+    for bloco in blocos:
+
+        estado = bloco.get("estado", "espera")
+
+        partes.append("<div class='peca " + estado + "'>")
+        partes.append("<h2>" + _html.escape(bloco["titulo"]) + "</h2>")
+        partes.append(
+            "<p class='estado'>" + _PALAVRA_ESTADO.get(estado, "?") + "</p>"
+        )
+        partes.append(
+            "<p class='resumo'>" + _html.escape(bloco.get("resumo") or "") + "</p>"
+        )
+
+        partes.append("<table>")
+        for rotulo, valor in bloco.get("linhas", []):
+            partes.append(
+                "<tr><td class='rot'>"
+                + _html.escape(str(rotulo))
+                + "</td><td class='val'>"
+                + _html.escape(str(valor))
+                + "</td></tr>"
+            )
+        partes.append("</table>")
+
+        if bloco.get("acao"):
+            partes.append(
+                "<p class='acao'>" + _html.escape(bloco["acao"]) + "</p>"
+            )
+
+        partes.append("</div>")
+
+    partes.append("</div></body></html>")
+
+    return "".join(partes)
+
+
+# ============================================================
 # EXECUÇÃO
 # ============================================================
 
