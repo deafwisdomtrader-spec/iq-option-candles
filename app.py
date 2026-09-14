@@ -5146,6 +5146,468 @@ def _processar_resultados_worker():
             pass
 
 
+
+# ============================================================
+# TESTE CRU — FALA DIRETO COM A IQ OPTION
+# ============================================================
+#
+# POR QUE ESTE ARQUIVO EXISTE
+#
+# O /diagnostico mostra o ESTADO do robô. Ele já disse tudo o
+# que sabia: a conexão trava e não volta. Mas ele não consegue
+# dizer POR QUÊ, porque a biblioteca da IQ Option engole o
+# motivo e fica pendurada.
+#
+# Esta rota pula a biblioteca inteira. Ela conversa com o
+# endereço de login da corretora usando HTTP puro — o mesmo
+# endereço que a biblioteca usa por dentro. A resposta vem
+# limpa, em texto, na tela.
+#
+# Também pula o cadeado, o freio e o pool de threads. Nada
+# aqui depende do resto do app. Se o robô estiver todo
+# travado, esta página continua respondendo.
+#
+# COMO INSTALAR
+#
+#   Cole no final do app.py, junto com o diagnóstico, ANTES
+#   do "if __name__ == "__main__":".
+#
+# COMO USAR
+#
+#   /teste-cru          -> alcance + login direto (uns 20 s)
+#   /teste-cru?lib=1    -> testa a biblioteca (uns 25 s)
+#
+#   Rode primeiro sem ?lib=1. É o teste que responde a
+#   pergunta.
+#
+# SOBRE SEGURANÇA
+#
+#   A página nunca mostra sua senha, e apaga o ssid (a chave
+#   da sessão) da resposta antes de exibir. Mesmo assim ela
+#   revela se o login funciona — apague esta rota do app.py
+#   quando terminar o conserto.
+# ============================================================
+
+
+def _sem_segredo(dados):
+    """Tira da resposta qualquer coisa que seja chave de acesso.
+
+    A resposta de um login bem-sucedido traz o ssid, que é a
+    sessão inteira. Quem pegar isso entra na conta. Não pode
+    aparecer numa página aberta.
+    """
+
+    if not isinstance(dados, dict):
+        return dados
+
+    limpo = {}
+
+    for chave, valor in dados.items():
+
+        nome = str(chave).lower()
+
+        if any(
+            marca in nome
+            for marca in ("ssid", "token", "session", "cookie")
+        ):
+            limpo[chave] = "[escondido]"
+        elif isinstance(valor, dict):
+            limpo[chave] = _sem_segredo(valor)
+        else:
+            limpo[chave] = valor
+
+    return limpo
+
+
+def _teste_alcance():
+    """A corretora atende o Render? Só isso, sem login."""
+
+    inicio = time.time()
+
+    try:
+
+        resposta = requests.get(
+            "https://iqoption.com/",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+        duracao = round(time.time() - inicio, 1)
+        texto = (resposta.text or "")[:400].lower()
+
+        bloqueio = any(
+            marca in texto
+            for marca in (
+                "access denied",
+                "cloudflare",
+                "forbidden",
+                "blocked",
+                "not available in your",
+            )
+        )
+
+        if resposta.status_code == 403 or bloqueio:
+            return {
+                "titulo": "A corretora atende este servidor?",
+                "estado": "ruim",
+                "resumo": (
+                    "Respondeu, mas com cara de bloqueio "
+                    "(código " + str(resposta.status_code) + ")."
+                ),
+                "linhas": [
+                    ("Tempo", str(duracao) + " s"),
+                    ("Código HTTP", str(resposta.status_code)),
+                ],
+                "acao": (
+                    "A IQ Option provavelmente bloqueou o IP do "
+                    "Render. Não tem conserto no código: seria "
+                    "preciso outro servidor."
+                ),
+            }
+
+        return {
+            "titulo": "A corretora atende este servidor?",
+            "estado": "ok",
+            "resumo": "Sim, respondeu normal.",
+            "linhas": [
+                ("Tempo", str(duracao) + " s"),
+                ("Código HTTP", str(resposta.status_code)),
+            ],
+            "acao": None,
+        }
+
+    except Exception as erro:
+
+        duracao = round(time.time() - inicio, 1)
+
+        return {
+            "titulo": "A corretora atende este servidor?",
+            "estado": "ruim",
+            "resumo": "Não respondeu em " + str(duracao) + " s.",
+            "linhas": [
+                ("Tipo do erro", type(erro).__name__),
+                ("Erro", str(erro)[:250]),
+            ],
+            "acao": (
+                "Se nem a página inicial responde, o Render não "
+                "alcança a IQ Option. É bloqueio de rede."
+            ),
+        }
+
+
+def _teste_login_direto():
+    """Faz o login por HTTP puro e mostra a resposta da corretora.
+
+    É ESTE o teste que responde a pergunta. A biblioteca chama
+    exatamente este endereço; a diferença é que aqui a resposta
+    aparece em vez de sumir.
+    """
+
+    email = os.getenv("IQ_EMAIL") or ""
+    senha = os.getenv("IQ_PASSWORD") or ""
+
+    if not email or not senha:
+        return {
+            "titulo": "Login direto (sem a biblioteca)",
+            "estado": "ruim",
+            "resumo": "Falta e-mail ou senha no Render.",
+            "linhas": [
+                ("IQ_EMAIL", "ok" if email else "FALTANDO"),
+                ("IQ_PASSWORD", "ok" if senha else "FALTANDO"),
+            ],
+            "acao": "Configure em Environment, no painel do Render.",
+        }
+
+    inicio = time.time()
+
+    try:
+
+        resposta = requests.post(
+            "https://auth.iqoption.com/api/v2/login",
+            json={"identifier": email, "password": senha},
+            timeout=12,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/json",
+            },
+        )
+
+        duracao = round(time.time() - inicio, 1)
+
+    except Exception as erro:
+
+        duracao = round(time.time() - inicio, 1)
+
+        return {
+            "titulo": "Login direto (sem a biblioteca)",
+            "estado": "ruim",
+            "resumo": "Nem chegou a receber resposta, em " + str(duracao) + " s.",
+            "linhas": [
+                ("Tipo do erro", type(erro).__name__),
+                ("Erro", str(erro)[:250]),
+            ],
+            "acao": (
+                "Sem resposta nenhuma aponta para bloqueio de "
+                "rede, não para senha errada."
+            ),
+        }
+
+    try:
+        dados = _sem_segredo(resposta.json())
+        texto_resposta = json.dumps(dados, ensure_ascii=False)[:400]
+    except Exception:
+        texto_resposta = (resposta.text or "")[:400]
+        dados = {}
+
+    codigo = str(resposta.status_code)
+    marca = (str(dados.get("code") or "") + " " + texto_resposta).lower()
+
+    # ------------------------------------------------------
+    # LEITURA DA RESPOSTA
+    # ------------------------------------------------------
+    # Cada caso tem um conserto diferente, por isso vale
+    # separar em vez de só mostrar o texto cru.
+
+    if resposta.status_code == 200 and "ssid" in texto_resposta.lower():
+        estado = "ok"
+        resumo = "A conta entrou. E-mail e senha estão certos."
+        acao = (
+            "Então o problema NÃO é a conta. É a biblioteca ou o "
+            "IP do Render. Rode /teste-cru?lib=1 agora."
+        )
+
+    elif "2fa" in marca or "token_required" in marca or "verify" in marca:
+        estado = "ruim"
+        resumo = "A conta pede verificação em duas etapas."
+        acao = (
+            "É isto. O robô não sabe digitar código de SMS e "
+            "fica esperando para sempre. Entre na IQ Option, "
+            "vá em segurança e desligue a verificação em duas "
+            "etapas para esta conta."
+        )
+
+    elif "invalid_credentials" in marca or resposta.status_code == 401:
+        estado = "ruim"
+        resumo = "A corretora recusou: e-mail ou senha errados."
+        acao = (
+            "Corrija IQ_PASSWORD no Render. Atenção a espaço "
+            "sobrando no começo ou no fim ao colar."
+        )
+
+    elif resposta.status_code == 429:
+        estado = "espera"
+        resumo = "Tentativas demais. A corretora pediu para esperar."
+        acao = "Espere uns 30 minutos antes de tentar de novo."
+
+    elif resposta.status_code == 403:
+        estado = "ruim"
+        resumo = "Acesso proibido para este servidor."
+        acao = (
+            "Bloqueio de IP. O código está certo; o Render é "
+            "que não é bem-vindo."
+        )
+
+    else:
+        estado = "ruim"
+        resumo = "Resposta fora do esperado."
+        acao = "Me mande o texto da resposta que está abaixo."
+
+    return {
+        "titulo": "Login direto (sem a biblioteca)",
+        "estado": estado,
+        "resumo": resumo,
+        "linhas": [
+            ("Tempo", str(duracao) + " s"),
+            ("Código HTTP", codigo),
+            ("Resposta da corretora", texto_resposta),
+        ],
+        "acao": acao,
+    }
+
+
+def _teste_biblioteca():
+    """Roda o connect() da biblioteca numa thread solta.
+
+    Não usa o pool do app: se travar, trava sozinho e não tira
+    vaga de ninguém. A thread é abandonada, como já acontece
+    hoje — a diferença é que aqui a gente VÊ acontecer.
+    """
+
+    email = os.getenv("IQ_EMAIL") or ""
+    senha = os.getenv("IQ_PASSWORD") or ""
+
+    caixa = {}
+
+    def _tentar():
+        try:
+            cliente = IQ_Option(email, senha)
+            ok, motivo = cliente.connect()
+            caixa["ok"] = bool(ok)
+            caixa["motivo"] = str(motivo)
+        except Exception as erro:
+            caixa["erro"] = type(erro).__name__ + ": " + str(erro)[:250]
+
+    inicio = time.time()
+
+    thread = threading.Thread(target=_tentar, daemon=True)
+    thread.start()
+    thread.join(timeout=22)
+
+    duracao = round(time.time() - inicio, 1)
+
+    if thread.is_alive():
+        return {
+            "titulo": "Login pela biblioteca",
+            "estado": "ruim",
+            "resumo": (
+                "Travou. Passaram " + str(duracao) + " s e a "
+                "biblioteca não voltou nem com erro."
+            ),
+            "linhas": [("Situação", "thread abandonada, ainda pendurada")],
+            "acao": (
+                "Se o login direto acima funcionou e este travou, "
+                "o problema está na biblioteca, não na sua conta."
+            ),
+        }
+
+    if caixa.get("erro"):
+        return {
+            "titulo": "Login pela biblioteca",
+            "estado": "ruim",
+            "resumo": "Deu erro em " + str(duracao) + " s.",
+            "linhas": [("Erro", caixa["erro"])],
+            "acao": None,
+        }
+
+    return {
+        "titulo": "Login pela biblioteca",
+        "estado": "ok" if caixa.get("ok") else "ruim",
+        "resumo": (
+            "Conectou em " + str(duracao) + " s."
+            if caixa.get("ok")
+            else "Não conectou, mas respondeu."
+        ),
+        "linhas": [
+            ("Conectou", "sim" if caixa.get("ok") else "não"),
+            ("Motivo dado", str(caixa.get("motivo"))[:250]),
+        ],
+        "acao": (
+            None
+            if caixa.get("ok")
+            else "Copie o motivo acima e me mande."
+        ),
+    }
+
+
+_CSS_CRU = """
+body { margin:0; padding:24px 16px 64px; background:#fbfbfa; color:#15202b;
+  font:17px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; }
+.wrap { max-width:640px; margin:0 auto; }
+h1 { font-size:26px; margin:0 0 4px; font-weight:650; }
+.quando { color:#6b7883; margin:0 0 24px; font-size:15px; }
+.peca { border-left:5px solid #c8d0d6; padding:2px 0 2px 16px; margin:0 0 26px; }
+.peca.ok { border-left-color:#0f7b3f; }
+.peca.espera { border-left-color:#a8740a; }
+.peca.ruim { border-left-color:#b3261e; }
+.peca h2 { font-size:19px; margin:0 0 2px; font-weight:620; }
+.estado { font-weight:640; font-size:15px; }
+.ok .estado { color:#0f7b3f; }
+.espera .estado { color:#a8740a; }
+.ruim .estado { color:#b3261e; }
+.resumo { margin:4px 0 12px; }
+table { width:100%; border-collapse:collapse; }
+td { padding:6px 0; vertical-align:top; border-top:1px solid #ebe9e5; }
+td.rot { color:#6b7883; width:38%; padding-right:12px; font-size:15px; }
+td.val { word-break:break-word; }
+.acao { margin:12px 0 0; padding:10px 12px; background:#f1f0ec;
+  border-radius:6px; font-size:15px; }
+a.botao { display:inline-block; margin:0 10px 22px 0; padding:10px 16px;
+  background:#15202b; color:#fff; text-decoration:none; border-radius:6px;
+  font-size:15px; }
+a.botao.claro { background:#fff; color:#15202b; border:1px solid #c8d0d6; }
+"""
+
+
+@app.get("/teste-cru")
+def teste_cru():
+
+    import html as _html
+
+    testar_lib = request.args.get("lib") == "1"
+
+    blocos = []
+
+    try:
+        if testar_lib:
+            blocos.append(_teste_biblioteca())
+        else:
+            blocos.append(_teste_alcance())
+            blocos.append(_teste_login_direto())
+    except Exception as erro:
+        blocos.append({
+            "titulo": "Falha no próprio teste",
+            "estado": "ruim",
+            "resumo": "O teste quebrou antes de terminar.",
+            "linhas": [("Erro", str(erro)[:250])],
+            "acao": None,
+        })
+
+    if request.args.get("json") == "1":
+        return jsonify({"ok": True, "blocos": blocos})
+
+    palavras = {"ok": "tudo certo", "espera": "atenção", "ruim": "problema"}
+
+    partes = [
+        "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+        "<title>Teste direto na corretora</title><style>",
+        _CSS_CRU,
+        "</style></head><body><div class='wrap'>",
+        "<h1>Teste direto na corretora</h1>",
+        "<p class='quando'>Gerado em ",
+        datetime.now(tz=FUSO_BR).strftime("%d/%m %H:%M:%S"),
+        "</p>",
+        "<p><a class='botao' href='/teste-cru'>Refazer</a>",
+        "<a class='botao claro' href='/teste-cru?lib=1'>Testar a biblioteca</a></p>",
+    ]
+
+    for bloco in blocos:
+
+        estado = bloco.get("estado", "espera")
+
+        partes.append("<div class='peca " + estado + "'>")
+        partes.append("<h2>" + _html.escape(bloco["titulo"]) + "</h2>")
+        partes.append(
+            "<p class='estado'>" + palavras.get(estado, "?") + "</p>"
+        )
+        partes.append(
+            "<p class='resumo'>" + _html.escape(bloco.get("resumo") or "") + "</p>"
+        )
+        partes.append("<table>")
+
+        for rotulo, valor in bloco.get("linhas", []):
+            partes.append(
+                "<tr><td class='rot'>"
+                + _html.escape(str(rotulo))
+                + "</td><td class='val'>"
+                + _html.escape(str(valor))
+                + "</td></tr>"
+            )
+
+        partes.append("</table>")
+
+        if bloco.get("acao"):
+            partes.append(
+                "<p class='acao'>" + _html.escape(bloco["acao"]) + "</p>"
+            )
+
+        partes.append("</div>")
+
+    partes.append("</div></body></html>")
+
+    return "".join(partes)
+
+
 # ------------------------------------------------------------
 # MERCADO ABERTO NO TELEGRAM (segunda a sexta)
 # ------------------------------------------------------------
