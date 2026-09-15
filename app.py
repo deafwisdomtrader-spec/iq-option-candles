@@ -840,10 +840,20 @@ _falhas_seguidas = 0
 _freio_ate = 0
 
 
-def _registrar_falha_conexao():
-    """Conta a falha e liga o freio quando passa do limite."""
+def _registrar_falha_conexao(motivo=None):
+    """Conta a falha e liga o freio quando passa do limite.
+
+    O MOTIVO é guardado para a página /diagnostico poder mostrar
+    o que a corretora respondeu. Antes ele era jogado fora, e a
+    única forma de saber era caçar no Logs do Render.
+    """
 
     global _falhas_seguidas, _freio_ate
+    global _ultimo_erro_conexao, _ultimo_erro_em
+
+    if motivo:
+        _ultimo_erro_conexao = str(motivo)[:300]
+        _ultimo_erro_em = int(time.time())
 
     _falhas_seguidas += 1
 
@@ -1983,7 +1993,10 @@ def conectar_com_timeout(timeout_segundos=None):
 
     except concurrent.futures.TimeoutError:
 
-        _registrar_falha_conexao()
+        _registrar_falha_conexao(
+            "Tempo esgotado: a corretora nao respondeu em "
+            + str(timeout_segundos) + "s."
+        )
         invalidar_conexao()
         registrar_thread_travada()
 
@@ -1992,11 +2005,11 @@ def conectar_com_timeout(timeout_segundos=None):
             f"{timeout_segundos}s e foi abandonada."
         )
 
-    except Exception:
+    except Exception as erro:
 
         # Falha que não foi de tempo (credencial recusada, rede
         # caída). Conta igual: o que importa é que não conectou.
-        _registrar_falha_conexao()
+        _registrar_falha_conexao(str(erro))
         raise
 
 
@@ -5661,20 +5674,24 @@ FOREX_DESCANSO = 1800
 
 
 def _forex_no_horario():
-    """O Forex aberto costuma estar funcionando agora?
+    """Só bloqueia quando o mercado com certeza está fechado.
 
-    Horario informado pelo produtor (horario de Brasilia):
+    Antes havia aqui uma tabela fixa de horários, escrita à mão.
+    Ela errava toda semana: abria um buraco das 18h às 22h de
+    segunda a quinta, quando o mercado segue aberto, e fazia o
+    domingo voltar só às 22h, quando ele abre no fim da tarde.
 
-        segunda a quinta -> aberto ate as 18h,
-                            fecha, e volta as 22h
-        sexta            -> aberto ate as 18h e nao volta
-        sabado           -> fechado o dia todo
-        domingo          -> volta a partir das 22h
+    A tabela não era necessária. O worker JÁ descobre sozinho
+    que o pregão fechou: em _processar_sinais_worker, quando
+    TODOS os pares voltam MERCADO FECHADO, ele liga o descanso
+    do Forex e fica só no OTC. Quem informa o horário passa a
+    ser a própria corretora — que acerta sempre, inclusive nas
+    mudanças de horário de verão dos Estados Unidos.
 
-    Antes o codigo so conhecia sabado e domingo. Nos outros
-    dias ele insistia no Forex de madrugada e no comeco da
-    noite, gastava conexao a toa e so descobria que estava
-    fechado depois de tentar.
+    Aqui sobra apenas o que é certo em qualquer semana e em
+    qualquer fuso: sábado o dia inteiro, e domingo antes do fim
+    da tarde. Nesses dois casos não vale nem gastar conexão
+    tentando.
     """
 
     try:
@@ -5683,19 +5700,14 @@ def _forex_no_horario():
         return True
 
     dia = agora.weekday()   # 0 = segunda ... 6 = domingo
-    hora = agora.hour
 
-    if dia == 5:            # sabado
+    if dia == 5:            # sábado: fechado o dia todo
         return False
 
-    if dia == 6:            # domingo: so a noite
-        return hora >= 22
+    if dia == 6:            # domingo: volta no fim da tarde
+        return agora.hour >= 17
 
-    if dia == 4:            # sexta: fecha as 18h e nao volta
-        return hora < 18
-
-    # segunda a quinta
-    return hora < 18 or hora >= 22
+    return True             # segunda a sexta: a corretora decide
 
 
 def _mercado_da_vez():
@@ -6232,6 +6244,12 @@ def _loop_worker():
         _WORKER_ATIVO = True
 
     while True:
+
+        # Batida do coração: prova que o robô está vivo.
+        # O /diagnostico compara com a hora atual — passou de
+        # 6 minutos sem batida, a thread morreu.
+        globals()["_worker_ultima_volta"] = int(time.time())
+
         try:
             # ------------------------------------------------------
             # CONEXÃO ANTES DE QUALQUER ALUNO PEDIR
@@ -7054,6 +7072,244 @@ def diagnostico():
             )
 
         partes.append("</div>")
+
+    partes.append("</div></body></html>")
+
+    return "".join(partes)
+
+
+
+
+# ============================================================
+# TESTAR ATIVOS — CONFERE NOMES ANTES DE ADICIONAR
+# ============================================================
+#
+# POR QUE ISTO EXISTE
+#
+# Quando se pede um ativo que não existe com aquele nome, a
+# biblioteca da IQ Option TRAVA por dentro em vez de devolver
+# erro. Cada nome travado gasta o orçamento de tempo inteiro
+# da rodada e abandona uma thread do pool.
+#
+# Foi o que derrubou o painel de ações: nove nomes de palpite
+# em doze. Quase toda rodada pegava vários travados e o painel
+# ficava em "SERVIDOR ACORDANDO" para sempre.
+#
+# Esta rota testa os nomes SEM esse risco:
+#
+#   - cada nome roda na própria thread, criada só para ele
+#   - não usa o pool compartilhado do app, então um nome
+#     travado não tira vaga dos cards que o aluno está vendo
+#   - o teste é um por vez, nunca vários em paralelo
+#
+# COMO USAR
+#
+#   1. Durante o pregão, abra /ativos e copie os nomes exatos.
+#   2. Teste de 5 em 5:
+#
+#        /testar-ativos?nomes=AMAZON,GOOGLE,MICROSOFT
+#
+#   3. Só os que aparecerem em VERDE entram na lista
+#      PARES_ACOES, lá em cima neste mesmo arquivo.
+#
+# QUANDO USAR
+#
+#   Ações só respondem durante o pregão da bolsa americana —
+#   das 10:30 às 17:00 no horário de Brasília, dias úteis.
+#   Fora disso TODOS voltam "mercado fechado", e o teste não
+#   serve para nada.
+# ============================================================
+
+
+def _testar_um_ativo(iq, nome, segundos=8):
+    """Pede poucas velas de um ativo, numa thread própria.
+
+    Devolve um dicionário com o que aconteceu. Nunca levanta
+    exceção: um nome ruim vira resultado ruim, não erro.
+    """
+
+    caixa = {}
+
+    def _tentar():
+        try:
+            # 20 velas bastam para saber se o nome existe.
+            # Pedir 100 só faria a espera ser maior.
+            velas = buscar_candles(iq, nome, 20)
+            caixa["velas"] = velas or []
+        except Exception as erro:
+            caixa["erro"] = type(erro).__name__ + ": " + str(erro)[:150]
+
+    inicio = time.time()
+
+    thread = threading.Thread(target=_tentar, daemon=True)
+    thread.start()
+    thread.join(timeout=segundos)
+
+    duracao = round(time.time() - inicio, 1)
+
+    # TRAVOU: a thread continua pendurada e nunca vai voltar.
+    # É exatamente este caso que não pode entrar em PARES_ACOES.
+    if thread.is_alive():
+        return {
+            "nome": nome,
+            "estado": "ruim",
+            "veredito": "TRAVOU",
+            "detalhe": (
+                "Não respondeu em " + str(duracao) + "s. Este nome "
+                "trava a biblioteca — NÃO adicione."
+            ),
+        }
+
+    if caixa.get("erro"):
+        return {
+            "nome": nome,
+            "estado": "ruim",
+            "veredito": "ERRO",
+            "detalhe": caixa["erro"],
+        }
+
+    velas = caixa.get("velas") or []
+
+    if not velas:
+        return {
+            "nome": nome,
+            "estado": "ruim",
+            "veredito": "SEM DADOS",
+            "detalhe": (
+                "Respondeu, mas não veio vela nenhuma. Nome "
+                "provavelmente errado."
+            ),
+        }
+
+    # Vela velha = pregão fechado, não nome errado. São coisas
+    # diferentes e o texto precisa dizer qual é qual.
+    atraso = int(time.time()) - velas[-1]["to"]
+
+    if atraso > 180:
+        return {
+            "nome": nome,
+            "estado": "espera",
+            "veredito": "MERCADO FECHADO",
+            "detalhe": (
+                "O nome existe e respondeu em " + str(duracao) + "s, "
+                "mas a última vela tem " + str(atraso // 60) + " min. "
+                "Teste de novo durante o pregão."
+            ),
+        }
+
+    return {
+        "nome": nome,
+        "estado": "ok",
+        "veredito": "PODE ADICIONAR",
+        "detalhe": (
+            str(len(velas)) + " velas em " + str(duracao) + "s, "
+            "dado fresco. Nome confirmado."
+        ),
+    }
+
+
+@app.get("/testar-ativos")
+def testar_ativos():
+
+    import html as _html
+
+    bruto = (request.args.get("nomes") or "").strip()
+
+    nomes = [
+        n.strip().upper()
+        for n in bruto.split(",")
+        if n.strip()
+    ]
+
+    # Teto de 5: cada nome pode levar 8s no pior caso. Mais que
+    # isso e a resposta passaria do tempo do gunicorn.
+    nomes = nomes[:5]
+
+    resultados = []
+    aviso = None
+
+    if not nomes:
+        aviso = (
+            "Passe os nomes na URL, separados por vírgula. "
+            "Exemplo: /testar-ativos?nomes=AMAZON,GOOGLE"
+        )
+    else:
+        try:
+            iq = conectar_com_timeout()
+            for nome in nomes:
+                resultados.append(_testar_um_ativo(iq, nome))
+        except Exception as erro:
+            aviso = "Não consegui conectar à corretora: " + str(erro)[:150]
+
+    if request.args.get("json") == "1":
+        return jsonify({
+            "ok": True,
+            "aviso": aviso,
+            "resultados": resultados,
+        })
+
+    cores = {"ok": "#0f7b3f", "espera": "#a8740a", "ruim": "#b3261e"}
+
+    partes = [
+        "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+        "<title>Testar ativos</title><style>",
+        "body{margin:0;padding:24px 16px 64px;background:#fbfbfa;",
+        "color:#15202b;font:17px/1.5 -apple-system,'Segoe UI',",
+        "Roboto,sans-serif}.wrap{max-width:640px;margin:0 auto}",
+        "h1{font-size:26px;margin:0 0 20px;font-weight:650}",
+        ".item{border-left:5px solid #c8d0d6;padding:2px 0 2px 16px;",
+        "margin:0 0 22px}.nome{font-size:19px;font-weight:620;",
+        "font-family:ui-monospace,monospace}.vd{font-weight:640;",
+        "font-size:15px}.det{margin:4px 0 0;font-size:15px}",
+        ".aviso{padding:12px 14px;background:#f1f0ec;border-radius:6px}",
+        "</style></head><body><div class='wrap'>",
+        "<h1>Testar ativos</h1>",
+    ]
+
+    if aviso:
+        partes.append(
+            "<p class='aviso'>" + _html.escape(aviso) + "</p>"
+        )
+
+    for item in resultados:
+
+        cor = cores.get(item["estado"], "#c8d0d6")
+
+        partes.append(
+            "<div class='item' style='border-left-color:" + cor + "'>"
+        )
+        partes.append(
+            "<div class='nome'>" + _html.escape(item["nome"]) + "</div>"
+        )
+        partes.append(
+            "<div class='vd' style='color:" + cor + "'>"
+            + _html.escape(item["veredito"]) + "</div>"
+        )
+        partes.append(
+            "<p class='det'>" + _html.escape(item["detalhe"]) + "</p>"
+        )
+        partes.append("</div>")
+
+    if resultados:
+        aprovados = [
+            i["nome"] for i in resultados if i["estado"] == "ok"
+        ]
+
+        if aprovados:
+            partes.append(
+                "<p class='aviso'>Para o app.py, dentro de "
+                "PARES_ACOES:<br><br><code>"
+                + _html.escape(
+                    ",<br>".join('    "' + n + '"' for n in aprovados)
+                )
+                + "</code></p>"
+            )
+        else:
+            partes.append(
+                "<p class='aviso'>Nenhum nome aprovado desta vez. "
+                "Não adicione nada à lista.</p>"
+            )
 
     partes.append("</div></body></html>")
 
