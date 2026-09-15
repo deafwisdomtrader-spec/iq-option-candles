@@ -767,6 +767,12 @@ PARES_ACOES = [
     "APPLE",
     "FACEBOOK",
     "TESLA",
+
+    # Aprovados em /testar-ativos no dia 15/09: responderam
+    # com dado fresco em 0,1s. MICROSOFT foi testado no mesmo
+    # lote e TRAVOU — por isso não está aqui.
+    "AMAZON",
+    "GOOGLE",
 ]
 
 
@@ -840,6 +846,66 @@ _falhas_seguidas = 0
 _freio_ate = 0
 
 
+def _limpeza_total(motivo=""):
+    """Joga fora TUDO que pode estar entupido e recomeça limpo.
+
+    POR QUE ISTO EXISTE
+    -------------------
+    O robô já sabia contar falhas e descansar, mas nunca
+    LIMPAVA o que estava entupido. Então ele descansava,
+    voltava, esbarrava nas mesmas threads travadas e falhava
+    de novo — a noite inteira, sem sair do lugar.
+
+    Aqui, depois de algumas falhas seguidas, ele faz sozinho o
+    mesmo que um Manual Deploy fazia à mão:
+
+      1. troca o cadeado da conexão por um novo
+      2. joga fora o pool de threads e cria outro
+      3. zera a contagem de threads travadas
+      4. descarta a sessão da corretora
+
+    As threads velhas continuam penduradas em algum canto da
+    memória, mas não seguram mais nada.
+    """
+
+    global _lock, _lock_pego_em
+    global _executor_candles, _threads_travadas
+    global _iq
+
+    # 1) Cadeado novo. A thread velha ainda segura o antigo,
+    #    mas ninguém mais espera por ele.
+    try:
+        with _lock_troca:
+            _lock = threading.Lock()
+            _lock_pego_em = 0
+    except Exception:
+        pass
+
+    # 2) Pool novo. shutdown sem esperar: as travadas seguem
+    #    penduradas, o pool novo já nasce com todas as vagas.
+    try:
+        antigo = _executor_candles
+        _executor_candles = concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_WORKERS_POOL
+        )
+        antigo.shutdown(wait=False)
+    except Exception:
+        pass
+
+    # 3) Contagem zerada, senão o próximo socorro viria cedo
+    #    demais.
+    try:
+        with _pool_lock:
+            _threads_travadas = 0
+    except Exception:
+        pass
+
+    # 4) Sessão descartada: a próxima conexão começa do zero.
+    _iq = None
+
+    print("CONEXAO: limpeza total —", motivo)
+
+
 def _registrar_falha_conexao(motivo=None):
     """Conta a falha e liga o freio quando passa do limite.
 
@@ -864,6 +930,19 @@ def _registrar_falha_conexao(motivo=None):
             "falhas seguidas — parando de tentar por",
             FREIO_SEGUNDOS // 60, "min."
         )
+
+        # ANTES de descansar, limpa a casa.
+        #
+        # Sem isto o descanso não adiantava: o robô voltava,
+        # esbarrava nas MESMAS threads travadas e falhava de
+        # novo. Era o ciclo que deixava o grupo mudo por horas
+        # até alguém dar Manual Deploy na mão.
+        try:
+            _limpeza_total(
+                str(_falhas_seguidas) + " falhas seguidas"
+            )
+        except Exception:
+            pass
 
 
 def _registrar_sucesso_conexao():
@@ -1885,7 +1964,17 @@ CONEXAO_TIMEOUT = max(
 )
 
 # Quantas threads podem ficar penduradas antes de reciclar.
-LIMITE_THREADS_TRAVADAS = 6
+#
+# Era 6, e isso deixava o serviço no pior dos mundos: com 3 ou
+# 4 threads travadas a conexão já engasgava, mas o socorro não
+# entrava porque o limite não tinha sido atingido. O robô
+# passava horas meio travado sem nunca se consertar.
+#
+# Com 3 o socorro chega antes de o aluno perceber.
+LIMITE_THREADS_TRAVADAS = max(
+    2,
+    int(os.getenv("LIMITE_THREADS_TRAVADAS", "3"))
+)
 
 _executor_candles = concurrent.futures.ThreadPoolExecutor(
     max_workers=MAX_WORKERS_POOL
