@@ -33,7 +33,7 @@ app = Flask(__name__)
 # de sinais nunca pode quebrar por causa do Telegram.
 #
 # As imagens (call_dw.webp, put_dw.webp, win_dw.webp, gale1_dw.webp,
-# gale2_dw.webp, loss_dw.webp, empate_dw.webp) precisam estar na raiz
+# gale2_dw.webp, loss_dw.webp, empata_dw.webp) precisam estar na raiz
 # do repositório, do lado do app.py — é de lá que elas são
 # lidas e enviadas pro Telegram.
 
@@ -49,7 +49,7 @@ IMAGENS_TELEGRAM = {
     "win_g1": os.path.join(DIRETORIO_APP, "gale1_dw.webp"),
     "win_g2": os.path.join(DIRETORIO_APP, "gale2_dw.webp"),
     "loss": os.path.join(DIRETORIO_APP, "loss_dw.webp"),
-    "empate": os.path.join(DIRETORIO_APP, "empate_dw.webp"),
+    "empate": os.path.join(DIRETORIO_APP, "empata_dw.webp"),
 }
 
 # Pool próprio, separado do de candles, pra um Telegram lento
@@ -5881,25 +5881,48 @@ _forex_fechado_ate = 0
 FOREX_DESCANSO = 1800
 
 
+# ------------------------------------------------------------
+# HORÁRIO DO FOREX (informado pelo produtor)
+# ------------------------------------------------------------
+# Regra em horário de Brasília:
+#
+#   segunda a quinta -> aberto até as 16h,
+#                       fecha, e volta às 22h
+#   sexta            -> aberto até as 16h e não volta
+#   sábado           -> fechado o dia todo
+#   domingo          -> volta a partir das 22h
+#
+# Quando o Forex está fechado, o robô fica só no OTC — que
+# roda 24 horas. Ou seja, o OTC cobre automaticamente o fim de
+# semana e a faixa das 16h às 22h nos dias úteis.
+#
+# As duas horas ficam em variáveis de ambiente para você poder
+# ajustar no Render sem mexer em código, caso a corretora mude
+# o horário dela.
+FOREX_FECHA_HORA = max(0, min(23, int(
+    os.getenv("FOREX_FECHA_HORA", "16")
+)))
+
+FOREX_ABRE_HORA = max(0, min(23, int(
+    os.getenv("FOREX_ABRE_HORA", "22")
+)))
+
+
 def _forex_no_horario():
-    """Só bloqueia quando o mercado com certeza está fechado.
+    """O Forex aberto costuma estar funcionando agora?
 
-    Antes havia aqui uma tabela fixa de horários, escrita à mão.
-    Ela errava toda semana: abria um buraco das 18h às 22h de
-    segunda a quinta, quando o mercado segue aberto, e fazia o
-    domingo voltar só às 22h, quando ele abre no fim da tarde.
+    ISTO É UM FILTRO, NÃO A VERDADE FINAL
+    -------------------------------------
+    Serve só para não gastar conexão tentando num horário em
+    que o mercado certamente está fechado. Quem confirma de
+    verdade é a própria corretora: em _processar_sinais_worker,
+    se TODOS os pares voltarem MERCADO FECHADO, o Forex entra
+    em descanso mesmo que a tabela aqui diga que está aberto.
 
-    A tabela não era necessária. O worker JÁ descobre sozinho
-    que o pregão fechou: em _processar_sinais_worker, quando
-    TODOS os pares voltam MERCADO FECHADO, ele liga o descanso
-    do Forex e fica só no OTC. Quem informa o horário passa a
-    ser a própria corretora — que acerta sempre, inclusive nas
-    mudanças de horário de verão dos Estados Unidos.
-
-    Aqui sobra apenas o que é certo em qualquer semana e em
-    qualquer fuso: sábado o dia inteiro, e domingo antes do fim
-    da tarde. Nesses dois casos não vale nem gastar conexão
-    tentando.
+    Ou seja: a tabela pode errar para mais, nunca para menos.
+    Se um dia a corretora mudar o horário, o robô descobre
+    sozinho — e você ajusta FOREX_FECHA_HORA e FOREX_ABRE_HORA
+    no Render quando puder.
     """
 
     try:
@@ -5908,14 +5931,20 @@ def _forex_no_horario():
         return True
 
     dia = agora.weekday()   # 0 = segunda ... 6 = domingo
+    hora = agora.hour
 
-    if dia == 5:            # sábado: fechado o dia todo
+    if dia == 5:                        # sábado: fechado
         return False
 
-    if dia == 6:            # domingo: volta no fim da tarde
-        return agora.hour >= 17
+    if dia == 6:                        # domingo: volta à noite
+        return hora >= FOREX_ABRE_HORA
 
-    return True             # segunda a sexta: a corretora decide
+    if dia == 4:                        # sexta: fecha e não volta
+        return hora < FOREX_FECHA_HORA
+
+    # Segunda a quinta: aberto de madrugada até o fechamento,
+    # e de novo a partir da reabertura à noite.
+    return hora < FOREX_FECHA_HORA or hora >= FOREX_ABRE_HORA
 
 
 def _mercado_da_vez():
