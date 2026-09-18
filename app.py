@@ -66,34 +66,70 @@ _executor_telegram = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-def _enviar_telegram_texto_sync(mensagem):
+def _enviar_telegram_texto_sync(mensagem, tentativas=3):
+    """Manda o cartão de texto, insistindo quando o Telegram
+    demora.
+
+    POR QUE INSISTE
+    ---------------
+    Antes era uma tentativa só, com 8 segundos de limite. O
+    cartão é enviado em DUAS chamadas: primeiro o sticker,
+    depois este texto. Quando o Telegram engasgava, o sticker
+    passava e o texto não — e o grupo recebia a seta PUT
+    sozinha, sem dizer o par nem a hora da entrada.
+
+    Era exatamente o defeito de dois stickers seguidos sem
+    cartão nenhum entre eles.
+
+    Agora tenta três vezes, com mais tempo, e espera um pouco
+    entre elas. Se mesmo assim falhar, quem chamou apaga o
+    sticker órfão.
+    """
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
-    try:
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
 
-        url = (
-            "https://api.telegram.org/bot"
-            + TELEGRAM_BOT_TOKEN
-            + "/sendMessage"
-        )
+    for numero in range(max(1, tentativas)):
 
-        resposta = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": mensagem,
-                "parse_mode": "HTML",
-            },
-            timeout=8,
-        )
+        try:
 
-        return resposta.ok
+            resposta = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": mensagem,
+                    "parse_mode": "HTML",
+                },
+                timeout=15,
+            )
 
-    except Exception:
+            if resposta.ok:
+                return True
 
-        return False
+            # 400 é erro do texto (HTML quebrado, por exemplo).
+            # Insistir não adianta e só atrasa o próximo cartão.
+            if resposta.status_code == 400:
+                print(
+                    "TELEGRAM: texto recusado (400) —",
+                    str(resposta.text)[:120],
+                )
+                return False
+
+        except Exception:
+            pass
+
+        # Última volta não precisa esperar.
+        if numero < tentativas - 1:
+            time.sleep(2)
+
+    print("TELEGRAM: o texto do cartao nao foi entregue.")
+    return False
 
 
 def _enviar_telegram_sticker_sync(caminho_imagem):
@@ -123,10 +159,21 @@ def _enviar_telegram_sticker_sync(caminho_imagem):
                 url,
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"sticker": arquivo_imagem},
-                timeout=8,
+                timeout=15,
             )
 
-        return resposta.ok
+        if not resposta.ok:
+            return False
+
+        # Devolve o ID da mensagem, e não apenas True.
+        #
+        # É com ele que dá para APAGAR o sticker caso o cartão
+        # de texto não chegue. Sem isso, um texto que falha
+        # deixa a seta sozinha no grupo para sempre.
+        try:
+            return resposta.json()["result"]["message_id"]
+        except Exception:
+            return True
 
     except Exception:
 
@@ -167,6 +214,38 @@ def _enviar_telegram_photo_sync(caminho_imagem):
         return False
 
 
+def _apagar_mensagem_telegram(id_mensagem):
+    """Apaga uma mensagem já enviada ao grupo.
+
+    Usado só num caso: o sticker foi entregue mas o cartão de
+    texto não. Melhor apagar a seta do que deixar o aluno
+    olhando um PUT sem saber de qual par, nem a que horas
+    entrar.
+    """
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    if not isinstance(id_mensagem, int):
+        return False
+
+    try:
+        requests.post(
+            "https://api.telegram.org/bot"
+            + TELEGRAM_BOT_TOKEN
+            + "/deleteMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": id_mensagem,
+            },
+            timeout=10,
+        )
+        print("TELEGRAM: sticker orfao apagado.")
+        return True
+    except Exception:
+        return False
+
+
 def _enviar_cartao_telegram_sync(caminho_imagem, caption):
     """Manda o ícone como STICKER primeiro (mensagem própria,
     sem legenda — sticker não aceita legenda no Telegram) e
@@ -175,16 +254,30 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption):
     original: ícone em cima, cartão embaixo.
     """
 
+    id_sticker = None
+
     if caminho_imagem and os.path.isfile(caminho_imagem):
 
         enviado_como_sticker = _enviar_telegram_sticker_sync(
             caminho_imagem
         )
 
-        if not enviado_como_sticker:
+        if enviado_como_sticker:
+            # Guardado para poder apagar se o texto não chegar.
+            if isinstance(enviado_como_sticker, int):
+                id_sticker = enviado_como_sticker
+        else:
             _enviar_telegram_photo_sync(caminho_imagem)
 
-    _enviar_telegram_texto_sync(caption)
+    texto_entregue = _enviar_telegram_texto_sync(caption)
+
+    # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA
+    #
+    # Se o texto não foi entregue nem depois de três
+    # tentativas, a seta sozinha só confunde: o aluno vê PUT e
+    # não sabe o par, a hora nem a força. Apaga.
+    if not texto_entregue and id_sticker:
+        _apagar_mensagem_telegram(id_sticker)
 
 
 # Quantos cartoes podem estar esperando na fila.
