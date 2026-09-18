@@ -328,13 +328,43 @@ def enviar_telegram_foto(caminho_imagem, caption):
             _fila_telegram -= 1
 
 
+# ------------------------------------------------------------
+# NOME BONITO NA TELA
+# ------------------------------------------------------------
+# O robô precisa do nome TÉCNICO para falar com a corretora
+# (XRPUSD), mas o aluno não conhece esse código. Ele conhece
+# "Ripple".
+#
+# Este dicionário traduz só na hora de MOSTRAR. A busca, o
+# banco e a conferência de resultado continuam usando o nome
+# técnico — trocar isso quebraria o histórico inteiro.
+#
+# Par que não estiver aqui aparece como está, sem tradução.
+NOMES_BONITOS = {
+    "BTCUSD": "Bitcoin",
+    "ETHUSD": "Ethereum",
+    "XRPUSD": "Ripple",
+}
+
+
+def nome_bonito(par):
+    """Nome como o aluno conhece. Só para exibição."""
+    return NOMES_BONITOS.get(str(par).upper(), par)
+
+
 def _mercado_do_par(par):
+    """Etiqueta que aparece no cartão do Telegram.
+
+    A lista continua se chamando PARES_ACOES por dentro, mas o
+    conteúdo dela virou cripto. O aluno não pode ver "Mercado
+    AÇÕES" num sinal de Bitcoin.
+    """
 
     if par.endswith("-OTC"):
         return "OTC"
 
     if par in PARES_ACOES:
-        return "AÇÕES"
+        return "CRIPTO"
 
     return "FOREX"
 
@@ -360,7 +390,7 @@ def montar_caption_sinal(par, analise):
     rsi_texto = str(rsi) if rsi is not None else "--"
 
     return (
-        f"{emoji_titulo} <b>{titulo}</b> · {par}\n"
+        f"{emoji_titulo} <b>{titulo}</b> · {nome_bonito(par)}\n"
         "────────────\n"
         f"🏛 Mercado  {_mercado_do_par(par)}\n"
         f"⏰ Entrada  {analise.get('entrada', '--:--')}\n"
@@ -653,7 +683,7 @@ def montar_resultado_telegram(par, sinal, entrada_em, resultado):
         )
 
         caption = (
-            f"✅ <b>{titulo}</b> · {par}\n"
+            f"✅ <b>{titulo}</b> · {nome_bonito(par)}\n"
             "────────────\n"
             f"🔁 Entrada das {hora_entrada}\n"
             f"🎯 Direção {sinal} · M1\n"
@@ -676,7 +706,7 @@ def montar_resultado_telegram(par, sinal, entrada_em, resultado):
         rodape = "\n⛔ Sequência encerrada no Gale 2."
 
     caption = (
-        f"❌ <b>LOSS</b> · {par}\n"
+        f"❌ <b>LOSS</b> · {nome_bonito(par)}\n"
         "────────────\n"
         f"🔁 Entrada das {hora_entrada}\n"
         f"🎯 Direção {sinal} · M1"
@@ -723,7 +753,7 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
             rodape = "\n🔥 Recuperado no gale 2."
 
         caption = (
-            f"✅ <b>{titulo}</b> · {par}\n"
+            f"✅ <b>{titulo}</b> · {nome_bonito(par)}\n"
             "────────────\n"
             f"↩️ Entrada das {hora_entrada}\n"
             f"📌 Direção {sinal} · M1\n"
@@ -740,7 +770,7 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
         # para isto; se o arquivo não estiver no servidor, só o
         # texto é enviado — o que já basta.
         caption = (
-            f"⚪ <b>EMPATE</b> · {par}\n"
+            f"⚪ <b>EMPATE</b> · {nome_bonito(par)}\n"
             "────────────\n"
             f"↩️ Entrada das {hora_entrada}\n"
             f"📌 Direção {sinal} · M1\n"
@@ -751,7 +781,7 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
 
     # LOSS — só chega aqui depois de perder entrada, G1 e G2.
     caption = (
-        f"❌ <b>LOSS</b> · {par}\n"
+        f"❌ <b>LOSS</b> · {nome_bonito(par)}\n"
         "────────────\n"
         f"↩️ Entrada das {hora_entrada}\n"
         f"📌 Direção {sinal} · M1\n"
@@ -806,66 +836,45 @@ PARES_FOREX = [
     "EURAUD",
 ]
 
-# AÇÕES.
-# ATENÇÃO: os nomes abaixo são um PALPITE inicial. Os códigos
-# reais da corretora podem ser diferentes (com ou sem -OTC).
-# Use a rota /ativos para ver a lista exata do que está aberto
-# e ajuste esta lista com os nomes que aparecerem lá.
-# AÇÕES (pregão da bolsa, dias úteis).
+# CRIPTO (funciona 24h, inclusive fim de semana).
 #
-# Confirmados por teste direto em /candles/<nome>:
-#   APPLE, FACEBOOK, TESLA  -> responderam ok:true
+# Substituiu a lista de AÇÕES em 17/09. Motivo: ação só tem
+# pregão das 10:30 às 17:00 em dia útil, então o painel ficava
+# apagado a maior parte do tempo. Cripto roda direto, igual ao
+# OTC.
 #
-# Os demais são o mesmo padrão de nome (sem sufixo) e ainda
-# precisam ser confirmados. Se algum der ERRO na segunda-feira,
-# basta apagar a linha dele.
+# A variável continua se chamando PARES_ACOES e o mercado
+# continua sendo "acoes" na URL. É de propósito: trocar o nome
+# obrigaria a mexer também no sinais.php e no sinais.js, e um
+# deles quebrado apaga o painel inteiro sem avisar. O nome é
+# etiqueta; o que vale é o conteúdo.
 #
-# IMPORTANTE: não existe versão -OTC para ações. Fora do
-# pregão elas retornam MERCADO FECHADO, o que é o correto.
+# SÓ NOMES CONFIRMADOS em /testar-ativos:
+#   BTCUSD, ETHUSD, XRPUSD -> 20 velas, dado fresco
+#
+# TRAVARAM no teste, NÃO adicionar:
+#   LTCUSD, ADAUSD, SOLUSD
+#
+# POR QUE SÓ TRÊS
+#
+# Na tela da corretora aparecem dezenas de criptos, mas quase
+# todas são "PerpFuture" — futuro perpétuo, que é outro
+# produto. Não existe vela de 1 minuto para ganhar ou perder
+# nelas, então não servem para sinal M1.
+#
+# COMO ADICIONAR MAIS COM SEGURANÇA
+#
+#   1. /testar-ativos?nomes=NOME1,NOME2
+#   2. Só os que disserem PODE ADICIONAR entram aqui.
+#   3. Dois por vez, nunca dez.
+#
+# Um nome errado não dá erro: ele TRAVA a biblioteca, gasta o
+# tempo da rodada e derruba o painel inteiro — inclusive o de
+# Forex, que estava saudável.
 PARES_ACOES = [
-    # SÓ NOMES CONFIRMADOS.
-    #
-    # Estes três responderam ok:true em teste direto pela rota
-    # /candles/<nome>. Os outros nove que estavam aqui
-    # (AMAZON, GOOGLE, MICROSOFT, NETFLIX, INTEL, ALIBABA,
-    # COCA-COLA, MCDON, VISA) eram PALPITE — nunca foram
-    # testados.
-    #
-    # POR QUE ISSO DERRUBAVA O PAINEL INTEIRO
-    #
-    # Quando se pede um ativo que não existe com aquele nome,
-    # a biblioteca da IQ Option costuma TRAVAR em vez de dar
-    # erro. Cada par travado gasta todo o tempo do orçamento e
-    # abandona uma thread do pool.
-    #
-    # A rotação pega 5 pares por vez. Com 9 nomes duvidosos em
-    # 12, quase toda rodada pegava vários travados, a chamada
-    # estourava e o painel de ações mostrava "SERVIDOR
-    # ACORDANDO" para sempre.
-    #
-    # E como 6 threads travadas fazem o pool ser reciclado e a
-    # conexão ser invalidada, o painel de ações quebrado ainda
-    # atrapalhava o de Forex, que estava saudável.
-    #
-    # COMO ADICIONAR MAIS AÇÕES COM SEGURANÇA
-    #
-    #   1. Abra /ativos no navegador, com a bolsa aberta.
-    #   2. Copie os nomes EXATOS que aparecerem lá.
-    #   3. Acrescente aqui, poucos por vez.
-    #   4. Confira cada um em /candles/<nome> antes de
-    #      confiar. Se não voltar ok:true, tire da lista.
-    #
-    # Nunca adicione um nome sem testar: um só já basta para
-    # travar a rodada.
-    "APPLE",
-    "FACEBOOK",
-    "TESLA",
-
-    # Aprovados em /testar-ativos no dia 15/09: responderam
-    # com dado fresco em 0,1s. MICROSOFT foi testado no mesmo
-    # lote e TRAVOU — por isso não está aqui.
-    "AMAZON",
-    "GOOGLE",
+    "BTCUSD",
+    "ETHUSD",
+    "XRPUSD",
 ]
 
 
@@ -5833,7 +5842,24 @@ def teste_cru():
 # Guardamos a thread entre uma chamada e outra para nao jogar o
 # trabalho fora quando o tempo estoura.
 
-ATIVOS_TIMEOUT = 25
+# Quanto a rota /ativos espera pela lista da corretora.
+#
+# Era 25, e a biblioteca leva uns 30 ("get_digital_underlying_list_data
+# late 30 sec" no log). Ou seja: desistia SEMPRE, e a lista
+# quase nunca saía — a pessoa recarregava cinco vezes e via a
+# mesma mensagem de demora.
+#
+# Agora 45. Cabe porque o Start Command do Render está com
+# --timeout 120: o gunicorn só mata a resposta depois de dois
+# minutos, então há folga de sobra.
+#
+# A thread continua sendo guardada entre uma chamada e outra,
+# então mesmo estourando o resultado fica pronto para a
+# próxima visita.
+ATIVOS_TIMEOUT = max(
+    20,
+    min(90, int(os.getenv("ATIVOS_TIMEOUT", "45")))
+)
 
 _ativos_futuro = None
 
@@ -6167,7 +6193,7 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
         ).strftime("%H:%M")
 
         linhas.append(
-            f"{hora}  {op['par']}  {marca}{selo}"
+            f"{hora}  {nome_bonito(op['par'])}  {marca}{selo}"
         )
 
     total = wins + losses
