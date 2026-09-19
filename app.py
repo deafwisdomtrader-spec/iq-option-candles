@@ -885,6 +885,59 @@ ESTRATEGIA = (
 )
 
 # ============================================================
+# APERTO DO FILTRO — QUANTOS SINAIS APARECEM
+# ============================================================
+#
+# COMO A PONTUAÇÃO FUNCIONA
+#
+# Cada indicador dá pontos para um lado. O máximo é 8:
+#
+#     Tendência (EMA 21/50) .... 2
+#     Rompimento ............... 2
+#     Pullback ................. 2
+#     Fibonacci (zona de ouro) . 2
+#     RSI ...................... 1
+#     MHI ...................... 1
+#
+# Para virar CALL ou PUT, o lado vencedor precisa de DUAS
+# coisas ao mesmo tempo:
+#
+#     PONTUACAO_MINIMA -> quantos pontos ele somou
+#     DIFERENCA_MINIMA -> por quanto ele ganhou do outro lado
+#
+# O segundo é o que importa de verdade. Ele mede CONCORDÂNCIA:
+# um 5x0 é bem melhor que um 5x4, mesmo os dois tendo 5 pontos.
+#
+# HISTÓRICO DESTE AJUSTE
+#
+#   4 e 3 -> sinal demais, muitos fracos. Gerava reclamação.
+#   6 e 6 -> quase nenhum sinal aparecia.
+#   5 e 5 -> meio-termo, mas o painel ficava muito tempo em
+#            AGUARDANDO e o aluno achava que tinha travado.
+#   5 e 4 -> o de agora. Mantém a exigência de pontos e
+#            afrouxa um pouco a margem: passa o 5x1, que antes
+#            era barrado, e continua barrando o 5x2 e o 4x0.
+#
+# COMO AJUSTAR SEM MEXER NO CÓDIGO
+#
+# No Render, em Environment:
+#
+#   PONTUACAO_MINIMA=6  e  DIFERENCA_MINIMA=5  -> mais rígido
+#   PONTUACAO_MINIMA=4  e  DIFERENCA_MINIMA=3  -> mais frouxo
+#
+# CONSELHO: antes de afrouxar mais, olhe /historico. Ele mostra
+# a taxa de acerto real por faixa de força. Se os sinais fracos
+# estiverem perdendo, afrouxar só aumenta a perda — e o aluno
+# que leva três seguidas sai do grupo.
+PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
+    os.getenv("PONTUACAO_MINIMA", "5")
+)))
+
+DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
+    os.getenv("DIFERENCA_MINIMA", "4")
+)))
+
+# ============================================================
 # CONEXÃO PERSISTENTE
 # ============================================================
 
@@ -3054,20 +3107,11 @@ def analisar_sinal(candles, par=None):
 
     confianca = 0
 
-    # Pontuação mínima para confirmar CALL/PUT (máximo é 8).
-    # Histórico: era 4 (muito sinal fraco), subiu para 6 (quase
-    # nenhum sinal aparecia), agora 5 como meio-termo.
-    PONTUACAO_MINIMA = 5
+    # Definidos lá em cima, perto das outras configurações,
+    # para poderem ser ajustados pelo Render sem mexer aqui.
+    PONTUACAO_MINIMA = PONTUACAO_MINIMA_PADRAO
 
-    # O lado vencedor também precisa ganhar por esta margem.
-    #
-    # Histórico: 3 deixava passar os sinais "fracos" (diferença
-    # de 3 a 4 pontos). Agora 5, para só aparecerem os sinais
-    # classificados como MÉDIO (5-6) e FORTE (7+) no painel.
-    #
-    # Efeito: menos sinal na tela, todos com concordância
-    # folgada entre os indicadores.
-    DIFERENCA_MINIMA = 5
+    DIFERENCA_MINIMA = DIFERENCA_MINIMA_PADRAO
 
     # --------------------------------------------------------
     # DECISÃO TÉCNICA (base, sem histórico)
