@@ -804,15 +804,60 @@ CANDLE_COUNT = 100
 # Se algum par não existir na corretora, ele simplesmente
 # falha na busca e aparece como erro no card — os outros
 # continuam funcionando normalmente.
+# OS CINCO QUE SE PROVARAM
+#
+# Escolhidos com DADO, não com palpite. Depois de 519
+# operações registradas em /historico, a conta por par ficou
+# assim (taxa da vela de entrada, sem gale):
+#
+#     NZDUSD-OTC    42 ops    59,5%   fica
+#     EURUSD-OTC    66 ops    59,1%   fica
+#     USDCHF-OTC    79 ops    57,0%   fica
+#     EURJPY-OTC    71 ops    56,3%   fica
+#     GBPUSD-OTC    58 ops    55,2%   fica
+#     ----------------------------------------
+#     GBPJPY-OTC    57 ops    49,1%   SAIU
+#     EURGBP-OTC    71 ops    46,5%   SAIU
+#     USDJPY-OTC    75 ops    45,3%   SAIU
+#
+# Com pagamento de 86%, o ponto de empate é 53,8%. Os três
+# removidos somavam 203 operações a 46,8% — davam prejuízo
+# constante.
+#
+# EFEITO DA MUDANÇA
+#
+#     antes (8 pares):  519 ops, 53,2%  -> abaixo do empate
+#     depois (5 pares): 316 ops, 57,3%  -> acima do empate
+#
+# O preço é perder cerca de 39% do volume de sinais. Menos
+# sinal no grupo, mas sinal que paga.
+#
+# O QUE SE PERDEU DE BOM
+#
+# Nem tudo nos três era ruim: USDJPY-OTC CALL e PUT na faixa
+# FORTE estavam em 66,7%, e EURGBP-OTC CALL em 60%. Esses
+# foram junto. É o custo de cortar por par em vez de por
+# combinação.
+#
+# NÃO EXISTEM OUTROS PARES OTC
+#
+# Testados em /testar-ativos e TRAVARAM: AUDJPY-OTC,
+# EURCAD-OTC, GBPAUD-OTC, CADJPY-OTC, EURAUD-OTC, AUDUSD-OTC,
+# USDCAD-OTC. A corretora só oferece estes oito como OTC, e
+# cinco deles ficaram.
+#
+# PARA REVER ESTA DECISÃO
+#
+# Daqui a algumas semanas, olhe /historico de novo. Se um par
+# removido nunca mais aparecer lá (porque saiu da lista), não
+# há como saber se melhorou — a decisão é definitiva enquanto
+# ele estiver fora.
 PARES = [
     "EURUSD-OTC",
     "GBPUSD-OTC",
-    "USDJPY-OTC",
     "EURJPY-OTC",
     "NZDUSD-OTC",
-    "EURGBP-OTC",
     "USDCHF-OTC",
-    "GBPJPY-OTC",
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
