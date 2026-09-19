@@ -5948,25 +5948,44 @@ def _forex_no_horario():
 
 
 def _mercado_da_vez():
-    """Decide qual mercado o worker analisa nesta volta."""
+    """Decide qual mercado o worker analisa nesta volta.
+
+    UM MERCADO DE CADA VEZ — SEM MISTURA
+    ------------------------------------
+    Antes isto ALTERNAVA: uma volta OTC, a volta seguinte
+    Forex. O grupo recebia EURUSD-OTC e depois AUDUSD quase
+    juntos, e o aluno não sabia em qual dos dois estava
+    operando. Com a sequência de gale no meio, virava bagunça.
+
+    Agora a regra é simples e segue o horário do produtor:
+
+        Forex aberto  ->  só Forex
+        Forex fechado ->  só OTC
+
+    Ou seja, o OTC cobre o fim de semana e a faixa das 16h às
+    22h nos dias úteis, e some do grupo quando o mercado real
+    está funcionando. Nunca os dois ao mesmo tempo.
+
+    O painel do site NÃO muda: lá cada mercado tem a sua
+    página, e o aluno escolhe qual olhar.
+    """
 
     global _worker_proximo_mercado
 
-    # Fora do horario de pregao existe só OTC, que roda 24h.
+    # Fora do horário do Forex existe só OTC, que roda 24h.
     if not _forex_no_horario():
-        return "otc"
-
-    # Dia útil, mas fora do horário de pregão (madrugada,
-    # sexta à noite): descobrimos isso na última tentativa.
-    if time.time() < _forex_fechado_ate:
-        return "otc"
-
-    if _worker_proximo_mercado == "forex":
         _worker_proximo_mercado = "otc"
-        return "forex"
+        return "otc"
+
+    # A tabela diz que está aberto, mas a corretora respondeu
+    # MERCADO FECHADO na última tentativa. Ela manda mais que
+    # a tabela.
+    if time.time() < _forex_fechado_ate:
+        _worker_proximo_mercado = "otc"
+        return "otc"
 
     _worker_proximo_mercado = "forex"
-    return "otc"
+    return "forex"
 
 
 def _ler_json_resposta(resposta):
