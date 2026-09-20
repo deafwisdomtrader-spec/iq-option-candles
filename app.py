@@ -7325,6 +7325,7 @@ a.botao {
   border-radius: 6px; font-size: 15px;
 }
 a.botao.claro { background: #fff; color: #15202b; border: 1px solid #c8d0d6; }
+.conta { color: #6b7883; font-size: 14px; margin-left: 4px; }
 a.botao:focus-visible { outline: 3px solid #a8740a; outline-offset: 2px; }
 """
 
@@ -7384,8 +7385,38 @@ def diagnostico():
         "<a class='botao' href='/diagnostico'>Atualizar</a>",
         "<a class='botao claro' href='/diagnostico?testar=1'>",
         "Testar login agora</a>",
+        "<span id='conta' class='conta'></span>",
         "</p>",
     ]
+
+    # ------------------------------------------------------
+    # ATUALIZAÇÃO SOZINHA
+    # ------------------------------------------------------
+    # A página se recarrega a cada 30 segundos, para você
+    # deixar aberta numa aba e só olhar de vez em quando, sem
+    # ficar clicando em Atualizar.
+    #
+    # NUNCA na página de teste (?testar=1). Ali o carregamento
+    # APAGA O CASTIGO E FORÇA UM LOGIN — recarregar sozinho
+    # viraria uma tentativa a cada 30 segundos, que é
+    # exatamente o que deixa thread pendurada e piora a
+    # situação quando a corretora está lenta.
+    #
+    # Por isso o endereço do recarregamento é sempre
+    # "/diagnostico" puro: mesmo que você chegue aqui vindo do
+    # teste, a próxima volta já é a versão que só observa.
+    if not testar:
+        partes.append(
+            "<script>"
+            "var s=30;"
+            "var e=document.getElementById('conta');"
+            "setInterval(function(){"
+            "  s--;"
+            "  if(s<=0){ location.href='/diagnostico'; return; }"
+            "  if(e){ e.textContent='atualiza em '+s+'s'; }"
+            "},1000);"
+            "</script>"
+        )
 
     for bloco in blocos:
 
