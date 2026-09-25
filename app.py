@@ -6416,9 +6416,16 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 # e "robô com problema" não é coisa para eles verem. O vigia
 # escreve só no log do Render.
 #
-# Para mudar o intervalo: VIGIA_SEGUNDOS no Render (padrão 3600).
+# Para mudar o intervalo: VIGIA_SEGUNDOS no Render (padrão 900).
 
-VIGIA_SEGUNDOS = max(600, int(os.getenv("VIGIA_SEGUNDOS", "3600")))
+# Era 3600 (uma hora). Em 19/09 o robô ficou parado das 13:44
+# às 15:00: o vigia tinha conferido logo antes do problema e só
+# voltou a olhar uma hora depois. Com 15 minutos, o pior caso
+# cai de ~70 para ~25 minutos parado.
+#
+# Continua gentil com a corretora: uma tentativa forçada a cada
+# 15 minutos, e só quando está desconectado há mais de 10.
+VIGIA_SEGUNDOS = max(600, int(os.getenv("VIGIA_SEGUNDOS", "900")))
 
 _vigia_ultima = 0
 _desconectado_desde = 0
@@ -7492,9 +7499,12 @@ def diagnostico():
     # ------------------------------------------------------
     # ATUALIZAÇÃO SOZINHA
     # ------------------------------------------------------
-    # A página se recarrega a cada 30 segundos, para você
-    # deixar aberta numa aba e só olhar de vez em quando, sem
-    # ficar clicando em Atualizar.
+    # A página se recarrega a cada 1 hora. Era 30 segundos,
+    # mas o produtor preferiu mais espaçado.
+    #
+    # Isto só atualiza a TELA — não conserta nada. Quem
+    # destrava o robô é o vigia (vigia_hora_em_hora), que roda
+    # por dentro do servidor, com a página aberta ou fechada.
     #
     # NUNCA na página de teste (?testar=1). Ali o carregamento
     # APAGA O CASTIGO E FORÇA UM LOGIN — recarregar sozinho
@@ -7508,12 +7518,13 @@ def diagnostico():
     if not testar:
         partes.append(
             "<script>"
-            "var s=30;"
+            "var s=3600;"
             "var e=document.getElementById('conta');"
             "setInterval(function(){"
             "  s--;"
             "  if(s<=0){ location.href='/diagnostico'; return; }"
-            "  if(e){ e.textContent='atualiza em '+s+'s'; }"
+            "  if(e){ var m=Math.floor(s/60), r=s%60;"
+            "    e.textContent='atualiza em '+m+'min '+(r<10?'0':'')+r+'s'; }"
             "},1000);"
             "</script>"
         )
