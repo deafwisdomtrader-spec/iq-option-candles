@@ -6386,6 +6386,100 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
     return cabecalho + corpo + rodape
 
 
+# ============================================================
+# VIGIA DE HORA EM HORA — O ROBÔ SE CONFERE SOZINHO
+# ============================================================
+#
+# Antes era você quem abria o /diagnostico, olhava se estava
+# conectado e, quando não estava, apertava "Testar login
+# agora". Agora o próprio robô faz isso, uma vez por hora.
+#
+# O QUE ELE FAZ
+#
+#   Conectado?  -> não mexe em nada. Só anota no log.
+#   Desconectado há um tempo? -> faz o mesmo que o botão:
+#       joga fora cadeado, pool e sessão (limpeza total),
+#       apaga o castigo e deixa a próxima volta do worker
+#       tentar de novo do zero.
+#
+# POR QUE SÓ UMA VEZ POR HORA
+#
+# Forçar conexão com a corretora lenta piora a situação: cada
+# tentativa que trava deixa uma thread pendurada. O castigo de
+# 5 minutos existe para proteger disso. O vigia só passa por
+# cima do castigo uma vez por hora — o suficiente para destravar
+# um robô preso, sem virar enxurrada de tentativas.
+#
+# O QUE ELE NÃO FAZ
+#
+# Não manda mensagem no grupo. O chat do Telegram é dos alunos,
+# e "robô com problema" não é coisa para eles verem. O vigia
+# escreve só no log do Render.
+#
+# Para mudar o intervalo: VIGIA_SEGUNDOS no Render (padrão 3600).
+
+VIGIA_SEGUNDOS = max(600, int(os.getenv("VIGIA_SEGUNDOS", "3600")))
+
+_vigia_ultima = 0
+_desconectado_desde = 0
+
+
+def vigia_hora_em_hora():
+    """Confere a saúde do robô e destrava se estiver preso."""
+
+    global _vigia_ultima, _desconectado_desde
+    global _falhas_seguidas, _freio_ate
+
+    agora = time.time()
+
+    # Anota desde quando está desconectado. Isso roda a cada
+    # volta do worker, não só de hora em hora — assim o vigia
+    # sabe há quanto tempo o problema existe.
+    conectado = False
+    try:
+        conectado = bool(_iq is not None and _iq.check_connect())
+    except Exception:
+        conectado = False
+
+    if conectado:
+        _desconectado_desde = 0
+    elif not _desconectado_desde:
+        _desconectado_desde = agora
+
+    # Ainda não é hora de agir.
+    if agora - _vigia_ultima < VIGIA_SEGUNDOS:
+        return
+
+    _vigia_ultima = agora
+
+    if conectado:
+        print("VIGIA: tudo certo — conectado, falhas:", _falhas_seguidas)
+        return
+
+    parado_ha = int(agora - _desconectado_desde) if _desconectado_desde else 0
+
+    # Desconectado há pouco: o castigo normal ainda dá conta.
+    if parado_ha < 600:
+        print("VIGIA: desconectado há", parado_ha, "s — deixando o castigo agir.")
+        return
+
+    print(
+        "VIGIA: desconectado há", parado_ha // 60,
+        "min — limpando tudo e liberando nova tentativa."
+    )
+
+    try:
+        _limpeza_total("vigia de hora em hora")
+    except Exception:
+        pass
+
+    # Mesmo efeito do botão "Testar login agora": apaga o
+    # castigo. A tentativa em si fica para a próxima volta do
+    # worker, que já vai encontrar tudo limpo.
+    _falhas_seguidas = 0
+    _freio_ate = 0
+
+
 def enviar_relatorio_sessao():
     """Manda o relatório da sessão que acabou de fechar."""
 
@@ -6631,6 +6725,12 @@ def _loop_worker():
         # não impeça o relatório de ser enviado.
         try:
             enviar_relatorio_sessao()
+        except Exception:
+            pass
+
+        # Vigia: roda a cada volta, mas só age de hora em hora.
+        try:
+            vigia_hora_em_hora()
         except Exception:
             pass
 
