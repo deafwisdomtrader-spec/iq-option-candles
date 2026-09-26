@@ -2114,6 +2114,14 @@ def buscar_candles(
         key=lambda item: item["from"]
     )
 
+    # BATIMENTO DE SAÚDE
+    #
+    # Toda vez que a corretora entrega velas de verdade, anota a
+    # hora. É com isto que o vigia sabe se o robô está TRABALHANDO
+    # — e não só "conectado" no papel.
+    if resultado:
+        globals()["_ultima_vela_recebida"] = time.time()
+
     return resultado
 
 
@@ -6387,104 +6395,117 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 
 
 # ============================================================
-# VIGIA DE HORA EM HORA — O ROBÔ SE CONFERE SOZINHO
+# VIGIA — O ROBÔ SE CONSERTA SOZINHO
 # ============================================================
 #
-# Antes era você quem abria o /diagnostico, olhava se estava
-# conectado e, quando não estava, apertava "Testar login
-# agora". Agora o próprio robô faz isso, uma vez por hora.
+# POR QUE A VERSÃO ANTERIOR NÃO BASTAVA
 #
-# O QUE ELE FAZ
+# Ela perguntava à biblioteca: "está conectado?" (check_connect).
+# E a biblioteca da IQ Option às vezes MENTE: responde "sim" com
+# a sessão já morta por dentro. O socket continua aberto, mas
+# nenhuma vela chega. O vigia acreditava e não fazia nada.
 #
-#   Conectado?  -> não mexe em nada. Só anota no log.
-#   Desconectado há um tempo? -> faz o mesmo que o botão:
-#       joga fora cadeado, pool e sessão (limpeza total),
-#       apaga o castigo e deixa a próxima volta do worker
-#       tentar de novo do zero.
+# Em 20/09 o robô parou às 9:44 exatamente assim. Só voltou quando
+# o produtor apertou "Testar login agora" — que não pergunta nada:
+# derruba a sessão e conecta de novo, sempre.
 #
-# POR QUE SÓ UMA VEZ POR HORA
+# COMO FUNCIONA AGORA
 #
-# Forçar conexão com a corretora lenta piora a situação: cada
-# tentativa que trava deixa uma thread pendurada. O castigo de
-# 5 minutos existe para proteger disso. O vigia só passa por
-# cima do castigo uma vez por hora — o suficiente para destravar
-# um robô preso, sem virar enxurrada de tentativas.
+# O vigia olha o TRABALHO, não a promessa. Toda vela recebida
+# anota a hora em _ultima_vela_recebida. Se passar tempo demais
+# sem nenhuma vela chegar, o robô está quebrado — não importa o
+# que check_connect diga.
+#
+# Aí ele faz o mesmo que o botão "Testar login agora":
+#
+#   1. derruba a sessão (mesmo que ela se diga viva)
+#   2. limpa cadeado, pool e threads travadas
+#   3. apaga o castigo
+#   4. tenta conectar NA HORA, sem esperar a próxima volta
+#
+# POR QUE DÁ PARA CONFIAR NA FALTA DE VELA
+#
+# O OTC roda 24 horas, e o robô busca velas a cada volta do
+# worker (3 min). Fora do horário do Forex ele fica no OTC. Então
+# em nenhum momento do dia é normal passar 10 minutos sem vela.
 #
 # O QUE ELE NÃO FAZ
 #
-# Não manda mensagem no grupo. O chat do Telegram é dos alunos,
-# e "robô com problema" não é coisa para eles verem. O vigia
-# escreve só no log do Render.
+# Não manda mensagem no grupo — o chat é dos alunos. Escreve só
+# no log do Render.
 #
-# Para mudar o intervalo: VIGIA_SEGUNDOS no Render (padrão 900).
-
-# Era 3600 (uma hora). Em 19/09 o robô ficou parado das 13:44
-# às 15:00: o vigia tinha conferido logo antes do problema e só
-# voltou a olhar uma hora depois. Com 15 minutos, o pior caso
-# cai de ~70 para ~25 minutos parado.
+# AJUSTES NO RENDER (opcional)
 #
-# Continua gentil com a corretora: uma tentativa forçada a cada
-# 15 minutos, e só quando está desconectado há mais de 10.
-VIGIA_SEGUNDOS = max(600, int(os.getenv("VIGIA_SEGUNDOS", "900")))
+#   SAUDE_LIMITE   -> quanto tempo sem vela é problema (padrão 600 = 10 min)
+#   VIGIA_SEGUNDOS -> intervalo mínimo entre dois consertos (padrão 600)
 
-_vigia_ultima = 0
-_desconectado_desde = 0
+SAUDE_LIMITE = max(300, int(os.getenv("SAUDE_LIMITE", "600")))
+
+VIGIA_SEGUNDOS = max(300, int(os.getenv("VIGIA_SEGUNDOS", "600")))
+
+# Começa na hora em que o servidor sobe. Se começasse em zero,
+# o vigia acharia que o robô está parado desde 1970 e agiria na
+# primeira volta, antes de dar tempo de a primeira vela chegar.
+_ultima_vela_recebida = time.time()
+
+_vigia_ultima_acao = 0
+_vigia_consertos = 0
 
 
 def vigia_hora_em_hora():
-    """Confere a saúde do robô e destrava se estiver preso."""
+    """Destrava o robô quando nenhuma vela chega há muito tempo.
 
-    global _vigia_ultima, _desconectado_desde
+    O nome ficou por compatibilidade com a chamada no loop do
+    worker. Hoje ela confere a cada volta (3 minutos) e só age
+    quando precisa.
+    """
+
+    global _vigia_ultima_acao, _vigia_consertos
     global _falhas_seguidas, _freio_ate
 
     agora = time.time()
+    sem_vela = agora - _ultima_vela_recebida
 
-    # Anota desde quando está desconectado. Isso roda a cada
-    # volta do worker, não só de hora em hora — assim o vigia
-    # sabe há quanto tempo o problema existe.
-    conectado = False
-    try:
-        conectado = bool(_iq is not None and _iq.check_connect())
-    except Exception:
-        conectado = False
-
-    if conectado:
-        _desconectado_desde = 0
-    elif not _desconectado_desde:
-        _desconectado_desde = agora
-
-    # Ainda não é hora de agir.
-    if agora - _vigia_ultima < VIGIA_SEGUNDOS:
+    # Saudável: velas chegando.
+    if sem_vela < SAUDE_LIMITE:
         return
 
-    _vigia_ultima = agora
-
-    if conectado:
-        print("VIGIA: tudo certo — conectado, falhas:", _falhas_seguidas)
+    # Já consertou há pouco — dá tempo para o conserto fazer
+    # efeito, em vez de martelar a corretora.
+    if agora - _vigia_ultima_acao < VIGIA_SEGUNDOS:
         return
 
-    parado_ha = int(agora - _desconectado_desde) if _desconectado_desde else 0
-
-    # Desconectado há pouco: o castigo normal ainda dá conta.
-    if parado_ha < 600:
-        print("VIGIA: desconectado há", parado_ha, "s — deixando o castigo agir.")
-        return
+    _vigia_ultima_acao = agora
+    _vigia_consertos += 1
 
     print(
-        "VIGIA: desconectado há", parado_ha // 60,
-        "min — limpando tudo e liberando nova tentativa."
+        "VIGIA: nenhuma vela há", int(sem_vela // 60),
+        "min — derrubando a sessão e reconectando.",
+        "(conserto nº", str(_vigia_consertos) + ")"
     )
 
+    # 1) Derruba a sessão, mesmo que ela diga estar viva.
     try:
-        _limpeza_total("vigia de hora em hora")
+        invalidar_conexao()
     except Exception:
         pass
 
-    # Mesmo efeito do botão "Testar login agora": apaga o
-    # castigo. A tentativa em si fica para a próxima volta do
-    # worker, que já vai encontrar tudo limpo.
+    # 2) Limpa cadeado, pool e threads travadas.
+    try:
+        _limpeza_total("vigia: sem vela há " + str(int(sem_vela)) + "s")
+    except Exception:
+        pass
+
+    # 3) Apaga o castigo.
     _falhas_seguidas = 0
     _freio_ate = 0
+
+    # 4) Tenta conectar agora, igual ao botão "Testar login".
+    try:
+        conectar_com_timeout()
+        print("VIGIA: reconectado com sucesso.")
+    except Exception as erro:
+        print("VIGIA: ainda sem conexão —", str(erro)[:120])
 
 
 def enviar_relatorio_sessao():
@@ -7076,6 +7097,15 @@ def _bloco_corretora():
             "livre" if travado_ha == 0 else "preso há " + _tempo_curto(travado_ha),
         ),
         ("Threads travadas", str(_g("_threads_travadas", 0))),
+        (
+            "Última vela recebida",
+            _tempo_curto(time.time() - _g("_ultima_vela_recebida", time.time()))
+            + " atrás",
+        ),
+        (
+            "Consertos do vigia",
+            str(_g("_vigia_consertos", 0)) + " desde que o servidor ligou",
+        ),
     ]
 
     if erro:
