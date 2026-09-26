@@ -810,60 +810,38 @@ CANDLE_COUNT = 100
 # Se algum par não existir na corretora, ele simplesmente
 # falha na busca e aparece como erro no card — os outros
 # continuam funcionando normalmente.
-# OS CINCO QUE SE PROVARAM
+# OTC — OS OITO QUE A CORRETORA TEM
 #
-# Escolhidos com DADO, não com palpite. Depois de 519
-# operações registradas em /historico, a conta por par ficou
-# assim (taxa da vela de entrada, sem gale):
+# A IQ Option só oferece estes oito como OTC. Todos os outros
+# nomes testados em /testar-ativos TRAVARAM: AUDJPY-OTC,
+# EURCAD-OTC, GBPAUD-OTC, CADJPY-OTC, EURAUD-OTC, AUDUSD-OTC e
+# USDCAD-OTC.
 #
-#     NZDUSD-OTC    42 ops    59,5%   fica
-#     EURUSD-OTC    66 ops    59,1%   fica
-#     USDCHF-OTC    79 ops    57,0%   fica
-#     EURJPY-OTC    71 ops    56,3%   fica
-#     GBPUSD-OTC    58 ops    55,2%   fica
-#     ----------------------------------------
-#     GBPJPY-OTC    57 ops    49,1%   SAIU
-#     EURGBP-OTC    71 ops    46,5%   SAIU
-#     USDJPY-OTC    75 ops    45,3%   SAIU
+# HISTÓRICO DESTA LISTA
 #
-# Com pagamento de 86%, o ponto de empate é 53,8%. Os três
-# removidos somavam 203 operações a 46,8% — davam prejuízo
-# constante.
+# 19/09 — ficaram só cinco. Em 519 operações, três estavam
+#         abaixo do ponto de empate (53,8%):
 #
-# EFEITO DA MUDANÇA
+#             GBPJPY-OTC   57 ops   49,1%
+#             EURGBP-OTC   71 ops   46,5%
+#             USDJPY-OTC   75 ops   45,3%
 #
-#     antes (8 pares):  519 ops, 53,2%  -> abaixo do empate
-#     depois (5 pares): 316 ops, 57,3%  -> acima do empate
+# 26/09 — os três VOLTARAM, para uma nova medição. Motivos:
+#         a medição antiga foi feita com o conferidor travado
+#         (enxergava só parte dos sinais) e com outro filtro de
+#         força. Agora os dados chegam completos.
 #
-# O preço é perder cerca de 39% do volume de sinais. Menos
-# sinal no grupo, mas sinal que paga.
-#
-# O QUE SE PERDEU DE BOM
-#
-# Nem tudo nos três era ruim: USDJPY-OTC CALL e PUT na faixa
-# FORTE estavam em 66,7%, e EURGBP-OTC CALL em 60%. Esses
-# foram junto. É o custo de cortar por par em vez de por
-# combinação.
-#
-# NÃO EXISTEM OUTROS PARES OTC
-#
-# Testados em /testar-ativos e TRAVARAM: AUDJPY-OTC,
-# EURCAD-OTC, GBPAUD-OTC, CADJPY-OTC, EURAUD-OTC, AUDUSD-OTC,
-# USDCAD-OTC. A corretora só oferece estes oito como OTC, e
-# cinco deles ficaram.
-#
-# PARA REVER ESTA DECISÃO
-#
-# Daqui a algumas semanas, olhe /historico de novo. Se um par
-# removido nunca mais aparecer lá (porque saiu da lista), não
-# há como saber se melhorou — a decisão é definitiva enquanto
-# ele estiver fora.
+# PRAZO: uma semana. Depois disso, olhe /historico e tire de
+# novo quem continuar abaixo de 53,8% com 30+ operações.
 PARES = [
     "EURUSD-OTC",
     "GBPUSD-OTC",
     "EURJPY-OTC",
     "NZDUSD-OTC",
     "USDCHF-OTC",
+    "GBPJPY-OTC",   # em nova medição desde 26/09
+    "EURGBP-OTC",   # em nova medição desde 26/09
+    "USDJPY-OTC",   # em nova medição desde 26/09
 ]
 
 # Forex "normal" (mercado aberto, sem ser OTC).
@@ -876,8 +854,6 @@ PARES_FOREX = [
     "EURJPY",
     "AUDUSD",
     "USDCAD",
-    "GBPJPY",
-    "EURGBP",
     "USDCHF",
     "AUDJPY",
     "NZDUSD",
@@ -885,6 +861,22 @@ PARES_FOREX = [
     "GBPAUD",
     "CADJPY",
     "EURAUD",
+
+    # SAÍRAM EM 26/09: GBPJPY e EURGBP.
+    #
+    # Perderam NOS DOIS MERCADOS, em medições separadas:
+    #
+    #              Forex         OTC
+    #   GBPJPY    45,5%    49,1% (57 ops)
+    #   EURGBP    36,4%    46,5% (71 ops)
+    #
+    # O ponto de empate é 53,8%. A mesma moeda perdendo no
+    # mercado real e no OTC não é sorte — é o par que não combina
+    # com esta estratégia.
+    #
+    # Os outros 13 ainda têm pouco dado (cerca de 5 operações
+    # cada) e ficam até o /historico mostrar mais. De olho no
+    # USDJPY: no OTC fazia 45,3% em 75 operações.
 ]
 
 # CRIPTO (funciona 24h, inclusive fim de semana).
@@ -5419,13 +5411,79 @@ def sou_o_dono_do_worker():
         return True
 
 
+# ------------------------------------------------------------
+# CONFERÊNCIA AUTOMÁTICA DOS SINAIS PENDENTES
+# ------------------------------------------------------------
+#
+# O DEFEITO QUE ESTAVA AQUI
+#
+# A busca pegava os 20 pendentes MAIS ANTIGOS primeiro. Só que
+# a conferência consegue olhar, no máximo, 100 velas para trás
+# (CANDLE_COUNT) — uns 90 minutos. Todo sinal mais velho que
+# isso NUNCA vai ter resultado: a vela dele já saiu da janela, e
+# a resposta é sempre NAO_ENCONTRADO.
+#
+# Então o conferidor ficava preso tentando, volta após volta, os
+# mesmos 20 sinais mortos no topo da fila, e nunca chegava nos
+# novos. Em 26/09 havia 776 sinais parados, e o /historico só
+# enxergava uma fração do que o robô realmente produz.
+#
+# É o mesmo defeito que já foi consertado no sinais.js: uma fila
+# que trava no primeiro item que não resolve.
+#
+# COMO FICOU
+#
+#   1) Pendentes velhos demais para conferir são APAGADOS.
+#      Não há o que fazer com eles; manter só atrapalha.
+#   2) A busca só olha dentro da janela que ainda dá para
+#      conferir, do mais antigo para o mais novo — os que estão
+#      mais perto de expirar vão primeiro.
+
+# Um pouco menos que as 100 velas, para sobrar folga para o G1
+# e o G2, que ficam depois da vela de entrada.
+JANELA_CONFERENCIA = (CANDLE_COUNT - 10) * TIMEFRAME
+
+# Quantos pendentes conferir por volta do worker (3 minutos).
+PENDENTES_POR_VOLTA = max(5, int(os.getenv("PENDENTES_POR_VOLTA", "25")))
+
+
+def _expirar_pendentes_velhos():
+    """Apaga pendentes que já saíram da janela de conferência."""
+
+    if not _DB_PRONTO:
+        return 0
+
+    corte = int(time.time()) - JANELA_CONFERENCIA
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            cur = conexao.execute(
+                """
+                DELETE FROM historico_sinais
+                 WHERE resultado IS NULL
+                   AND entrada_em < ?
+                """,
+                (corte,),
+            )
+            apagados = cur.rowcount
+            conexao.commit()
+            conexao.close()
+        return apagados or 0
+    except Exception:
+        return 0
+
+
 def _buscar_pendentes_worker():
-    """Retorna sinais M1 ainda sem resultado e já fechados."""
+    """Pendentes que ainda dá para conferir: vela fechada e
+    dentro da janela de 100 velas."""
+
     if not _DB_PRONTO:
         return []
 
     agora = int(time.time())
-    limite = agora - TIMEFRAME
+    fechado_ate = agora - TIMEFRAME
+    mais_antigo = agora - JANELA_CONFERENCIA
 
     try:
         with _db_lock:
@@ -5436,10 +5494,11 @@ def _buscar_pendentes_worker():
                   FROM historico_sinais
                  WHERE resultado IS NULL
                    AND entrada_em <= ?
+                   AND entrada_em >= ?
               ORDER BY entrada_em ASC
-                 LIMIT 20
+                 LIMIT ?
                 """,
-                (limite,),
+                (fechado_ate, mais_antigo, PENDENTES_POR_VOLTA),
             ).fetchall()
             conexao.close()
 
@@ -5458,6 +5517,14 @@ def _buscar_pendentes_worker():
 
 def _processar_resultados_worker():
     """Fecha automaticamente os sinais pendentes."""
+
+    apagados = _expirar_pendentes_velhos()
+    if apagados:
+        print(
+            "PENDENTES:", apagados,
+            "expirados (fora da janela de conferência)."
+        )
+
     for par, entrada_em, sinal in _buscar_pendentes_worker():
         try:
             # Reutiliza exatamente a mesma lógica da rota pública.
@@ -5470,7 +5537,6 @@ def _processar_resultados_worker():
                 resultado_sinal(par)
         except Exception:
             pass
-
 
 
 # ============================================================
@@ -6069,45 +6135,86 @@ def _forex_no_horario():
     return hora < FOREX_FECHA_HORA or hora >= FOREX_ABRE_HORA
 
 
+# ------------------------------------------------------------
+# CRIPTO NO TELEGRAM
+# ------------------------------------------------------------
+# A cripto roda 24 horas e entra no rodízio do grupo, uma volta
+# sim, uma volta não. Para tirar do Telegram sem mexer no código:
+# CRIPTO_NO_TELEGRAM=0 no Render. O site continua mostrando
+# cripto de qualquer jeito — lá cada painel pede o seu mercado.
+CRIPTO_NO_TELEGRAM = os.getenv("CRIPTO_NO_TELEGRAM", "1") != "0"
+
+_turno_cripto = False
+
+
 def _mercado_da_vez():
     """Decide qual mercado o worker analisa nesta volta.
 
-    UM MERCADO DE CADA VEZ — SEM MISTURA
+    DUAS REGRAS, UMA EM CIMA DA OUTRA
+    ---------------------------------
+
+    1) Mercado principal: Forex OU OTC, nunca os dois.
+
+           Forex aberto  ->  Forex
+           Forex fechado ->  OTC
+
+       Isso vem do pedido do produtor: o OTC cobre o fim de
+       semana e a faixa das 16h às 22h, e some do grupo quando o
+       mercado real está funcionando.
+
+    2) Cripto alterna com o mercado principal:
+
+           volta 1 -> principal (Forex ou OTC)
+           volta 2 -> cripto
+           volta 3 -> principal
+           ...
+
+    ANTES A CRIPTO NUNCA IA PARA O GRUPO
     ------------------------------------
-    Antes isto ALTERNAVA: uma volta OTC, a volta seguinte
-    Forex. O grupo recebia EURUSD-OTC e depois AUDUSD quase
-    juntos, e o aluno não sabia em qual dos dois estava
-    operando. Com a sequência de gale no meio, virava bagunça.
+    A regra 1 foi escrita sem pensar na cripto, e ela ficou de
+    fora: o site mostrava as nove moedas, mas o robô do Telegram
+    só conhecia Forex e OTC.
 
-    Agora a regra é simples e segue o horário do produtor:
+    POR QUE NÃO VIRA BAGUNÇA
+    ------------------------
+    O robô já trava UMA OPERAÇÃO POR VEZ no grupo
+    (pode_enviar_sinal_agora + _sequencia_aberta). Enquanto um
+    sinal não fecha o resultado, nenhum outro sai — seja do
+    mercado que for. A alternância só decide QUEM é analisado em
+    cada volta; o grupo continua recebendo uma coisa de cada vez.
 
-        Forex aberto  ->  só Forex
-        Forex fechado ->  só OTC
-
-    Ou seja, o OTC cobre o fim de semana e a faixa das 16h às
-    22h nos dias úteis, e some do grupo quando o mercado real
-    está funcionando. Nunca os dois ao mesmo tempo.
-
-    O painel do site NÃO muda: lá cada mercado tem a sua
-    página, e o aluno escolhe qual olhar.
+    O PREÇO
+    -------
+    Cada mercado passa a ser olhado a cada 6 minutos em vez de 3.
+    Como a sequência de gale já leva 3 minutos, na prática quase
+    não se perde entrada.
     """
 
-    global _worker_proximo_mercado
+    global _worker_proximo_mercado, _turno_cripto
 
-    # Fora do horário do Forex existe só OTC, que roda 24h.
+    # Regra 1: qual é o mercado principal agora?
     if not _forex_no_horario():
-        _worker_proximo_mercado = "otc"
-        return "otc"
+        principal = "otc"
+    elif time.time() < _forex_fechado_ate:
+        # A tabela diz aberto, mas a corretora respondeu MERCADO
+        # FECHADO na última tentativa. Ela manda mais que a tabela.
+        principal = "otc"
+    else:
+        principal = "forex"
 
-    # A tabela diz que está aberto, mas a corretora respondeu
-    # MERCADO FECHADO na última tentativa. Ela manda mais que
-    # a tabela.
-    if time.time() < _forex_fechado_ate:
-        _worker_proximo_mercado = "otc"
-        return "otc"
+    # Regra 2: alterna com a cripto.
+    if CRIPTO_NO_TELEGRAM and PARES_ACOES:
+        _turno_cripto = not _turno_cripto
+        escolhido = "acoes" if _turno_cripto else principal
+    else:
+        escolhido = principal
 
-    _worker_proximo_mercado = "forex"
-    return "forex"
+    # Mostra no /diagnostico. "acoes" é o nome interno da cripto.
+    _worker_proximo_mercado = (
+        "cripto" if escolhido == "acoes" else escolhido
+    )
+
+    return escolhido
 
 
 def _ler_json_resposta(resposta):
