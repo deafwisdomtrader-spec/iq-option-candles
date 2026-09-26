@@ -344,6 +344,12 @@ NOMES_BONITOS = {
     "BTCUSD": "Bitcoin",
     "ETHUSD": "Ethereum",
     "XRPUSD": "Ripple",
+    "TRXUSD": "Tron",
+    "BCHUSD": "Bitcoin Cash",
+    "ETCUSD": "Ethereum Classic",
+    "XLMUSD": "Stellar",
+    "LTCUSD": "Litecoin",
+    "ZECUSD": "ZCash",
 }
 
 
@@ -920,6 +926,25 @@ PARES_ACOES = [
     "BTCUSD",
     "ETHUSD",
     "XRPUSD",
+
+    # Aprovados em /testar-ativos em 26/09, um de cada vez:
+    "TRXUSD",   # Tron
+    "BCHUSD",   # Bitcoin Cash
+    "ETCUSD",   # Ethereum Classic
+    "XLMUSD",   # Stellar
+    "LTCUSD",   # Litecoin — tinha travado quando testado junto
+                #   com outros dois; sozinho, passou.
+    "ZECUSD",   # ZCash
+
+    # FORA DA LISTA DE PROPÓSITO:
+    #
+    #   USDT  — moeda presa ao dólar, o preço não se mexe.
+    #           Vela de 1 minuto daria empate quase sempre.
+    #   TRUMP — travou a conexão no teste.
+    #   SOLUSD, ADAUSD — ainda sem teste isolado.
+    #
+    # COM NOVE MOEDAS: o painel mostra 5 por vez e troca a cada
+    # 3 minutos, então cada moeda volta à tela a cada ~5 minutos.
 ]
 
 
@@ -7069,15 +7094,18 @@ def _bloco_corretora():
             + " antes de tentar de novo."
         )
         acao = (
-            "Não espere: abra /diagnostico?testar=1 para apagar "
-            "o castigo e tentar logar agora."
+            "Não precisa fazer nada. O vigia destrava sozinho "
+            "quando o robô passa 10 minutos sem receber vela. "
+            "Testar por cima dele força mais uma conexão numa "
+            "hora em que a corretora já está engasgada."
         )
     else:
         estado = "ruim"
         resumo = "Sem conexão. Nenhum sinal sai enquanto isso."
         acao = (
-            "Abra /diagnostico?testar=1 para ver o motivo exato "
-            "que a corretora responde."
+            "Não precisa fazer nada. O vigia reconecta sozinho "
+            "quando o robô passa 10 minutos sem receber vela. "
+            "Veja a linha 'Última vela recebida' logo abaixo."
         )
 
     linhas = [
