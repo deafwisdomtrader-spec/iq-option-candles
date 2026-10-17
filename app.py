@@ -7972,6 +7972,38 @@ def testar_ativos():
 # EXECUÇÃO
 # ============================================================
 
+# ============================================================
+# AUDITOR — O CARD "AUDITOR" DO ACADEMY, MORANDO AQUI DENTRO
+# ============================================================
+#
+# Até 16/10/2026 o Auditor era um serviço separado no Render
+# (dw-auditor). Os dois dividiam as 750 horas grátis do mês, e a
+# conta acabou no dia 16. Agora ele mora aqui, com as rotas em
+# /auditor/..., e usa a MESMA conexão com a IQ Option que o robô.
+#
+# O código dele está no arquivo auditor.py, ao lado deste.
+#
+# O try/except é de propósito: se o auditor.py faltar ou tiver
+# algum problema, o robô do Telegram continua funcionando normal.
+# O motivo aparece no log do Render.
+try:
+    from auditor import criar_auditor
+
+    app.register_blueprint(
+        criar_auditor(
+            conectar=conectar_com_timeout,
+            buscar=buscar_candles_com_timeout,
+            pares_otc=PARES,
+            pares_forex=PARES_FOREX,
+            pares_cripto=PARES_ACOES,
+            forex_aberto=_forex_no_horario,
+        )
+    )
+    print("AUDITOR: ligado em /auditor")
+except Exception as _erro_auditor:
+    print("AUDITOR: não carregou —", _erro_auditor)
+
+
 if __name__ == "__main__":
 
     porta = int(
