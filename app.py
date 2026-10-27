@@ -862,6 +862,10 @@ PARES_FOREX = [
     "CADJPY",
     "EURAUD",
 
+    # Aprovados em /testar-ativos em 27/10:
+    "EURCHF",
+    "AUDCAD",
+
     # SAÍRAM EM 26/09: GBPJPY e EURGBP.
     #
     # Perderam NOS DOIS MERCADOS, em medições separadas:
