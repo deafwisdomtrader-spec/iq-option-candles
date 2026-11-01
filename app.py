@@ -2089,8 +2089,11 @@ def normalizar_candle(candle):
 def buscar_candles(
     iq,
     par,
-    quantidade=CANDLE_COUNT
+    quantidade=CANDLE_COUNT,
+    tf=None
 ):
+    # tf = tamanho da vela em segundos (60 = M1, 300 = M5, 900 = M15).
+    # Sem tf, continua M1 como sempre.
 
     try:
 
@@ -2106,7 +2109,7 @@ def buscar_candles(
 
     candles = iq.get_candles(
         par,
-        TIMEFRAME,
+        tf or TIMEFRAME,
         quantidade,
         timestamp
     )
@@ -2335,14 +2338,16 @@ def buscar_candles_com_timeout(
     iq,
     par,
     quantidade=CANDLE_COUNT,
-    timeout_segundos=15
+    timeout_segundos=15,
+    tf=None
 ):
 
     future = _executor_candles.submit(
         buscar_candles,
         iq,
         par,
-        quantidade
+        quantidade,
+        tf
     )
 
     try:
@@ -2869,7 +2874,7 @@ def analisar_mhi(candles):
 # ANÁLISE COMPLETA
 # ============================================================
 
-def descartar_vela_aberta(candles):
+def descartar_vela_aberta(candles, tf=None):
     """Remove do fim da lista qualquer candle que ainda não
     fechou.
 
@@ -2892,13 +2897,13 @@ def descartar_vela_aberta(candles):
 
     fechados = [
         c for c in candles
-        if c.get("from", 0) + TIMEFRAME <= agora
+        if c.get("from", 0) + (tf or TIMEFRAME) <= agora
     ]
 
     return fechados
 
 
-def analisar_sinal(candles, par=None):
+def analisar_sinal(candles, par=None, tf=None):
     """Analisa os candles e devolve o sinal.
 
     O parâmetro `par` é opcional e serve só para consultar o
@@ -2907,7 +2912,8 @@ def analisar_sinal(candles, par=None):
     """
 
     # SEMPRE descartar a vela aberta antes de qualquer cálculo.
-    candles = descartar_vela_aberta(candles)
+    tf = tf or TIMEFRAME
+    candles = descartar_vela_aberta(candles, tf)
 
     if len(candles) < 50:
 
@@ -2962,7 +2968,8 @@ def analisar_sinal(candles, par=None):
     # Regra: o último candle fechado precisa ser recente. Em M1,
     # no máximo 3 minutos de atraso.
 
-    ATRASO_MAXIMO = 180
+    # Em M5/M15 a última vela FECHADA pode ter até 1 vela de idade.
+    ATRASO_MAXIMO = 180 if tf == TIMEFRAME else tf + 180
 
     atraso = int(time.time()) - candles[-1]["to"]
 
@@ -3399,7 +3406,7 @@ def analisar_sinal(candles, par=None):
         # Início do candle de ENTRADA, em UNIX. É esta a chave
         # que o front-end usa para o contador e para conferir
         # o resultado.
-        entrada_em = candles[-1]["from"] + TIMEFRAME
+        entrada_em = candles[-1]["from"] + tf
 
         entrada = datetime.fromtimestamp(
             entrada_em,
@@ -4706,6 +4713,132 @@ def operar(par):
 # ============================================================
 # MÚLTIPLOS PARES
 # ============================================================
+
+# ============================================================
+# ANÁLISE EM M5 / M15  (rota separada, não mexe no M1)
+# ============================================================
+#
+# Usada pela janela "DW Sinal" quando o aluno escolhe M5 ou M15.
+#
+#   /analise-tf?tf=5&mercado=otc            -> até 5 pares do mercado
+#   /analise-tf?tf=15&pares=EURUSD-OTC      -> só esse par
+#
+# O QUE ELA NÃO FAZ (de propósito):
+#   - não grava no banco (o histórico continua sendo só do M1);
+#   - não manda nada para o grupo do Telegram;
+#   - não usa o ajuste de histórico, que foi aprendido em M1.
+#
+# A ENTRADA é no começo do PRÓXIMO minuto, com expiração de 5 ou
+# 15 minutos a partir dela. O site confere o resultado com a
+# abertura do 1º minuto e o fechamento do último.
+# ============================================================
+
+TFS_PERMITIDOS = {1: 60, 5: 300, 15: 900}
+
+
+@app.get("/analise-tf")
+def analise_tf():
+
+    inicio_req = time.time()
+
+    try:
+        minutos = int(request.args.get("tf", "5"))
+    except (TypeError, ValueError):
+        minutos = 5
+
+    if minutos not in TFS_PERMITIDOS:
+        return jsonify({"ok": False, "erro": "tf deve ser 1, 5 ou 15"}), 400
+
+    tf = TFS_PERMITIDOS[minutos]
+
+    mercado = request.args.get("mercado", "otc").strip().lower()
+
+    if mercado == "forex":
+        lista_base = PARES_FOREX
+    elif mercado == "acoes":
+        lista_base = PARES_ACOES
+    else:
+        lista_base = PARES
+
+    pedidos = [
+        p.strip().upper()
+        for p in request.args.get("pares", "").split(",")
+        if p.strip()
+    ]
+
+    if pedidos:
+        # Só aceita nomes que o robô conhece (nome errado trava a biblioteca).
+        pares = [p for p in pedidos if p in (PARES + PARES_FOREX + PARES_ACOES)][:5]
+    else:
+        # Sem par escolhido: 5 pares do mercado, girando a cada 3 minutos.
+        lista = list(lista_base)
+        if len(lista) > 5:
+            giro = int(time.time() // 180) % len(lista)
+            lista = (lista[giro:] + lista[:giro])[:5]
+        pares = lista
+
+    try:
+        velas_pedidas = int(request.args.get("velas", 0))
+    except (TypeError, ValueError):
+        velas_pedidas = 0
+    velas_pedidas = max(0, min(CANDLE_COUNT, velas_pedidas))
+
+    resultados = []
+
+    try:
+        iq = conectar_com_timeout()
+    except Exception as erro:
+        invalidar_conexao()
+        return jsonify({"ok": False, "erro": "Sem conexão com a corretora: " + str(erro)[:120]}), 503
+
+    for par in pares:
+
+        # Mesmo cuidado da rota /candles: não estourar os ~30s do gunicorn.
+        if time.time() - inicio_req > 20:
+            resultados.append({"par": par, "sinal": "AGUARDANDO", "status": "PULADO",
+                               "entrada_em": None, "entrada": "--:--"})
+            continue
+
+        try:
+            dados = buscar_candles_com_timeout(
+                iq, par, CANDLE_COUNT, timeout_segundos=8, tf=tf
+            )
+
+            # par=None: o ajuste de histórico foi aprendido em M1, não vale aqui.
+            analise = analisar_sinal(dados, par=None, tf=tf)
+
+            if analise.get("sinal") in ("CALL", "PUT"):
+                entrada_em = (int(time.time()) // 60 + 1) * 60
+                analise["entrada_em"] = entrada_em
+                analise["entrada"] = datetime.fromtimestamp(
+                    entrada_em, tz=FUSO_BR
+                ).strftime("%H:%M")
+                analise["expira_em"] = entrada_em + tf
+
+            analise["validade"] = str(minutos) + (" minuto" if minutos == 1 else " minutos")
+
+            item = {"par": par, "timeframe": "M" + str(minutos)}
+            item.update(analise)
+            if velas_pedidas:
+                item["candles"] = dados[-velas_pedidas:]
+            resultados.append(item)
+
+        except Exception as erro:
+            resultados.append({"par": par, "sinal": "AGUARDANDO", "status": "ERRO",
+                               "erro": str(erro)[:120], "entrada_em": None, "entrada": "--:--"})
+
+    return jsonify({
+        "ok": True,
+        "fonte": "IQ Option",
+        "servico": "Academy Trading",
+        "somente_dados": True,
+        "operacao": False,
+        "timeframe": "M" + str(minutos),
+        "mercado": mercado,
+        "resultados": resultados,
+        "timestamp": int(time.time()),
+    })
+
 
 @app.get("/candles")
 def candles():
