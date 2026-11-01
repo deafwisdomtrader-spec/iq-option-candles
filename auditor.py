@@ -54,7 +54,24 @@ import time
 from flask import Blueprint, jsonify, request
 
 
-VELA = 60          # M1
+VELA = 60          # M1 (padrão)
+
+# M5 e M15: o aluno escolhe no card (?tf=5 ou ?tf=15)
+TFS = {1: 60, 5: 300, 15: 900}
+
+
+def tf_pedido():
+    """Tamanho da vela em segundos escolhido pelo aluno (padrão M1)."""
+    try:
+        m = int(request.args.get("tf", "1"))
+    except (TypeError, ValueError):
+        m = 1
+    return TFS.get(m, VELA)
+
+
+def nome_tf(seg):
+    m = seg // 60
+    return str(m) + (" minuto" if m == 1 else " minutos")
 PREPARO_MIN = 8    # faltando menos que isso para virar o minuto, entra no seguinte
 
 def numero(nome, padrao, minimo, maximo):
@@ -450,10 +467,13 @@ def criar_auditor(
     def permitidos():
         return set(pares_otc) | set(pares_forex) | set(pares_cripto)
 
-    def candles(par, quantidade):
-        """Velas M1 pela conexão do robô, no formato do Auditor."""
+    def candles(par, quantidade, tf=VELA):
+        """Velas (M1, M5 ou M15) pela conexão do robô, no formato do Auditor."""
         iq = conectar()
-        dados = buscar(iq, par, int(quantidade), timeout_segundos=15) or []
+        if tf == VELA:
+            dados = buscar(iq, par, int(quantidade), timeout_segundos=15) or []
+        else:
+            dados = buscar(iq, par, int(quantidade), timeout_segundos=15, tf=tf) or []
         saida = []
         for c in dados:
             c = dict(c)
@@ -512,28 +532,32 @@ def criar_auditor(
                       cfg["macd_lenta"] + cfg["macd_sinal"], cfg["bb_periodo"],
                       cfg["st_k"] + cfg["st_d"] * 2, cfg["adx_periodo"] * 2 + 1,
                       cfg["cci_periodo"]) + 10
+        T = tf_pedido()
         try:
-            velas = candles(par, min(max(120, precisa + 20), 400))
+            velas = candles(par, min(max(120, precisa + 20), 400), T)
         except Exception as e:
             return jsonify({"erro": str(e)[:160]}), 503
 
         agora = time.time()
         # Só velas FECHADAS entram na análise.
-        fechadas = [c for c in velas if c["from"] + VELA <= agora]
+        fechadas = [c for c in velas if c["from"] + T <= agora]
         if len(fechadas) < precisa:
             return jsonify({"erro": "Poucos candles para analisar este par agora."}), 422
 
         r = analisar(fechadas, cfg)
 
-        proximo = (int(agora) // VELA + 1) * VELA
-        if proximo - agora < PREPARO_MIN:
-            proximo += VELA
+        # Entrada no COMEÇO da próxima vela (M1, M5 ou M15) e expiração
+        # no FIM dessa mesma vela — igual à vela da corretora.
+        proximo = (int(agora) // T + 1) * T
+        if proximo - agora < (PREPARO_MIN if T == VELA else 15):
+            proximo += T
         r.update({
             "par": par,
             "entrada_em": proximo,
-            "expira_em": proximo + VELA,
-            "expiracao": "1 minuto",
-            "tipo_grafico": "candlestick M1",
+            "expira_em": proximo + T,
+            "expiracao": nome_tf(T),
+            "timeframe": "M" + str(T // 60),
+            "tipo_grafico": "candlestick M" + str(T // 60),
             "analisado_em": int(agora),
             "config": cfg,
         })
@@ -551,17 +575,18 @@ def criar_auditor(
             return jsonify({"erro": "Dados inválidos."}), 422
         if par not in permitidos():
             return jsonify({"erro": "Par não disponível no Auditor."}), 422
+        T = tf_pedido()
         agora = time.time()
-        if agora < inicio + VELA + 2:
+        if agora < inicio + T + 2:
             return jsonify({"status": "AGUARDANDO"})
 
         # A conexão do robô sempre busca as velas que terminam AGORA.
         # Pede o suficiente para alcançar a vela de entrada.
-        idade = int((agora - inicio) // VELA) + 3
+        idade = int((agora - inicio) // T) + 3
         if idade > 400:
             return jsonify({"erro": "Entrada antiga demais para conferir."}), 422
         try:
-            velas = candles(par, max(5, idade))
+            velas = candles(par, max(5, idade), T)
         except Exception as e:
             return jsonify({"erro": str(e)[:160]}), 503
 
