@@ -5535,6 +5535,10 @@ def candles():
 
 _WORKER_ATIVO = False
 _WORKER_LOCK = threading.Lock()
+# Número da "geração" do worker. Se o worker TRAVAR (fica vivo mas
+# parado), sobe um novo com número maior e o velho se aposenta
+# sozinho na próxima volta, se um dia destravar.
+_WORKER_GERACAO = -1
 
 # ------------------------------------------------------------
 # UM WORKER SÓ — TRAVA DE ARQUIVO
@@ -7038,16 +7042,21 @@ def limpar_banco():
     )
 
 
-def _loop_worker():
+def _loop_worker(geracao=0):
     """Loop único: primeiro fecha resultados, depois procura sinais."""
-    global _WORKER_ATIVO
+    global _WORKER_ATIVO, _WORKER_GERACAO
 
     with _WORKER_LOCK:
-        if _WORKER_ATIVO:
+        if _WORKER_ATIVO and geracao <= _WORKER_GERACAO:
             return
         _WORKER_ATIVO = True
+        _WORKER_GERACAO = geracao
 
     while True:
+
+        # Um worker mais novo assumiu (este tinha travado): sai.
+        if geracao != _WORKER_GERACAO:
+            return
 
         # Batida do coração: prova que o robô está vivo.
         # O /diagnostico compara com a hora atual — passou de
@@ -7149,37 +7158,97 @@ def iniciar_worker_automatico():
     morrem no fork, sem deixar erro nenhum no log.
     """
 
-    vivas = {
-        t.name for t in threading.enumerate() if t.is_alive()
-    }
+    def _worker_saudavel():
+        vivas = {
+            t.name for t in threading.enumerate() if t.is_alive()
+        }
+        tem = any(n.startswith("dw-academy-worker") for n in vivas)
+        if not tem:
+            return False
+        # Vivo, mas TRAVADO? A batida do coração acontece a cada
+        # volta (3 min). Sem batida há muito tempo = travado.
+        limite = int(os.getenv("INTERVALO_WORKER", "180")) * 2 + 180
+        ultima = globals().get("_worker_ultima_volta", 0) or 0
+        if ultima and time.time() - ultima > limite:
+            return False
+        return True
 
-    if "dw-academy-worker" in vivas:
+    if _worker_saudavel():
+        _iniciar_manter_acordado()
         return
 
     with _WORKER_LOCK:
 
         # Confere de novo dentro do lock: outra requisição
         # pode ter subido a thread no meio do caminho.
-        vivas = {
-            t.name for t in threading.enumerate() if t.is_alive()
-        }
-
-        if "dw-academy-worker" in vivas:
+        if _worker_saudavel():
             return
 
         if not sou_o_dono_do_worker():
             return
 
         try:
+            nova = _WORKER_GERACAO + 1
+            # A batida é renovada já, para a próxima visita não
+            # achar que o worker novo também travou.
+            globals()["_worker_ultima_volta"] = int(time.time())
             thread = threading.Thread(
                 target=_loop_worker,
-                name="dw-academy-worker",
+                args=(nova,),
+                name="dw-academy-worker-" + str(nova),
                 daemon=True,
             )
             thread.start()
-            print("WORKER: iniciado, pid", os.getpid())
+            print("WORKER: iniciado, pid", os.getpid(), "geracao", nova)
         except Exception:
             pass
+
+    _iniciar_manter_acordado()
+
+
+# ============================================================
+# MANTER ACORDADO (o Telegram não para mais)
+# ============================================================
+# No Render, o serviço DORME quando fica um tempo sem visita.
+# Dormindo, o worker para e o Telegram fica mudo — até alguém
+# abrir uma página (ex.: /diagnostico), que acorda tudo de novo.
+#
+# Este vigia visita o PRÓPRIO endereço do robô a cada 10 minutos.
+# Como o serviço nunca fica sem visita, ele não dorme mais.
+# O Render já informa o endereço em RENDER_EXTERNAL_URL.
+# (Se quiser outro endereço, crie a variável URL_PUBLICA.)
+# Para desligar: crie MANTER_ACORDADO=0 nas variáveis do Render.
+def _loop_manter_acordado():
+    url = (os.getenv("URL_PUBLICA") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if not url:
+        print("ACORDADO: sem RENDER_EXTERNAL_URL/URL_PUBLICA — vigia desligado")
+        return
+    intervalo = max(60, int(os.getenv("INTERVALO_ACORDADO", "600")))
+    print("ACORDADO: visitando", url + "/health", "a cada", intervalo, "s")
+    while True:
+        time.sleep(intervalo)
+        try:
+            requests.get(url + "/health", timeout=20)
+        except Exception:
+            pass
+
+
+def _iniciar_manter_acordado():
+    if os.getenv("MANTER_ACORDADO", "1") == "0":
+        return
+    try:
+        vivas = {t.name for t in threading.enumerate() if t.is_alive()}
+        if "dw-manter-acordado" in vivas:
+            return
+        if not sou_o_dono_do_worker():
+            return
+        threading.Thread(
+            target=_loop_manter_acordado,
+            name="dw-manter-acordado",
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
 
 
 @app.before_request
@@ -7471,7 +7540,7 @@ def _bloco_corretora():
 def _bloco_worker():
 
     viva = any(
-        t.name == "dw-academy-worker" and t.is_alive()
+        t.name.startswith("dw-academy-worker") and t.is_alive()
         for t in threading.enumerate()
     )
 
