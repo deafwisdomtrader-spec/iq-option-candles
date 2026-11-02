@@ -66,118 +66,142 @@ _executor_telegram = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-def _enviar_telegram_texto_sync(mensagem, tentativas=3):
-    """Manda o cartão de texto, insistindo quando o Telegram
-    demora.
+# ------------------------------------------------------------
+# QUANDO PODE TENTAR DE NOVO — E QUANDO NÃO PODE
+# ------------------------------------------------------------
+# A versão anterior tentava de novo em QUALQUER falha, inclusive
+# quando o Telegram demorava para RESPONDER. Só que "demorou para
+# responder" não quer dizer "não chegou": muitas vezes a mensagem
+# já tinha sido entregue no grupo, a confirmação é que atrasou.
+#
+# Resultado: o texto saía DUAS vezes. E com o sticker era pior —
+# o robô achava que o sticker tinha falhado e mandava a MESMA
+# imagem de novo como foto. O grupo via a seta duplicada.
+#
+# Agora só tenta de novo quando é CERTO que não chegou:
+#   - não conseguiu nem conectar (ConnectTimeout);
+#   - o Telegram pediu para esperar (429, "muitas mensagens");
+#   - o Telegram respondeu com erro interno (5xx).
+# Se a mensagem foi enviada e a resposta só demorou, NÃO repete.
 
-    POR QUE INSISTE
-    ---------------
-    Antes era uma tentativa só, com 8 segundos de limite. O
-    cartão é enviado em DUAS chamadas: primeiro o sticker,
-    depois este texto. Quando o Telegram engasgava, o sticker
-    passava e o texto não — e o grupo recebia a seta PUT
-    sozinha, sem dizer o par nem a hora da entrada.
+ENVIADO = "enviado"      # o Telegram confirmou
+TALVEZ = "talvez"        # foi enviado, a confirmação não veio
+FALHOU = "falhou"        # certeza de que não chegou
+RECUSADO = "recusado"    # o Telegram recusou o conteúdo (400)
 
-    Era exatamente o defeito de dois stickers seguidos sem
-    cartão nenhum entre eles.
 
-    Agora tenta três vezes, com mais tempo, e espera um pouco
-    entre elas. Se mesmo assim falhar, quem chamou apaga o
-    sticker órfão.
-    """
+def _post_telegram(metodo, tentativas=3, **kwargs):
+    """Faz o pedido ao Telegram. Devolve (estado, json_ou_None)."""
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_BOT_TOKEN
-        + "/sendMessage"
-    )
+    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/" + metodo
 
     for numero in range(max(1, tentativas)):
 
-        try:
+        espera = 2
 
-            resposta = requests.post(
-                url,
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": mensagem,
-                    "parse_mode": "HTML",
-                },
-                timeout=15,
-            )
+        try:
+            # Arquivo precisa voltar ao começo a cada tentativa.
+            for arquivo in (kwargs.get("files") or {}).values():
+                try:
+                    arquivo.seek(0)
+                except Exception:
+                    pass
+
+            resposta = requests.post(url, timeout=(5, 20), **kwargs)
 
             if resposta.ok:
-                return True
+                try:
+                    return ENVIADO, resposta.json()
+                except Exception:
+                    return ENVIADO, None
 
-            # 400 é erro do texto (HTML quebrado, por exemplo).
-            # Insistir não adianta e só atrasa o próximo cartão.
             if resposta.status_code == 400:
-                print(
-                    "TELEGRAM: texto recusado (400) —",
-                    str(resposta.text)[:120],
-                )
-                return False
+                print("TELEGRAM:", metodo, "recusado (400) —", str(resposta.text)[:120])
+                return RECUSADO, None
+
+            if resposta.status_code == 429:
+                try:
+                    espera = int(resposta.json()["parameters"]["retry_after"])
+                except Exception:
+                    espera = 3
+                espera = max(1, min(espera, 15))
+            elif resposta.status_code < 500:
+                # 401, 403, 404...: insistir não resolve.
+                print("TELEGRAM:", metodo, "erro", resposta.status_code)
+                return FALHOU, None
+
+        except requests.exceptions.ConnectTimeout:
+            pass  # nem conectou: com certeza não chegou
+
+        except requests.exceptions.ReadTimeout:
+            # Enviou, mas a resposta não veio. Pode ter chegado.
+            # Repetir arriscaria duplicar no grupo.
+            print("TELEGRAM:", metodo, "sem confirmação — não vou repetir.")
+            return TALVEZ, None
 
         except Exception:
-            pass
+            # Conexão caiu no meio: também pode ter chegado.
+            return TALVEZ, None
 
-        # Última volta não precisa esperar.
         if numero < tentativas - 1:
-            time.sleep(2)
+            time.sleep(espera)
 
-    print("TELEGRAM: o texto do cartao nao foi entregue.")
-    return False
+    return FALHOU, None
+
+
+def _enviar_telegram_texto_sync(mensagem, tentativas=3):
+    """Manda o cartão de texto. Devolve ENVIADO, TALVEZ ou FALHOU."""
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return FALHOU
+
+    estado, _ = _post_telegram(
+        "sendMessage",
+        tentativas=tentativas,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": mensagem,
+            "parse_mode": "HTML",
+        },
+    )
+
+    if estado == FALHOU:
+        print("TELEGRAM: o texto do cartao nao foi entregue.")
+
+    return estado
 
 
 def _enviar_telegram_sticker_sync(caminho_imagem):
-    """Manda a imagem como STICKER (sem moldura, sem fundo
-    branco). É assim que o Telegram exibe imagem "colada" no
-    fundo do chat, em vez da caixa clara que sendPhoto sempre
-    desenha atrás da imagem.
+    """Manda a imagem como STICKER (sem moldura, sem fundo branco).
+
+    Devolve (estado, id_da_mensagem). O id serve para apagar o
+    sticker se o texto do cartão com certeza não chegar.
     """
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+        return FALHOU, None
 
     if not caminho_imagem or not os.path.isfile(caminho_imagem):
-        return False
+        return FALHOU, None
 
     try:
-
-        url = (
-            "https://api.telegram.org/bot"
-            + TELEGRAM_BOT_TOKEN
-            + "/sendSticker"
-        )
-
         with open(caminho_imagem, "rb") as arquivo_imagem:
-
-            resposta = requests.post(
-                url,
+            estado, dados = _post_telegram(
+                "sendSticker",
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"sticker": arquivo_imagem},
-                timeout=15,
             )
-
-        if not resposta.ok:
-            return False
-
-        # Devolve o ID da mensagem, e não apenas True.
-        #
-        # É com ele que dá para APAGAR o sticker caso o cartão
-        # de texto não chegue. Sem isso, um texto que falha
-        # deixa a seta sozinha no grupo para sempre.
-        try:
-            return resposta.json()["result"]["message_id"]
-        except Exception:
-            return True
-
     except Exception:
+        return FALHOU, None
 
-        return False
+    id_msg = None
+    if estado == ENVIADO and dados:
+        try:
+            id_msg = int(dados["result"]["message_id"])
+        except Exception:
+            id_msg = None
+
+    return estado, id_msg
 
 
 def _enviar_telegram_photo_sync(caminho_imagem):
@@ -247,36 +271,33 @@ def _apagar_mensagem_telegram(id_mensagem):
 
 
 def _enviar_cartao_telegram_sync(caminho_imagem, caption):
-    """Manda o ícone como STICKER primeiro (mensagem própria,
-    sem legenda — sticker não aceita legenda no Telegram) e
-    depois o cartão de texto, como mensagem separada logo em
-    seguida. É o mesmo padrão de duas mensagens do canal
-    original: ícone em cima, cartão embaixo.
+    """Ícone (sticker) primeiro, cartão de texto logo depois.
+
+    A IMAGEM SÓ VAI UMA VEZ
+    -----------------------
+    Antes, quando o sticker demorava a ser confirmado, o robô
+    mandava a mesma imagem de novo como foto — e o grupo via a
+    seta duas vezes. Agora a foto só é usada quando o Telegram
+    RECUSA o arquivo como sticker (erro 400), que é o único caso
+    em que é certo que a imagem não apareceu.
     """
 
     id_sticker = None
 
     if caminho_imagem and os.path.isfile(caminho_imagem):
 
-        enviado_como_sticker = _enviar_telegram_sticker_sync(
-            caminho_imagem
-        )
+        estado, id_sticker = _enviar_telegram_sticker_sync(caminho_imagem)
 
-        if enviado_como_sticker:
-            # Guardado para poder apagar se o texto não chegar.
-            if isinstance(enviado_como_sticker, int):
-                id_sticker = enviado_como_sticker
-        else:
+        if estado == RECUSADO:
             _enviar_telegram_photo_sync(caminho_imagem)
 
-    texto_entregue = _enviar_telegram_texto_sync(caption)
+    estado_texto = _enviar_telegram_texto_sync(caption)
 
-    # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA
-    #
-    # Se o texto não foi entregue nem depois de três
-    # tentativas, a seta sozinha só confunde: o aluno vê PUT e
-    # não sabe o par, a hora nem a força. Apaga.
-    if not texto_entregue and id_sticker:
+    # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA — mas só apaga quando é
+    # CERTO que o texto não chegou. Se a confirmação só atrasou, o
+    # texto provavelmente está no grupo, e apagar o ícone deixaria
+    # o cartão sem a imagem.
+    if estado_texto == FALHOU and id_sticker:
         _apagar_mensagem_telegram(id_sticker)
 
 
@@ -457,8 +478,43 @@ SEQUENCIA_TEMPO_MAXIMO = int(
 
 _sequencia_aberta = None
 
+# Folga depois que a vela do G2 fecha. Passou disso sem resultado,
+# a trava solta para o grupo não ficar mudo.
+SEQUENCIA_FOLGA = int(os.getenv("SEQUENCIA_FOLGA", "90"))
 
-def pode_enviar_sinal_agora(par=None, entrada_em=None):
+
+# ------------------------------------------------------------
+# QUEM PODE MANDAR SINAL PARA O GRUPO: SÓ O WORKER
+# ------------------------------------------------------------
+# A rota /candles é usada por DOIS lados: pelo worker (o robô do
+# grupo) e pelas páginas do site, toda vez que um aluno abre um
+# painel. Antes, QUALQUER uma dessas chamadas podia mandar sinal
+# para o Telegram.
+#
+# Por isso o grupo recebia:
+#   - sinal de CRIPTO, mesmo com a cripto tirada do Telegram —
+#     bastava um aluno abrir a página de cripto;
+#   - sinal de FOREX às 18h, misturado com o OTC — bastava um
+#     aluno abrir a página de mercado aberto.
+#
+# Agora só o worker manda. Ele marca a própria thread antes de
+# chamar a rota, e a rota confere essa marca.
+_contexto_tg = threading.local()
+
+
+def _chamada_do_worker():
+    return bool(getattr(_contexto_tg, "worker", False))
+
+
+def _entrada_da_tempo(entrada_em):
+    """A entrada ainda está no futuro, com tempo de o aluno ver?"""
+    try:
+        return int(entrada_em) - time.time() >= 10
+    except Exception:
+        return False
+
+
+def pode_enviar_sinal_agora(par=None, entrada_em=None, sinal=None):
     """True só se não houver sequência aberta e a espera
     mínima já tiver passado.
     """
@@ -475,7 +531,23 @@ def pode_enviar_sinal_agora(par=None, entrada_em=None):
 
             idade = agora - _sequencia_aberta["criado_em"]
 
-            if idade < SEQUENCIA_TEMPO_MAXIMO:
+            # A TRAVA AGORA SEGUE A VELA, NÃO O RELÓGIO DO ENVIO
+            #
+            # Antes soltava 240-300 s depois do envio do sinal. Só
+            # que o G2 fecha uns 240 s depois do envio — e o
+            # resultado ainda precisava ser conferido. A trava
+            # soltava ANTES do resultado sair, um sinal novo entrava
+            # no grupo, e o resultado do anterior chegava depois,
+            # no meio da operação nova. Era a "confusão" no grupo.
+            #
+            # Agora só solta 90 s depois que a vela do G2 FECHOU.
+            entrada_aberta = int(_sequencia_aberta.get("entrada_em") or 0)
+            if entrada_aberta:
+                livre = agora > entrada_aberta + 3 * TIMEFRAME + SEQUENCIA_FOLGA
+            else:
+                livre = idade >= SEQUENCIA_TEMPO_MAXIMO
+
+            if not livre:
                 return False
 
             # Passou do tempo máximo: provavelmente o resultado
@@ -505,7 +577,9 @@ def pode_enviar_sinal_agora(par=None, entrada_em=None):
             _sequencia_aberta = {
                 "par": str(par),
                 "entrada_em": int(entrada_em),
+                "sinal": str(sinal or "").upper(),
                 "criado_em": agora,
+                "conferidas": 0,
             }
 
         return True
@@ -1526,7 +1600,9 @@ def registrar_resultado_historico(par, entrada_em, sinal, resultado):
     if not _DB_PRONTO:
         return False
 
-    if resultado not in ("WIN", "LOSS"):
+    # EMPATE também é gravado: tira o sinal da fila de pendentes.
+    # As contas de taxa usam só WIN e LOSS, então não muda nada nelas.
+    if resultado not in ("WIN", "LOSS", "EMPATE"):
         return False
 
     try:
@@ -2101,6 +2177,17 @@ def normalizar_candle(candle):
 _velas_fechadas = {}
 _velas_fechadas_lock = threading.Lock()
 
+# FOLGA DEPOIS QUE A VELA FECHA
+#
+# Uma vela lida no segundo exato em que fecha pode vir com o
+# preço de fechamento ainda incompleto — faltando os últimos
+# negócios. Numa vela quase sem corpo, isso troca a cor: o
+# robô via vermelha, o gráfico mostrava verde, e o resultado
+# saía errado no grupo. Pior: ia para a memória e ficava lá.
+#
+# Agora a vela só conta como fechada 3 segundos depois.
+FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "3"))
+
 
 def guardar_velas_fechadas(par, velas, agora_ts):
     par = str(par or "").strip().upper()
@@ -2109,7 +2196,7 @@ def guardar_velas_fechadas(par, velas, agora_ts):
     with _velas_fechadas_lock:
         for v in velas:
             ini = v.get("from")
-            if ini and ini + 60 <= agora_ts:
+            if ini and ini + 60 + FOLGA_FECHAMENTO <= agora_ts:
                 _velas_fechadas[(par, int(ini))] = v
         # limpeza: guarda só as últimas ~3 horas
         if len(_velas_fechadas) > 30000:
@@ -2128,7 +2215,7 @@ def velas_da_memoria(par, inicio, quantas=3):
     with _velas_fechadas_lock:
         for k in range(quantas):
             ini = inicio + k * 60
-            if ini + 60 > agora_ts:
+            if ini + 60 + FOLGA_FECHAMENTO > agora_ts:
                 break                      # essa ainda não fechou: não precisa
             v = _velas_fechadas.get((par, ini))
             if v is None:
@@ -4103,7 +4190,7 @@ def resultado_sinal(par):
 
     # Espera o candle de entrada fechar. As durações maiores
     # (M2 e M3) voltam como null até que fechem também.
-    if time.time() < inicio_candle + TIMEFRAME:
+    if time.time() < inicio_candle + TIMEFRAME + FOLGA_FECHAMENTO:
 
         return jsonify({
             "par": par,
@@ -4213,8 +4300,8 @@ def resultado_sinal(par):
         if ultimo is None:
             return None
 
-        # Ainda não fechou.
-        if time.time() < ultimo["from"] + TIMEFRAME:
+        # Ainda não fechou (com folga).
+        if time.time() < ultimo["from"] + TIMEFRAME + FOLGA_FECHAMENTO:
             return None
 
         fechamento = ultimo["close"]
@@ -4262,8 +4349,8 @@ def resultado_sinal(par):
         if vela is None:
             return None
 
-        # Ainda não fechou.
-        if time.time() < vela["from"] + TIMEFRAME:
+        # Ainda não fechou (com folga).
+        if time.time() < vela["from"] + TIMEFRAME + FOLGA_FECHAMENTO:
             return None
 
         if vela["close"] > vela["open"]:
@@ -4293,7 +4380,13 @@ def resultado_sinal(par):
     #   - o resultado não cai no sinal errado.
     gravado = False
 
-    if m1 in ("WIN", "LOSS"):
+    # EMPATE NA ENTRADA
+    #
+    # Antes, se a vela de entrada fechava no mesmo preço, nada
+    # acontecia: nem WIN, nem LOSS, nem EMPATE. O grupo ficava
+    # com a entrada sem resultado nenhum, e a trava segurava o
+    # próximo sinal até soltar por tempo.
+    if m1 in ("WIN", "LOSS", "EMPATE"):
 
         # ----------------------------------------------------
         # LOSS SÓ DEPOIS DE PERDER AS TRÊS
@@ -4315,6 +4408,12 @@ def resultado_sinal(par):
 
         if m1 == "WIN":
             resultado_final = "WIN"
+            etapa_final = 0
+
+        elif m1 == "EMPATE":
+            # Vela de entrada sem movimento: o valor volta para o
+            # aluno, a operação acaba aqui, sem gale.
+            resultado_final = "EMPATE"
             etapa_final = 0
 
         elif g1 == "WIN":
@@ -4471,24 +4570,10 @@ def candles_par(par):
             # Adianta ANTES de gravar: é este horário que vai
             # para o banco, e é dele que o worker tira a vela
             # para conferir o resultado.
-            sinal_e_novo = registrar_sinal(par, analise_tg)
-            if (
-                sinal_e_novo
-                and analise_tg.get("sinal") in ("CALL", "PUT")
-                and pode_enviar_sinal_agora(
-                    par,
-                    analise_tg.get("entrada_em"),
-                )
-            ):
-                enviar_telegram_foto(
-                    escolher_imagem_sinal(analise_tg.get("sinal")),
-                    montar_caption_sinal(par, analise_tg),
-                )
-                marcar_avisado_telegram(
-                    par,
-                    analise_tg.get("entrada_em"),
-                    analise_tg.get("sinal"),
-                )
+            # Só registra. O grupo do Telegram é assunto do worker
+            # (ver _chamada_do_worker): esta rota é chamada pelas
+            # páginas do site e não pode mandar sinal.
+            registrar_sinal(par, analise_tg)
         except Exception:
             pass
 
@@ -5256,13 +5341,27 @@ def candles():
                 # pra rotação repetida do mesmo par/candle não
                 # mandar o mesmo sinal de novo.
                 try:
-                    sinal_e_novo = registrar_sinal(par, analise_tg)
+                    registrar_sinal(par, analise_tg)
+
+                    # Só o worker manda para o grupo. A página do
+                    # aluno só registra o sinal no banco.
+                    #
+                    # "Ainda não avisado" no lugar de "linha nova":
+                    # se um aluno registrou o sinal primeiro, o
+                    # worker ainda pode anunciá-lo.
                     if (
-                        sinal_e_novo
+                        _chamada_do_worker()
                         and analise_tg.get("sinal") in ("CALL", "PUT")
+                        and _entrada_da_tempo(analise_tg.get("entrada_em"))
+                        and not foi_avisado_telegram(
+                            par,
+                            analise_tg.get("entrada_em"),
+                            analise_tg.get("sinal"),
+                        )
                         and pode_enviar_sinal_agora(
                             par,
                             analise_tg.get("entrada_em"),
+                            analise_tg.get("sinal"),
                         )
                     ):
                         enviar_telegram_foto(
@@ -6351,7 +6450,11 @@ def _forex_no_horario():
 # sim, uma volta não. Para tirar do Telegram sem mexer no código:
 # CRIPTO_NO_TELEGRAM=0 no Render. O site continua mostrando
 # cripto de qualquer jeito — lá cada painel pede o seu mercado.
-CRIPTO_NO_TELEGRAM = os.getenv("CRIPTO_NO_TELEGRAM", "1") != "0"
+# Padrão DESLIGADO desde nov/2026: o produtor decidiu tirar a
+# cripto do grupo, porque os preços da cripto OTC variam entre
+# corretoras e o resultado não batia com o gráfico do aluno.
+# Para voltar: CRIPTO_NO_TELEGRAM=1 no Render.
+CRIPTO_NO_TELEGRAM = os.getenv("CRIPTO_NO_TELEGRAM", "0") == "1"
 
 _turno_cripto = False
 
@@ -6451,6 +6554,8 @@ def _processar_sinais_worker():
 
     mercado = _mercado_da_vez()
 
+    # Marca: esta chamada é do worker, pode mandar para o grupo.
+    _contexto_tg.worker = True
     try:
         with app.test_request_context(
             "/candles?mercado=" + mercado
@@ -6458,6 +6563,8 @@ def _processar_sinais_worker():
             resposta = candles()
     except Exception:
         return
+    finally:
+        _contexto_tg.worker = False
 
     if mercado != "forex":
         return
@@ -7175,6 +7282,7 @@ def iniciar_worker_automatico():
 
     if _worker_saudavel():
         _iniciar_manter_acordado()
+        _iniciar_acompanhante()
         return
 
     with _WORKER_LOCK:
@@ -7204,6 +7312,103 @@ def iniciar_worker_automatico():
             pass
 
     _iniciar_manter_acordado()
+    _iniciar_acompanhante()
+
+
+# ============================================================
+# ACOMPANHANTE — O RESULTADO SAI NA HORA CERTA
+# ============================================================
+#
+# O worker só roda de 3 em 3 minutos. O resultado de um sinal
+# do grupo dependia dessa volta (ou de um aluno com o painel
+# aberto). De madrugada, sem aluno, o LOSS ou o WIN 2G chegava
+# até 3 minutos atrasado — às vezes DEPOIS do sinal seguinte.
+#
+# Este acompanhante olha SÓ a operação aberta no grupo, a cada
+# 5 segundos, e confere assim que cada vela fecha:
+#
+#   vela de entrada fecha -> WIN?          manda já
+#   vela do G1 fecha      -> WIN 1G?       manda já
+#   vela do G2 fecha      -> WIN 2G / LOSS manda já
+#
+# É uma consulta pequena por vela (a memória de velas costuma
+# responder sem nem ir à corretora). A conferência é a MESMA do
+# resto do robô (resultado_sinal), e o banco garante que cada
+# resultado sai uma vez só.
+
+ACOMPANHANTE_INTERVALO = max(2, int(os.getenv("ACOMPANHANTE_INTERVALO", "5")))
+
+
+def _acompanhar_sequencia():
+    """Confere a operação aberta no grupo, se uma vela nova fechou."""
+
+    with _lock_espera_entrada:
+        aberta = dict(_sequencia_aberta) if _sequencia_aberta else None
+
+    if not aberta or aberta.get("sinal") not in ("CALL", "PUT"):
+        return
+
+    par = aberta["par"]
+    entrada = int(aberta["entrada_em"])
+    sinal = aberta["sinal"]
+
+    # Quantas velas da operação já fecharam (com folga): 0 a 3.
+    fechadas = int(
+        (time.time() - FOLGA_FECHAMENTO - entrada) // TIMEFRAME
+    )
+    fechadas = max(0, min(3, fechadas))
+
+    if fechadas < 1 or fechadas <= int(aberta.get("conferidas") or 0):
+        return
+
+    caminho = f"/resultado/{par}?inicio={entrada}&sinal={sinal}"
+
+    with app.test_request_context(caminho):
+        resposta = resultado_sinal(par)
+
+    dados = _ler_json_resposta(resposta) or {}
+
+    # Só marca como conferida se a conferência rodou de verdade.
+    # Falha de conexão ou vela ainda sem dado: tenta de novo daqui
+    # a 5 segundos.
+    if "m1" not in dados or dados.get("m1") is None:
+        return
+
+    with _lock_espera_entrada:
+        atual = _sequencia_aberta
+        if (
+            atual
+            and atual.get("par") == par
+            and int(atual.get("entrada_em") or 0) == entrada
+        ):
+            atual["conferidas"] = fechadas
+
+
+def _loop_acompanhante():
+    print("ACOMPANHANTE: conferindo a operação do grupo a cada",
+          ACOMPANHANTE_INTERVALO, "s")
+    while True:
+        time.sleep(ACOMPANHANTE_INTERVALO)
+        try:
+            _acompanhar_sequencia()
+        except Exception as erro:
+            print("ACOMPANHANTE: erro —", str(erro)[:120])
+
+
+def _iniciar_acompanhante():
+    try:
+        vivas = {t.name for t in threading.enumerate() if t.is_alive()}
+        if "dw-acompanhante" in vivas:
+            return
+        if not sou_o_dono_do_worker():
+            return
+        threading.Thread(
+            target=_loop_acompanhante,
+            name="dw-acompanhante",
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
 
 
 # ============================================================
