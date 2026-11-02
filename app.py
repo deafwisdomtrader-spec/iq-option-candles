@@ -506,6 +506,27 @@ def _chamada_do_worker():
     return bool(getattr(_contexto_tg, "worker", False))
 
 
+# ------------------------------------------------------------
+# AQUECIMENTO DEPOIS DE LIGAR
+# ------------------------------------------------------------
+# No plano pago, quando um app.py novo sobe, o Render liga a
+# versão NOVA antes de desligar a ANTIGA. Por um ou dois minutos
+# as duas rodam juntas — cada uma com o seu worker, a sua trava e
+# o seu banco. Em 02/11, às 13:32, foi exatamente isso: uma mandou
+# a entrada das 13:33, a outra a das 13:34, e o grupo viu o WIN da
+# 13:33 logo embaixo do sinal da 13:34.
+#
+# Agora o processo novo espera 3 minutos antes de mandar o
+# primeiro sinal. Até lá a versão antiga já foi desligada.
+# Ele analisa e grava normalmente; só não fala no grupo.
+TELEGRAM_AQUECIMENTO = int(os.getenv("TELEGRAM_AQUECIMENTO", "180"))
+_LIGADO_EM = time.time()
+
+
+def _aquecido():
+    return time.time() - _LIGADO_EM >= TELEGRAM_AQUECIMENTO
+
+
 def _entrada_da_tempo(entrada_em):
     """A entrada ainda está no futuro, com tempo de o aluno ver?"""
     try:
@@ -5351,6 +5372,7 @@ def candles():
                     # worker ainda pode anunciá-lo.
                     if (
                         _chamada_do_worker()
+                        and _aquecido()
                         and analise_tg.get("sinal") in ("CALL", "PUT")
                         and _entrada_da_tempo(analise_tg.get("entrada_em"))
                         and not foi_avisado_telegram(
