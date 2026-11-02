@@ -2086,6 +2086,57 @@ def normalizar_candle(candle):
 # BUSCAR CANDLES
 # ============================================================
 
+# ============================================================
+# MEMÓRIA DE VELAS FECHADAS (resultado RÁPIDO)
+# ============================================================
+# Toda busca de velas M1 que o robô faz para analisar os pares
+# guarda aqui as velas que JÁ FECHARAM. Quando o painel pergunta
+# "deu WIN ou LOSS?", a resposta sai daqui na hora, sem pedir
+# de novo à corretora e sem esperar na fila das análises.
+#
+# Antes cada painel de cada aluno fazia uma consulta própria à
+# corretora para a MESMA vela. Com muitos alunos, a fila crescia
+# e o "Conferindo o resultado..." demorava muito.
+# Vela fechada não muda mais, então guardar é seguro.
+_velas_fechadas = {}
+_velas_fechadas_lock = threading.Lock()
+
+
+def guardar_velas_fechadas(par, velas, agora_ts):
+    par = str(par or "").strip().upper()
+    if not par or not velas:
+        return
+    with _velas_fechadas_lock:
+        for v in velas:
+            ini = v.get("from")
+            if ini and ini + 60 <= agora_ts:
+                _velas_fechadas[(par, int(ini))] = v
+        # limpeza: guarda só as últimas ~3 horas
+        if len(_velas_fechadas) > 30000:
+            limite = agora_ts - 3 * 3600
+            for chave in [k for k in _velas_fechadas if k[1] < limite]:
+                _velas_fechadas.pop(chave, None)
+
+
+def velas_da_memoria(par, inicio, quantas=3):
+    """Devolve as velas [inicio, inicio+60, ...] que já fecharam,
+    se TODAS as que já deviam ter fechado estiverem na memória.
+    Senão devolve None (aí busca na corretora como antes)."""
+    par = str(par or "").strip().upper()
+    agora_ts = time.time()
+    lista = []
+    with _velas_fechadas_lock:
+        for k in range(quantas):
+            ini = inicio + k * 60
+            if ini + 60 > agora_ts:
+                break                      # essa ainda não fechou: não precisa
+            v = _velas_fechadas.get((par, ini))
+            if v is None:
+                return None
+            lista.append(v)
+    return lista or None
+
+
 def buscar_candles(
     iq,
     par,
@@ -2137,6 +2188,13 @@ def buscar_candles(
     resultado.sort(
         key=lambda item: item["from"]
     )
+
+    # Guarda as velas M1 já fechadas (resultado rápido).
+    if (tf or TIMEFRAME) == 60:
+        try:
+            guardar_velas_fechadas(par, resultado, float(timestamp))
+        except Exception:
+            pass
 
     # BATIMENTO DE SAÚDE
     #
@@ -4053,61 +4111,71 @@ def resultado_sinal(par):
             "mensagem": "candle ainda nao fechou",
         })
 
-    try:
+    # RESULTADO RÁPIDO: a vela já está na memória (o robô acabou
+    # de buscar para analisar os pares)? Responde na hora.
+    candles = None
+    if TIMEFRAME == 60:
+        try:
+            candles = velas_da_memoria(par, inicio_candle, 3)
+        except Exception:
+            candles = None
 
-        iq = conectar_com_timeout()
+    if candles is None:
+        try:
 
-        # ----------------------------------------------------
-        # REMENDO 3 — SÓ AS VELAS NECESSÁRIAS
-        # ----------------------------------------------------
-        # Antes pedia sempre 100 velas (CANDLE_COUNT). Uma
-        # entrada de 3 minutos atrás precisa de umas 10 — as
-        # outras 90 eram tempo e banda jogados fora, disputando
-        # a MESMA conexão que os cards que o aluno está olhando
-        # na tela. Era uma das causas do painel travar em
-        # "BUSCANDO DADOS".
-        #
-        # Pendentes velhos (o worker às vezes pega um de meia
-        # hora atrás) continuam recebendo o suficiente para
-        # alcançar a vela, até o teto de 100.
-        #
-        # A folga de 8 cobre o G1 e o G2, que ficam depois da
-        # vela de entrada.
-        idade_velas = int(
-            (time.time() - inicio_candle) / TIMEFRAME
-        )
+            iq = conectar_com_timeout()
 
-        velas_necessarias = max(
-            20,
-            min(CANDLE_COUNT, idade_velas + 8)
-        )
+            # ----------------------------------------------------
+            # REMENDO 3 — SÓ AS VELAS NECESSÁRIAS
+            # ----------------------------------------------------
+            # Antes pedia sempre 100 velas (CANDLE_COUNT). Uma
+            # entrada de 3 minutos atrás precisa de umas 10 — as
+            # outras 90 eram tempo e banda jogados fora, disputando
+            # a MESMA conexão que os cards que o aluno está olhando
+            # na tela. Era uma das causas do painel travar em
+            # "BUSCANDO DADOS".
+            #
+            # Pendentes velhos (o worker às vezes pega um de meia
+            # hora atrás) continuam recebendo o suficiente para
+            # alcançar a vela, até o teto de 100.
+            #
+            # A folga de 8 cobre o G1 e o G2, que ficam depois da
+            # vela de entrada.
+            idade_velas = int(
+                (time.time() - inicio_candle) / TIMEFRAME
+            )
 
-        # Timeout curto: esta rota é chamada em segundo plano
-        # e não pode competir com a busca dos cards, que é o
-        # que o usuário está esperando na tela.
-        candles = buscar_candles_com_timeout(
-            iq,
-            par,
-            velas_necessarias,
-            timeout_segundos=8
-        )
+            velas_necessarias = max(
+                20,
+                min(CANDLE_COUNT, idade_velas + 8)
+            )
 
-    except Exception as erro:
+            # Timeout curto: esta rota é chamada em segundo plano
+            # e não pode competir com a busca dos cards, que é o
+            # que o usuário está esperando na tela.
+            candles = buscar_candles_com_timeout(
+                iq,
+                par,
+                velas_necessarias,
+                timeout_segundos=8
+            )
 
-        invalidar_conexao()
+        except Exception as erro:
 
-        # Devolve 200, não 502.
-        #
-        # O 502 fazia o PHP responder "Falha ao consultar o
-        # servidor", sem status nenhum, e o painel repetia a
-        # mesma consulta indefinidamente. Com 200 + status
-        # INDISPONIVEL o front entende que houve falha
-        # temporária e passa para o próximo pendente.
-        return jsonify({
-            "par": par,
-            "status": "INDISPONIVEL",
-            "mensagem": str(erro)[:120],
-        }), 200
+            invalidar_conexao()
+
+            # Devolve 200, não 502.
+            #
+            # O 502 fazia o PHP responder "Falha ao consultar o
+            # servidor", sem status nenhum, e o painel repetia a
+            # mesma consulta indefinidamente. Com 200 + status
+            # INDISPONIVEL o front entende que houve falha
+            # temporária e passa para o próximo pendente.
+            return jsonify({
+                "par": par,
+                "status": "INDISPONIVEL",
+                "mensagem": str(erro)[:120],
+            }), 200
 
     por_inicio = {
         c.get("from"): c
