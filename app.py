@@ -149,17 +149,23 @@ def _post_telegram(metodo, tentativas=3, **kwargs):
     return FALHOU, None
 
 
-def _enviar_telegram_texto_sync(mensagem, tentativas=3):
-    """Manda o cartão de texto. Devolve ENVIADO, TALVEZ ou FALHOU."""
+def _enviar_telegram_texto_sync(mensagem, tentativas=3, chat_id=None):
+    """Manda o cartão de texto. Devolve ENVIADO, TALVEZ ou FALHOU.
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    chat_id: grupo de destino. Sem ele, vai para o grupo principal
+    (TELEGRAM_CHAT_ID). O grupo grátis passa o dele.
+    """
+
+    chat = chat_id or TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not chat:
         return FALHOU
 
     estado, _ = _post_telegram(
         "sendMessage",
         tentativas=tentativas,
         json={
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": chat,
             "text": mensagem,
             "parse_mode": "HTML",
         },
@@ -171,14 +177,16 @@ def _enviar_telegram_texto_sync(mensagem, tentativas=3):
     return estado
 
 
-def _enviar_telegram_sticker_sync(caminho_imagem):
+def _enviar_telegram_sticker_sync(caminho_imagem, chat_id=None):
     """Manda a imagem como STICKER (sem moldura, sem fundo branco).
 
     Devolve (estado, id_da_mensagem). O id serve para apagar o
     sticker se o texto do cartão com certeza não chegar.
     """
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    chat = chat_id or TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not chat:
         return FALHOU, None
 
     if not caminho_imagem or not os.path.isfile(caminho_imagem):
@@ -188,7 +196,7 @@ def _enviar_telegram_sticker_sync(caminho_imagem):
         with open(caminho_imagem, "rb") as arquivo_imagem:
             estado, dados = _post_telegram(
                 "sendSticker",
-                data={"chat_id": TELEGRAM_CHAT_ID},
+                data={"chat_id": chat},
                 files={"sticker": arquivo_imagem},
             )
     except Exception:
@@ -204,14 +212,16 @@ def _enviar_telegram_sticker_sync(caminho_imagem):
     return estado, id_msg
 
 
-def _enviar_telegram_photo_sync(caminho_imagem):
+def _enviar_telegram_photo_sync(caminho_imagem, chat_id=None):
     """Reserva: só usado se o arquivo for rejeitado como
     sticker (ex: não bate com o tamanho/tipo exigido pelo
     Telegram). Melhor a imagem chegar com moldura do que não
     chegar de jeito nenhum.
     """
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    chat = chat_id or TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not chat:
         return False
 
     try:
@@ -226,7 +236,7 @@ def _enviar_telegram_photo_sync(caminho_imagem):
 
             resposta = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID},
+                data={"chat_id": chat},
                 files={"photo": arquivo_imagem},
                 timeout=8,
             )
@@ -238,7 +248,7 @@ def _enviar_telegram_photo_sync(caminho_imagem):
         return False
 
 
-def _apagar_mensagem_telegram(id_mensagem):
+def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
     """Apaga uma mensagem já enviada ao grupo.
 
     Usado só num caso: o sticker foi entregue mas o cartão de
@@ -247,7 +257,9 @@ def _apagar_mensagem_telegram(id_mensagem):
     entrar.
     """
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    chat = chat_id or TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not chat:
         return False
 
     if not isinstance(id_mensagem, int):
@@ -259,7 +271,7 @@ def _apagar_mensagem_telegram(id_mensagem):
             + TELEGRAM_BOT_TOKEN
             + "/deleteMessage",
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": chat,
                 "message_id": id_mensagem,
             },
             timeout=10,
@@ -270,7 +282,7 @@ def _apagar_mensagem_telegram(id_mensagem):
         return False
 
 
-def _enviar_cartao_telegram_sync(caminho_imagem, caption):
+def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
     """Ícone (sticker) primeiro, cartão de texto logo depois.
 
     A IMAGEM SÓ VAI UMA VEZ
@@ -286,19 +298,21 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption):
 
     if caminho_imagem and os.path.isfile(caminho_imagem):
 
-        estado, id_sticker = _enviar_telegram_sticker_sync(caminho_imagem)
+        estado, id_sticker = _enviar_telegram_sticker_sync(
+            caminho_imagem, chat_id=chat_id
+        )
 
         if estado == RECUSADO:
-            _enviar_telegram_photo_sync(caminho_imagem)
+            _enviar_telegram_photo_sync(caminho_imagem, chat_id=chat_id)
 
-    estado_texto = _enviar_telegram_texto_sync(caption)
+    estado_texto = _enviar_telegram_texto_sync(caption, chat_id=chat_id)
 
     # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA — mas só apaga quando é
     # CERTO que o texto não chegou. Se a confirmação só atrasou, o
     # texto provavelmente está no grupo, e apagar o ícone deixaria
     # o cartão sem a imagem.
     if estado_texto == FALHOU and id_sticker:
-        _apagar_mensagem_telegram(id_sticker)
+        _apagar_mensagem_telegram(id_sticker, chat_id=chat_id)
 
 
 # Quantos cartoes podem estar esperando na fila.
@@ -311,13 +325,15 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption):
 # Com teto, cartao velho demais e descartado em vez de sair
 # atrasado. Melhor nao mandar do que mandar uma entrada que ja
 # passou da hora.
-_FILA_TELEGRAM_MAXIMA = 4
+# Era 4. Com o grupo grátis, um sinal pode virar 3 cartões de uma
+# vez (grupo pago + cabeçalho da lista + grupo grátis).
+_FILA_TELEGRAM_MAXIMA = 7
 
 _fila_telegram = 0
 _lock_fila_telegram = threading.Lock()
 
 
-def enviar_telegram_foto(caminho_imagem, caption):
+def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
     """Dispara o envio (sticker + cartão) em segundo plano,
     sem travar a rota.
     """
@@ -337,7 +353,7 @@ def enviar_telegram_foto(caminho_imagem, caption):
     def _tarefa():
         global _fila_telegram
         try:
-            _enviar_cartao_telegram_sync(caminho_imagem, caption)
+            _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id)
         finally:
             with _lock_fila_telegram:
                 _fila_telegram -= 1
@@ -347,6 +363,251 @@ def enviar_telegram_foto(caminho_imagem, caption):
     except Exception:
         with _lock_fila_telegram:
             _fila_telegram -= 1
+
+
+# ============================================================
+# GRUPO GRÁTIS — 3 LISTAS DE 5 SINAIS POR DIA
+# ============================================================
+#
+# Um segundo grupo do Telegram, aberto, para atrair alunos.
+# Ele NÃO tem robô próprio: recebe uma CÓPIA dos sinais do grupo
+# pago, mas só os 5 primeiros de cada período:
+#
+#   LISTA DA MANHÃ  -> 5 sinais a partir das 09:00
+#   LISTA DA TARDE  -> 5 sinais a partir das 15:00
+#   LISTA DA NOITE  -> 5 sinais a partir das 20:00
+#
+# Cada sinal leva o resultado (WIN, WIN 1G, WIN 2G, LOSS ou
+# EMPATE), com o mesmo sticker do grupo pago. Quando os 5
+# resultados saem, vai um resumo da lista.
+#
+# Como é uma cópia, vale tudo o que vale no grupo pago: um par
+# por vez, resultado na hora, sem cripto (se ela estiver fora).
+#
+# CONFIGURAÇÃO NO RENDER (Environment)
+#
+#   TELEGRAM_CHAT_ID_GRATIS  -> id do grupo grátis (ex.: -1001234567890)
+#                               Sem ele, nada vai para o grupo grátis.
+#   GRATIS_HORARIOS          -> horas de início (padrão "9,15,20")
+#   GRATIS_POR_LISTA         -> sinais por lista (padrão 5)
+#   GRATIS_JANELA_MIN        -> minutos para juntar os sinais da
+#                               lista (padrão 60). Se em 1 hora não
+#                               saírem 5, a lista fecha com os que
+#                               saíram.
+#
+# O BOT precisa ser ADMINISTRADOR do grupo grátis, com permissão
+# de enviar e apagar mensagens.
+
+TELEGRAM_CHAT_ID_GRATIS = (os.getenv("TELEGRAM_CHAT_ID_GRATIS") or "").strip()
+
+GRATIS_HORARIOS = sorted({
+    int(h) for h in os.getenv("GRATIS_HORARIOS", "9,15,20").split(",")
+    if h.strip().isdigit() and 0 <= int(h) <= 23
+})
+
+GRATIS_POR_LISTA = max(1, int(os.getenv("GRATIS_POR_LISTA", "5")))
+
+GRATIS_JANELA_MIN = max(10, int(os.getenv("GRATIS_JANELA_MIN", "60")))
+
+# Depois que a janela fecha, quanto esperar por um resultado que
+# não veio antes de mandar o resumo assim mesmo.
+GRATIS_ESPERA_RESUMO = 600
+
+_gratis = {}
+_gratis_lock = threading.Lock()
+
+
+def _nome_lista(hora):
+    if hora < 12:
+        return "DA MANHÃ"
+    if hora < 18:
+        return "DA TARDE"
+    return "DA NOITE"
+
+
+def _janela_gratis_atual(agora=None):
+    """(chave, inicio_ts, hora) da lista aberta agora, ou None."""
+
+    if not TELEGRAM_CHAT_ID_GRATIS:
+        return None
+
+    agora_ts = time.time() if agora is None else agora
+    agora_dt = datetime.fromtimestamp(agora_ts, tz=FUSO_BR)
+
+    for hora in GRATIS_HORARIOS:
+        inicio = agora_dt.replace(hour=hora, minute=0, second=0, microsecond=0)
+        passou = agora_ts - inicio.timestamp()
+        if 0 <= passou < GRATIS_JANELA_MIN * 60:
+            chave = inicio.date().isoformat() + "|" + f"{hora:02d}"
+            return chave, int(inicio.timestamp()), hora
+
+    return None
+
+
+def gratis_ao_enviar_sinal(par, analise):
+    """Chamado logo depois que um sinal vai ao grupo pago."""
+
+    janela = _janela_gratis_atual()
+
+    if not janela:
+        return
+
+    chave_j, inicio_ts, hora = janela
+
+    try:
+        chave_s = (str(par), int(analise.get("entrada_em")), str(analise.get("sinal")))
+    except Exception:
+        return
+
+    with _gratis_lock:
+
+        lista = _gratis.setdefault(chave_j, {
+            "inicio": inicio_ts,
+            "hora": hora,
+            "sinais": [],
+            "resultados": {},
+            "resumo": False,
+        })
+
+        if chave_s in lista["sinais"]:
+            return
+
+        if len(lista["sinais"]) >= GRATIS_POR_LISTA:
+            return
+
+        lista["sinais"].append(chave_s)
+        numero = len(lista["sinais"])
+
+    nome = _nome_lista(hora)
+    dia = datetime.fromtimestamp(inicio_ts, tz=FUSO_BR).strftime("%d/%m")
+
+    if numero == 1:
+        enviar_telegram_foto(
+            None,
+            f"📋 <b>LISTA {nome}</b> · {dia}\n"
+            "────────────\n"
+            f"🎁 {GRATIS_POR_LISTA} sinais grátis a partir das {hora:02d}:00\n"
+            "⏱ Duração M1 · Martingale até G2 (opcional)\n"
+            "📌 Cada sinal chega com o horário de entrada, e o\n"
+            "resultado sai logo depois.\n\n"
+            "⚠️ <i>Alerta técnico e educacional.</i>",
+            chat_id=TELEGRAM_CHAT_ID_GRATIS,
+        )
+
+    caption = (
+        montar_caption_sinal(par, analise)
+        + f"\n\n🎁 Lista {nome.lower()} · sinal {numero} de {GRATIS_POR_LISTA}"
+    )
+
+    enviar_telegram_foto(
+        escolher_imagem_sinal(analise.get("sinal")),
+        caption,
+        chat_id=TELEGRAM_CHAT_ID_GRATIS,
+    )
+
+
+def gratis_ao_enviar_resultado(par, entrada_em, sinal, final, etapa, imagem, caption):
+    """Chamado logo depois que um resultado vai ao grupo pago."""
+
+    if not TELEGRAM_CHAT_ID_GRATIS:
+        return
+
+    chave_s = (str(par), int(entrada_em), str(sinal))
+    alvo = None
+
+    with _gratis_lock:
+        for chave_j, lista in _gratis.items():
+            if chave_s in lista["sinais"] and chave_s not in lista["resultados"]:
+                lista["resultados"][chave_s] = (final, int(etapa or 0))
+                alvo = chave_j
+                break
+
+    if not alvo:
+        return
+
+    enviar_telegram_foto(imagem, caption, chat_id=TELEGRAM_CHAT_ID_GRATIS)
+
+    _gratis_talvez_resumo(alvo)
+
+
+def _gratis_talvez_resumo(chave_j):
+    """Manda o resumo da lista quando ela terminou."""
+
+    agora = time.time()
+
+    with _gratis_lock:
+
+        lista = _gratis.get(chave_j)
+
+        if not lista or lista["resumo"] or not lista["sinais"]:
+            return
+
+        enviados = len(lista["sinais"])
+        prontos = len(lista["resultados"])
+        fim_janela = lista["inicio"] + GRATIS_JANELA_MIN * 60
+
+        completa = enviados >= GRATIS_POR_LISTA and prontos >= enviados
+        janela_fechou = agora >= fim_janela and prontos >= enviados
+        desistiu = agora >= fim_janela + GRATIS_ESPERA_RESUMO
+
+        if not (completa or janela_fechou or desistiu):
+            return
+
+        lista["resumo"] = True
+        sinais = list(lista["sinais"])
+        resultados = dict(lista["resultados"])
+        hora = lista["hora"]
+        inicio = lista["inicio"]
+
+    linhas = []
+    wins = losses = 0
+
+    for par, entrada, sinal in sinais:
+
+        final, etapa = resultados.get((par, entrada, sinal), (None, 0))
+        hora_txt = datetime.fromtimestamp(entrada, tz=FUSO_BR).strftime("%H:%M")
+
+        if final == "WIN":
+            marca = "✅" + (f" G{etapa}" if etapa else "")
+            wins += 1
+        elif final == "LOSS":
+            marca = "❌"
+            losses += 1
+        elif final == "EMPATE":
+            marca = "⚪ empate"
+        else:
+            marca = "⏳ sem resultado"
+
+        linhas.append(f"{hora_txt}  {nome_bonito(par)}  {sinal}  {marca}")
+
+    dia = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%d/%m")
+
+    texto = (
+        f"📊 <b>RESULTADO DA LISTA {_nome_lista(hora)}</b> · {dia}\n"
+        "────────────\n"
+        + "\n".join(linhas)
+        + "\n────────────\n"
+        + f"✅ Wins: {wins}   ❌ Losses: {losses}\n\n"
+        "<i>Resultado com gale, do jeito que saiu aqui no grupo. "
+        "Não é garantia de resultado futuro.</i>"
+    )
+
+    enviar_telegram_foto(None, texto, chat_id=TELEGRAM_CHAT_ID_GRATIS)
+
+
+def gratis_fechar_listas():
+    """Chamado pelo worker: fecha listas que acabaram e limpa as velhas."""
+
+    if not TELEGRAM_CHAT_ID_GRATIS:
+        return
+
+    for chave in list(_gratis.keys()):
+        _gratis_talvez_resumo(chave)
+
+    limite = time.time() - 2 * 86400
+    with _gratis_lock:
+        for chave in [c for c, l in _gratis.items() if l["inicio"] < limite]:
+            _gratis.pop(chave, None)
 
 
 # ------------------------------------------------------------
@@ -4520,6 +4781,17 @@ def resultado_sinal(par):
                             etapa_final,
                         )
                         enviar_telegram_foto(imagem, caption)
+
+                        # O mesmo resultado no grupo grátis, se
+                        # este sinal fez parte de uma lista.
+                        try:
+                            gratis_ao_enviar_resultado(
+                                par, inicio_candle, sinal,
+                                resultado_final, etapa_final,
+                                imagem, caption,
+                            )
+                        except Exception as erro:
+                            print("GRATIS: resultado não copiado —", str(erro)[:120])
                     except Exception:
                         pass
 
@@ -5395,6 +5667,13 @@ def candles():
                             analise_tg.get("entrada_em"),
                             analise_tg.get("sinal"),
                         )
+
+                        # Cópia para o grupo grátis, se estiver
+                        # num horário de lista e ela não tiver 5.
+                        try:
+                            gratis_ao_enviar_sinal(par, analise_tg)
+                        except Exception as erro:
+                            print("GRATIS: sinal não copiado —", str(erro)[:120])
                 except Exception:
                     pass
 
@@ -7231,6 +7510,12 @@ def _loop_worker(geracao=0):
         except Exception:
             pass
 
+        # Fecha as listas do grupo grátis que já terminaram.
+        try:
+            gratis_fechar_listas()
+        except Exception:
+            pass
+
         # Vigia: roda a cada volta, mas só age de hora em hora.
         try:
             vigia_hora_em_hora()
@@ -7879,6 +8164,15 @@ def _bloco_telegram():
         "linhas": [
             ("Token do bot", "configurado" if tem_token else "FALTANDO"),
             ("Grupo (chat id)", "configurado" if tem_chat else "FALTANDO"),
+            (
+                "Grupo grátis",
+                (
+                    "ligado · listas às "
+                    + ", ".join(f"{h}h" for h in _g("GRATIS_HORARIOS", []))
+                )
+                if _g("TELEGRAM_CHAT_ID_GRATIS")
+                else "desligado (falta TELEGRAM_CHAT_ID_GRATIS)",
+            ),
             ("Imagens faltando", ", ".join(faltando) if faltando else "nenhuma"),
             ("Cartões na fila", str(_g("_fila_telegram", 0))),
             (
