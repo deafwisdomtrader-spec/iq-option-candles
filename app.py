@@ -8799,6 +8799,30 @@ except Exception as _erro_auditor:
     print("AUDITOR: não carregou —", _erro_auditor)
 
 
+# ============================================================
+# MT4 -> TELEGRAM (rota /mt4/sinal)
+# ============================================================
+# O EA DWT_EnviarSinais (MetaTrader 4) manda os sinais dos
+# indicadores DWT para ca, e daqui vao para o Telegram com as
+# mesmas imagens do robo. O codigo fica no mt4.py, ao lado deste.
+# Mesmo esquema do auditor: se o mt4.py faltar ou der erro,
+# o robo continua funcionando normal.
+try:
+    from mt4 import criar_mt4
+
+    app.register_blueprint(
+        criar_mt4(
+            enviar_foto=enviar_telegram_foto,
+            imagens=IMAGENS_TELEGRAM,
+            nome_bonito=nome_bonito,
+            chat_vip=TELEGRAM_CHAT_ID,
+            chat_gratis=TELEGRAM_CHAT_ID_GRATIS,
+        )
+    )
+    print("MT4: ligado em /mt4/sinal")
+except Exception as _erro_mt4:
+    print("MT4: não carregou —", _erro_mt4)
+
 if __name__ == "__main__":
 
     porta = int(
