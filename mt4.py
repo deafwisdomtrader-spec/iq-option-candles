@@ -114,13 +114,16 @@ def criar_mt4(enviar_foto, imagens, nome_bonito, chat_vip, chat_gratis):
         sinal = d["direcao"]
         emoji = "🟢" if sinal == "CALL" else "🔴"
         ind = NOMES_INDICADOR.get(d["indicador"], d["indicador"])
+        linha = d.get("linha") or ""
         return (
             f"{emoji} <b>{sinal} CONFIRMADO</b> · {_par_bonito(d['par'])}\n"
             "────────────\n"
             f"🏛 Mercado  {_mercado(d['par'])}\n"
             f"⏰ Entrada  {_hora(d['entrada'])}\n"
             f"⏱ Duração  M{d['tf']}\n\n"
-            f"📊 Indicador  {ind} (MT4)\n\n"
+            f"📊 Indicador  {ind} (MT4)\n"
+            + (f"📍 Na linha  {linha}\n" if linha else "")
+            + "\n"
             "🔁 Martingale: até G2 (opcional)\n"
             "⚠️ <i>Alerta técnico e educacional.</i>"
         )
@@ -216,7 +219,8 @@ def criar_mt4(enviar_foto, imagens, nome_bonito, chat_vip, chat_gratis):
         if tipo == "sinal" and time.time() - entrada > 600:
             return jsonify({"ok": False, "erro": "sinal velho, nao enviado"}), 200
 
-        dados = {"par": par, "direcao": direcao, "tf": tf, "indicador": indicador, "entrada": entrada}
+        dados = {"par": par, "direcao": direcao, "tf": tf, "indicador": indicador, "entrada": entrada,
+                 "linha": str(d.get("linha") or "")[:40]}
 
         if tipo == "sinal":
             chave = f"S|{par}|{entrada}|{indicador}"
