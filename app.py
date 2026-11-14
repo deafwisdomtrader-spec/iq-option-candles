@@ -447,6 +447,13 @@ def _janela_gratis_atual(agora=None):
 def gratis_ao_enviar_sinal(par, analise):
     """Chamado logo depois que um sinal vai ao grupo pago."""
 
+    # Se o 1º sinal da lista sair antes da volta do worker, o aviso
+    # animado vai na frente dele (a fila do Telegram é uma só).
+    try:
+        gratis_aviso_inicio()
+    except Exception:
+        pass
+
     janela = _janela_gratis_atual()
 
     if not janela:
@@ -608,6 +615,133 @@ def gratis_fechar_listas():
     with _gratis_lock:
         for chave in [c for c, l in _gratis.items() if l["inicio"] < limite]:
             _gratis.pop(chave, None)
+
+
+# ------------------------------------------------------------
+# AVISO ANIMADO NA HORA DE CADA LISTA (09:00, 15:00, 20:00)
+# ------------------------------------------------------------
+# Quando bate a hora da lista, o grupo grátis recebe um vídeo
+# curto (aparece como GIF) com "COMEÇOU AGORA!" piscando. Ele sai
+# na HORA CERTA, antes do primeiro sinal da lista.
+#
+# Sai UMA vez por lista: a marca fica no banco (a mesma tabela do
+# relatório da sessão), então reiniciar o Render não repete.
+#
+# Se o servidor estava fora do ar na hora, só manda se ainda
+# estiver nos primeiros GRATIS_AVISO_MIN minutos. Aviso de
+# "começou agora" chegando 20 minutos depois só confunde.
+#
+# Arquivos na raiz, ao lado das imagens .webp:
+#   aviso_lista_manha.mp4   (lista das 09:00)
+#   aviso_lista_tarde.mp4   (lista das 15:00)
+#   aviso_lista_noite.mp4   (lista das 20:00)
+# Sem o arquivo, vai só o texto.
+#
+# CONFIGURAÇÃO NO RENDER (Environment)
+#   GRATIS_AVISO       -> "0" desliga o aviso (padrão ligado)
+#   GRATIS_AVISO_MIN   -> minutos de tolerância (padrão 5)
+
+GRATIS_AVISO = os.getenv("GRATIS_AVISO", "1").strip() != "0"
+GRATIS_AVISO_MIN = max(1, int(os.getenv("GRATIS_AVISO_MIN", "5")))
+
+# Reserva para quando o banco não estiver pronto.
+_gratis_avisos_memoria = set()
+
+
+def _arquivo_aviso_lista(hora):
+    if hora < 12:
+        nome = "manha"
+    elif hora < 18:
+        nome = "tarde"
+    else:
+        nome = "noite"
+    return os.path.join(DIRETORIO_APP, f"aviso_lista_{nome}.mp4")
+
+
+def _enviar_aviso_lista_sync(hora, legenda):
+    """Manda o vídeo do aviso. Se o vídeo falhar, manda só o texto."""
+
+    caminho = _arquivo_aviso_lista(hora)
+
+    if os.path.isfile(caminho):
+        try:
+            with open(caminho, "rb") as arquivo:
+                estado, _ = _post_telegram(
+                    "sendAnimation",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID_GRATIS,
+                        "caption": legenda,
+                        "parse_mode": "HTML",
+                        "width": 720,
+                        "height": 720,
+                    },
+                    files={
+                        "animation": (
+                            os.path.basename(caminho), arquivo, "video/mp4"
+                        )
+                    },
+                )
+            # TALVEZ = pode ter chegado. Mandar o texto também
+            # arriscaria aviso duplicado no grupo.
+            if estado in (ENVIADO, TALVEZ):
+                return
+        except Exception:
+            pass
+
+    _enviar_telegram_texto_sync(legenda, chat_id=TELEGRAM_CHAT_ID_GRATIS)
+
+
+def _marcar_aviso_lista(chave):
+    """True só na primeira vez que esta lista é avisada."""
+
+    if _DB_PRONTO:
+        return _marcar_relatorio_enviado("aviso_gratis|" + chave)
+
+    with _gratis_lock:
+        if chave in _gratis_avisos_memoria:
+            return False
+        _gratis_avisos_memoria.add(chave)
+        if len(_gratis_avisos_memoria) > 60:
+            _gratis_avisos_memoria.clear()
+            _gratis_avisos_memoria.add(chave)
+        return True
+
+
+def gratis_aviso_inicio():
+    """Chamado pelo worker: na hora de cada lista, manda o aviso."""
+
+    if not TELEGRAM_CHAT_ID_GRATIS or not TELEGRAM_BOT_TOKEN or not GRATIS_AVISO:
+        return
+
+    agora_ts = time.time()
+    agora_dt = datetime.fromtimestamp(agora_ts, tz=FUSO_BR)
+
+    for hora in GRATIS_HORARIOS:
+
+        inicio = agora_dt.replace(hour=hora, minute=0, second=0, microsecond=0)
+        passou = agora_ts - inicio.timestamp()
+
+        if not (0 <= passou < GRATIS_AVISO_MIN * 60):
+            continue
+
+        chave = inicio.date().isoformat() + "|" + f"{hora:02d}"
+
+        # Marca ANTES de enviar, igual ao relatório: nunca duas vezes.
+        if not _marcar_aviso_lista(chave):
+            continue
+
+        nome = _nome_lista(hora)
+        legenda = (
+            f"🔔 <b>A LISTA {nome} COMEÇOU!</b>\n"
+            f"🎁 {GRATIS_POR_LISTA} sinais grátis a partir de agora · M1\n"
+            "👀 Fique atento e deixe a corretora aberta!"
+        )
+
+        try:
+            _executor_telegram.submit(_enviar_aviso_lista_sync, hora, legenda)
+            print("GRATIS: aviso da lista", nome, "enviado.")
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------
@@ -7507,6 +7641,12 @@ def _loop_worker(geracao=0):
         # não impeça o relatório de ser enviado.
         try:
             enviar_relatorio_sessao()
+        except Exception:
+            pass
+
+        # Aviso animado na hora de cada lista do grupo grátis.
+        try:
+            gratis_aviso_inicio()
         except Exception:
             pass
 
