@@ -283,40 +283,36 @@ def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
 
 
 def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
-    """Envia sticker/cartão e confirma se o texto chegou ao Telegram.
+    """Ícone (sticker) primeiro, cartão de texto logo depois.
 
-    Retorna True SOMENTE quando o texto foi confirmado pelo Telegram.
-    O histórico só deve ser marcado depois dessa confirmação.
+    A IMAGEM SÓ VAI UMA VEZ
+    -----------------------
+    Antes, quando o sticker demorava a ser confirmado, o robô
+    mandava a mesma imagem de novo como foto — e o grupo via a
+    seta duas vezes. Agora a foto só é usada quando o Telegram
+    RECUSA o arquivo como sticker (erro 400), que é o único caso
+    em que é certo que a imagem não apareceu.
     """
 
     id_sticker = None
 
     if caminho_imagem and os.path.isfile(caminho_imagem):
+
         estado, id_sticker = _enviar_telegram_sticker_sync(
             caminho_imagem, chat_id=chat_id
         )
 
         if estado == RECUSADO:
-            _enviar_telegram_photo_sync(
-                caminho_imagem,
-                chat_id=chat_id,
-            )
+            _enviar_telegram_photo_sync(caminho_imagem, chat_id=chat_id)
 
-    estado_texto = _enviar_telegram_texto_sync(
-        caption,
-        chat_id=chat_id,
-    )
+    estado_texto = _enviar_telegram_texto_sync(caption, chat_id=chat_id)
 
+    # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA — mas só apaga quando é
+    # CERTO que o texto não chegou. Se a confirmação só atrasou, o
+    # texto provavelmente está no grupo, e apagar o ícone deixaria
+    # o cartão sem a imagem.
     if estado_texto == FALHOU and id_sticker:
-        _apagar_mensagem_telegram(
-            id_sticker,
-            chat_id=chat_id,
-        )
-
-    # TALVEZ significa: o Telegram recebeu o pedido, mas a resposta
-    # HTTP demorou. Não repetir evita duplicar a mensagem. Para a
-    # máquina de estados, consideramos o cartão entregue.
-    return estado_texto in (ENVIADO, TALVEZ)
+        _apagar_mensagem_telegram(id_sticker, chat_id=chat_id)
 
 
 # Quantos cartoes podem estar esperando na fila.
@@ -337,14 +333,9 @@ _fila_telegram = 0
 _lock_fila_telegram = threading.Lock()
 
 
-def enviar_telegram_foto(
-    caminho_imagem,
-    caption,
-    chat_id=None,
-    ao_confirmar=None,
-):
-    """Envia em segundo plano e chama ``ao_confirmar`` somente
-    quando o cartão de texto foi confirmado pelo Telegram.
+def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
+    """Dispara o envio (sticker + cartão) em segundo plano,
+    sem travar a rota.
     """
 
     global _fila_telegram
@@ -356,37 +347,22 @@ def enviar_telegram_foto(
                 _fila_telegram,
                 ") — cartao descartado para nao chegar atrasado.",
             )
-            return False
+            return
         _fila_telegram += 1
 
     def _tarefa():
         global _fila_telegram
         try:
-            confirmado = _enviar_cartao_telegram_sync(
-                caminho_imagem,
-                caption,
-                chat_id,
-            )
-
-            if confirmado and ao_confirmar:
-                try:
-                    ao_confirmar()
-                except Exception as erro:
-                    print(
-                        "TELEGRAM: callback de confirmação falhou —",
-                        str(erro)[:120],
-                    )
+            _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id)
         finally:
             with _lock_fila_telegram:
                 _fila_telegram -= 1
 
     try:
         _executor_telegram.submit(_tarefa)
-        return True
     except Exception:
         with _lock_fila_telegram:
             _fila_telegram -= 1
-        return False
 
 
 # ============================================================
@@ -896,7 +872,7 @@ def montar_caption_sinal(par, analise):
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
 )
 
 _ultima_entrada_enviada = 0
@@ -1302,20 +1278,11 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
             titulo = "WIN 1G"
             linha_etapa = "🔁 Recuperado em G1\n"
             rodape = "\n🔥 Recuperado no gale 1."
-        elif etapa == 2:
+        else:
             imagem = IMAGENS_TELEGRAM["win_g2"]
             titulo = "WIN 2G"
             linha_etapa = "🔁 Recuperado em G2\n"
             rodape = "\n🔥 Recuperado no gale 2."
-        else:
-            return IMAGENS_TELEGRAM["loss"], (
-                f"❌ <b>LOSS</b> · {nome_bonito(par)}\n"
-                "────────────\n"
-                f"↩️ Entrada das {hora_entrada}\n"
-                f"📌 Direção {sinal} · M1\n"
-                "🔁 Etapas entrada + G1 + G2\n"
-                "\n⛔ Sequência encerrada."
-            )
 
         caption = (
             f"✅ <b>{titulo}</b> · {nome_bonito(par)}\n"
@@ -1914,11 +1881,6 @@ def iniciar_db():
                 ("resultado_final", "TEXT"),
                 ("etapa_final", "INTEGER"),
                 ("avisado_tg", "INTEGER"),
-                # 1 = o cartão de resultado já foi confirmado pelo Telegram.
-                # Sem esta coluna, um erro temporário depois de gravar
-                # o resultado no banco fazia WIN/G1/G2/LOSS nunca ser
-                # tentado novamente.
-                ("resultado_tg_enviado", "INTEGER"),
             ):
                 try:
                     conexao.execute(
@@ -2136,12 +2098,25 @@ def registrar_resultado_historico(par, entrada_em, sinal, resultado):
 
 
 def registrar_final_historico(par, entrada_em, sinal, final, etapa):
-    """Guarda o resultado FINAL da mesma sequência e, se ele mudou,
-    libera novamente o cartão para o Telegram.
+    """Guarda o resultado que o GRUPO viu, com o gale considerado.
 
-    Regra: o resultado final é sempre derivado da sequência real:
-    M1 -> G1 -> G2. Nunca reaproveita um WIN/LOSS antigo para outro
-    resultado.
+    POR QUE ISTO EXISTE
+    -------------------
+    A coluna 'resultado' guarda o m1: só a vela de entrada, sem gale.
+    É ela que alimenta o aprendizado, e está certo assim — um "WIN 2G"
+    nasceu de uma leitura errada, e contar como acerto ensinaria o
+    sistema a repetir o erro.
+
+    Mas o grupo não viu isso. O grupo viu "WIN 1G" e entendeu vitória.
+    Um relatório montado só com o m1 mostraria ❌ num sinal que o aluno
+    acompanhou como ganho — e ele reclamaria, com razão.
+
+    Então guardamos os dois. Cada um serve a uma pergunta diferente:
+      resultado       -> a estratégia acertou de primeira?
+      resultado_final -> a operação, com gale, terminou ganhando?
+
+    Função separada de propósito: assim o caminho que já funciona não
+    muda em nada.
     """
 
     if not _DB_PRONTO:
@@ -2151,190 +2126,35 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
         return False
 
     try:
+
         with _db_lock:
+
             conexao = _conectar_db()
-            atual = conexao.execute(
-                """
-                SELECT resultado_final, etapa_final, resultado_tg_enviado
-                  FROM historico_sinais
-                 WHERE par = ? AND entrada_em = ? AND sinal = ?
-                 LIMIT 1
-                """,
-                (str(par), int(entrada_em), str(sinal)),
-            ).fetchone()
 
-            mudou = (
-                not atual
-                or atual["resultado_final"] != str(final)
-                or int(atual["etapa_final"] or 0) != int(etapa or 0)
-            )
-
-            if mudou:
-                conexao.execute(
-                    """
-                    UPDATE historico_sinais
-                       SET resultado_final = ?,
-                           etapa_final = ?,
-                           resultado_tg_enviado = 0
-                     WHERE par = ? AND entrada_em = ? AND sinal = ?
-                    """,
-                    (
-                        str(final),
-                        int(etapa or 0),
-                        str(par),
-                        int(entrada_em),
-                        str(sinal),
-                    ),
-                )
-            else:
-                conexao.execute(
-                    """
-                    UPDATE historico_sinais
-                       SET resultado_final = ?, etapa_final = ?
-                     WHERE par = ? AND entrada_em = ? AND sinal = ?
-                    """,
-                    (
-                        str(final),
-                        int(etapa or 0),
-                        str(par),
-                        int(entrada_em),
-                        str(sinal),
-                    ),
-                )
-
-            conexao.commit()
-            conexao.close()
-
-        return True
-
-    except Exception:
-        return False
-
-
-# ------------------------------------------------------------
-# RESULTADO CONFIRMADO NO TELEGRAM
-# ------------------------------------------------------------
-# O resultado pode ser gravado no banco ANTES de o Telegram responder.
-# Se o envio falhar, ele precisa continuar pendente e ser tentado de novo.
-
-_RESULTADOS_TG_ENVIANDO = set()
-_LOCK_RESULTADOS_TG = threading.Lock()
-
-
-def _chave_resultado_tg(par, entrada_em, sinal):
-    try:
-        return (str(par).upper(), int(entrada_em), str(sinal).upper())
-    except Exception:
-        return None
-
-
-def marcar_resultado_tg_enviado(par, entrada_em, sinal):
-    chave = _chave_resultado_tg(par, entrada_em, sinal)
-    if chave is not None:
-        with _LOCK_RESULTADOS_TG:
-            _RESULTADOS_TG_ENVIANDO.discard(chave)
-
-    if not _DB_PRONTO:
-        return True
-
-    try:
-        with _db_lock:
-            conexao = _conectar_db()
             conexao.execute(
                 """
                 UPDATE historico_sinais
-                   SET resultado_tg_enviado = 1
-                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                   SET resultado_final = ?, etapa_final = ?
+                 WHERE par = ?
+                   AND entrada_em = ?
+                   AND sinal = ?
                 """,
-                (str(par), int(entrada_em), str(sinal)),
+                (
+                    str(final),
+                    int(etapa or 0),
+                    str(par),
+                    int(entrada_em),
+                    str(sinal),
+                ),
             )
+
             conexao.commit()
             conexao.close()
+
         return True
+
     except Exception:
-        return False
 
-
-def resultado_tg_foi_enviado(par, entrada_em, sinal):
-    chave = _chave_resultado_tg(par, entrada_em, sinal)
-    if chave is not None:
-        with _LOCK_RESULTADOS_TG:
-            if chave in _RESULTADOS_TG_ENVIANDO:
-                return True
-
-    if not _DB_PRONTO:
-        return False
-
-    try:
-        with _db_lock:
-            conexao = _conectar_db()
-            linha = conexao.execute(
-                """
-                SELECT resultado_tg_enviado
-                  FROM historico_sinais
-                 WHERE par = ? AND entrada_em = ? AND sinal = ?
-                 LIMIT 1
-                """,
-                (str(par), int(entrada_em), str(sinal)),
-            ).fetchone()
-            conexao.close()
-        return bool(linha and linha["resultado_tg_enviado"])
-    except Exception:
-        return False
-
-
-def _enviar_resultado_persistente(par, entrada_em, sinal, final, etapa):
-    """Tenta o resultado até o Telegram confirmar, sem bloquear o worker."""
-
-    if not final or not foi_avisado_telegram(par, entrada_em, sinal):
-        return False
-
-    if resultado_tg_foi_enviado(par, entrada_em, sinal):
-        return True
-
-    chave = _chave_resultado_tg(par, entrada_em, sinal)
-    if chave is None:
-        return False
-
-    with _LOCK_RESULTADOS_TG:
-        if chave in _RESULTADOS_TG_ENVIANDO:
-            return False
-        _RESULTADOS_TG_ENVIANDO.add(chave)
-
-    try:
-        imagem, caption = montar_resultado_gale(
-            par, sinal, entrada_em, final, etapa
-        )
-
-        def _confirmar():
-            try:
-                marcar_resultado_tg_enviado(par, entrada_em, sinal)
-                try:
-                    gratis_ao_enviar_resultado(
-                        par, entrada_em, sinal, final, etapa, imagem, caption
-                    )
-                except Exception as erro:
-                    print("GRATIS: resultado não copiado —", str(erro)[:120])
-                encerrar_sequencia(par, entrada_em)
-            finally:
-                with _LOCK_RESULTADOS_TG:
-                    _RESULTADOS_TG_ENVIANDO.discard(chave)
-
-        aceito = enviar_telegram_foto(
-            imagem, caption, ao_confirmar=_confirmar
-        )
-
-        if not aceito:
-            with _LOCK_RESULTADOS_TG:
-                _RESULTADOS_TG_ENVIANDO.discard(chave)
-            return False
-
-        return True
-
-    except Exception as erro:
-        print("TELEGRAM: falha ao preparar resultado —", str(erro)[:120])
-        with _LOCK_RESULTADOS_TG:
-            _RESULTADOS_TG_ENVIANDO.discard(chave)
         return False
 
 
@@ -2823,7 +2643,7 @@ _velas_fechadas_lock = threading.Lock()
 # saía errado no grupo. Pior: ia para a memória e ficava lá.
 #
 # Agora a vela só conta como fechada 3 segundos depois.
-FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "0"))
+FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "3"))
 
 
 def guardar_velas_fechadas(par, velas, agora_ts):
@@ -5447,84 +5267,117 @@ def resultado_sinal(par):
         resultado_final = None
         etapa_final = 0
 
-        # REGRA ÚNICA DO RESULTADO FINAL:
-        #
-        # M1 WIN                  -> WIN (sticker win)
-        # M1 LOSS + G1 WIN       -> WIN 1G (sticker gale1)
-        # M1 LOSS + G1 EMPATE    -> EMPATE em G1
-        # M1 LOSS + G1 LOSS + G2 WIN    -> WIN 2G (sticker gale2)
-        # M1 LOSS + G1 LOSS + G2 EMPATE -> EMPATE em G2
-        # M1 LOSS + G1 LOSS + G2 LOSS   -> LOSS (sticker loss)
-        #
-        # Se a vela da próxima etapa ainda não fechou, NÃO inventa
-        # resultado e NÃO manda sticker. Aguarda a vela correta.
-
         if m1 == "WIN":
             resultado_final = "WIN"
             etapa_final = 0
 
         elif m1 == "EMPATE":
+            # Vela de entrada sem movimento: o valor volta para o
+            # aluno, a operação acaba aqui, sem gale.
             resultado_final = "EMPATE"
             etapa_final = 0
 
-        elif m1 == "LOSS":
-            if g1 == "WIN":
+        elif g1 == "WIN":
+            resultado_final = "WIN"
+            etapa_final = 1
+
+        elif g1 == "EMPATE":
+            resultado_final = "EMPATE"
+            etapa_final = 1
+
+        elif g1 == "LOSS":
+
+            if g2 == "WIN":
                 resultado_final = "WIN"
-                etapa_final = 1
-            elif g1 == "EMPATE":
+                etapa_final = 2
+
+            elif g2 == "EMPATE":
                 resultado_final = "EMPATE"
-                etapa_final = 1
-            elif g1 == "LOSS":
-                if g2 == "WIN":
-                    resultado_final = "WIN"
-                    etapa_final = 2
-                elif g2 == "EMPATE":
-                    resultado_final = "EMPATE"
-                    etapa_final = 2
-                elif g2 == "LOSS":
-                    resultado_final = "LOSS"
-                    etapa_final = 2
+                etapa_final = 2
+
+            elif g2 == "LOSS":
+                resultado_final = "LOSS"
+                etapa_final = 2
+
+        # Válvula de segurança: se depois de 15 minutos a
+        # sequência ainda não fechou (mercado fechou, vela não
+        # veio), encerra com o que se sabe. Sem isto a linha
+        # ficaria para sempre na fila do worker.
+        if (
+            resultado_final is None
+            and time.time() - inicio_candle > 900
+        ):
+            resultado_final = "LOSS" if m1 == "LOSS" else "WIN"
+            etapa_final = 0
 
         if resultado_final:
 
-            # O m1 é o resultado da estratégia para o aprendizado.
-            # Pode já estar gravado de uma tentativa anterior; mesmo
-            # assim o cartão do Telegram precisa continuar sendo tentado
-            # até confirmar.
+            # Grava a vela da ENTRADA no histórico — é ela que
+            # mede a estratégia. Um "WIN 2G" foi, na origem,
+            # uma leitura errada; contar como acerto ensinaria
+            # o sistema a repetir o erro.
             try:
-                registrar_resultado_historico(
-                    par, inicio_candle, sinal, m1
-                )
-            except Exception:
-                pass
-
-            try:
-                registrar_final_historico(
+                gravado = registrar_resultado_historico(
                     par,
                     inicio_candle,
                     sinal,
-                    resultado_final,
-                    etapa_final,
+                    m1,
                 )
             except Exception:
-                pass
+                gravado = False
 
-            # IMPORTANTE: não usamos mais "gravado" como trava do Telegram.
-            # Se o banco gravou e o Telegram falhou, a próxima conferência
-            # precisa poder reenviar WIN / WIN 1G / WIN 2G / LOSS.
-            try:
-                _enviar_resultado_persistente(
-                    par,
-                    inicio_candle,
-                    sinal,
-                    resultado_final,
-                    etapa_final,
-                )
-            except Exception as erro:
-                print(
-                    "TELEGRAM: resultado pendente —",
-                    str(erro)[:120],
-                )
+            # Só manda o Telegram na primeira gravação. A rota
+            # é consultada várias vezes pro mesmo sinal.
+            if gravado:
+
+                # Guarda também o resultado que o GRUPO vai ver, com o
+                # gale já considerado. É ele que alimenta o relatório de
+                # sessão — sem isto, um "WIN 1G" apareceria lá como ❌.
+                try:
+                    registrar_final_historico(
+                        par,
+                        inicio_candle,
+                        sinal,
+                        resultado_final,
+                        etapa_final,
+                    )
+                except Exception:
+                    pass
+
+                # SO MANDA O RESULTADO SE A ENTRADA FOI AO GRUPO.
+                #
+                # Antes o resultado saia sempre. Como a trava deixa
+                # uma operacao por vez, varios sinais ficavam so
+                # gravados no banco sem serem anunciados -- e o grupo
+                # recebia WIN/LOSS de entradas que nunca viu.
+                if foi_avisado_telegram(par, inicio_candle, sinal):
+                    try:
+                        imagem, caption = montar_resultado_gale(
+                            par,
+                            sinal,
+                            inicio_candle,
+                            resultado_final,
+                            etapa_final,
+                        )
+                        enviar_telegram_foto(imagem, caption)
+
+                        # O mesmo resultado no grupo grátis, se
+                        # este sinal fez parte de uma lista.
+                        try:
+                            gratis_ao_enviar_resultado(
+                                par, inicio_candle, sinal,
+                                resultado_final, etapa_final,
+                                imagem, caption,
+                            )
+                        except Exception as erro:
+                            print("GRATIS: resultado não copiado —", str(erro)[:120])
+                    except Exception:
+                        pass
+
+                try:
+                    encerrar_sequencia(par, inicio_candle)
+                except Exception:
+                    pass
 
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
@@ -6384,32 +6237,22 @@ def candles():
                             analise_tg.get("sinal"),
                         )
                     ):
-                        # Só marca avisado_tg DEPOIS que o Telegram
-                        # confirmar o cartão. Antes a marca era feita
-                        # enquanto o cartão ainda estava na fila.
-                        def _confirmar_entrada_telegram():
-                            marcou = marcar_avisado_telegram(
-                                par,
-                                analise_tg.get("entrada_em"),
-                                analise_tg.get("sinal"),
-                            )
-
-                            if marcou:
-                                # Copia para o grupo grátis somente
-                                # depois da confirmação do grupo pago.
-                                try:
-                                    gratis_ao_enviar_sinal(par, analise_tg)
-                                except Exception as erro:
-                                    print(
-                                        "GRATIS: sinal não copiado —",
-                                        str(erro)[:120],
-                                    )
-
                         enviar_telegram_foto(
                             escolher_imagem_sinal(analise_tg.get("sinal")),
                             montar_caption_sinal(par, analise_tg),
-                            ao_confirmar=_confirmar_entrada_telegram,
                         )
+                        marcar_avisado_telegram(
+                            par,
+                            analise_tg.get("entrada_em"),
+                            analise_tg.get("sinal"),
+                        )
+
+                        # Cópia para o grupo grátis, se estiver
+                        # num horário de lista e ela não tiver 5.
+                        try:
+                            gratis_ao_enviar_sinal(par, analise_tg)
+                        except Exception as erro:
+                            print("GRATIS: sinal não copiado —", str(erro)[:120])
                 except Exception:
                     pass
 
@@ -6860,48 +6703,8 @@ def _buscar_pendentes_worker():
         return []
 
 
-def _processar_resultados_telegram_pendentes():
-    """Reenvia resultados já calculados mas ainda não confirmados."""
-
-    if not _DB_PRONTO:
-        return
-
-    try:
-        with _db_lock:
-            conexao = _conectar_db()
-            linhas = conexao.execute(
-                """
-                SELECT par, entrada_em, sinal, resultado_final, etapa_final
-                  FROM historico_sinais
-                 WHERE resultado_final IN ('WIN', 'LOSS', 'EMPATE')
-                   AND COALESCE(resultado_tg_enviado, 0) = 0
-                   AND avisado_tg = 1
-              ORDER BY entrada_em ASC
-                 LIMIT 25
-                """
-            ).fetchall()
-            conexao.close()
-    except Exception:
-        return
-
-    for linha in linhas:
-        try:
-            _enviar_resultado_persistente(
-                str(linha["par"]),
-                int(linha["entrada_em"]),
-                str(linha["sinal"]).upper(),
-                str(linha["resultado_final"]),
-                int(linha["etapa_final"] or 0),
-            )
-        except Exception:
-            pass
-
-
 def _processar_resultados_worker():
-    """Fecha resultados e reenvia qualquer cartão ainda não confirmado."""
-
-    _processar_resultados_telegram_pendentes()
-
+    """Fecha automaticamente os sinais pendentes."""
 
     apagados = _expirar_pendentes_velhos()
     if apagados:
@@ -7718,8 +7521,7 @@ RELATORIO_SESSAO = os.getenv("RELATORIO_SESSAO", "1") != "0"
 # Telegram corta mensagem em 4096 caracteres. Com sessão cheia a
 # lista estoura, então mostramos as últimas e avisamos quantas
 # ficaram de fora.
-RELATORIO_MAX_POR_HORA = 10
-RELATORIO_MAX_LINHAS = 60
+RELATORIO_MAX_LINHAS = 40
 
 NOMES_SESSAO = ["MADRUGADA", "MANHÃ", "TARDE", "NOITE"]
 
@@ -7832,47 +7634,8 @@ def _buscar_operacoes_da_sessao(inicio, fim):
         return []
 
 
-def _limitar_relatorio_por_hora(operacoes):
-    """Limita a 10 sinais por hora, máximo 60 por sessão.
-
-    A seleção é cronológica. Só chegam aqui os sinais marcados
-    como enviados ao Telegram.
-    """
-
-    if not operacoes:
-        return []
-
-    selecionadas = []
-    por_hora = {}
-
-    for op in sorted(
-        operacoes,
-        key=lambda item: int(item.get("entrada_em") or 0),
-    ):
-        try:
-            hora = datetime.fromtimestamp(
-                int(op["entrada_em"]),
-                tz=FUSO_BR,
-            ).strftime("%Y-%m-%d %H")
-        except Exception:
-            continue
-
-        if por_hora.get(hora, 0) >= RELATORIO_MAX_POR_HORA:
-            continue
-
-        por_hora[hora] = por_hora.get(hora, 0) + 1
-        selecionadas.append(op)
-
-        if len(selecionadas) >= RELATORIO_MAX_LINHAS:
-            break
-
-    return selecionadas
-
-
 def montar_relatorio_sessao(operacoes, nome, inicio, fim):
     """Texto do relatório. Devolve None quando não há o que contar."""
-
-    operacoes = _limitar_relatorio_por_hora(operacoes)
 
     if not operacoes:
         return None
@@ -7932,6 +7695,9 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
     taxa = (wins / total) * 100
 
     cortadas = 0
+    if len(linhas) > RELATORIO_MAX_LINHAS:
+        cortadas = len(linhas) - RELATORIO_MAX_LINHAS
+        linhas = linhas[-RELATORIO_MAX_LINHAS:]
 
     dia = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%d/%m/%Y")
     h1 = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%H:%M")
@@ -7943,8 +7709,11 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
         "────────────\n"
     )
 
-    # O limite de 10 por hora já foi aplicado antes da contagem.
-    # Não esconder as últimas linhas nem alterar o total calculado.
+    if cortadas:
+        cabecalho += (
+            f"<i>(mostrando as {RELATORIO_MAX_LINHAS} últimas de "
+            f"{total + cortadas})</i>\n"
+        )
 
     corpo = "\n".join(linhas)
 
@@ -8489,18 +8258,11 @@ def iniciar_worker_automatico():
 # resto do robô (resultado_sinal), e o banco garante que cada
 # resultado sai uma vez só.
 
-ACOMPANHANTE_INTERVALO = max(1, int(os.getenv("ACOMPANHANTE_INTERVALO", "1")))
+ACOMPANHANTE_INTERVALO = max(2, int(os.getenv("ACOMPANHANTE_INTERVALO", "5")))
 
 
 def _acompanhar_sequencia():
-    """Confere a operação aberta e garante o resultado no Telegram."""
-
-    # Primeiro, tenta qualquer resultado que ficou gravado mas ainda
-    # não foi confirmado pelo Telegram. Isso não depende de nova vela.
-    try:
-        _processar_resultados_telegram_pendentes()
-    except Exception:
-        pass
+    """Confere a operação aberta no grupo, se uma vela nova fechou."""
 
     with _lock_espera_entrada:
         aberta = dict(_sequencia_aberta) if _sequencia_aberta else None
@@ -8529,7 +8291,8 @@ def _acompanhar_sequencia():
     dados = _ler_json_resposta(resposta) or {}
 
     # Só marca como conferida se a conferência rodou de verdade.
-    # Falha de conexão ou vela ainda sem dado: tenta de novo no próximo ciclo.
+    # Falha de conexão ou vela ainda sem dado: tenta de novo daqui
+    # a 5 segundos.
     if "m1" not in dados or dados.get("m1") is None:
         return
 
