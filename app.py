@@ -872,7 +872,7 @@ def montar_caption_sinal(par, analise):
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
 )
 
 _ultima_entrada_enviada = 0
