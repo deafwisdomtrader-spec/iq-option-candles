@@ -888,12 +888,12 @@ def montar_caption_sinal(par, analise):
 # Com 3 minutos de espera, só o primeiro passa. Os outros são
 # descartados; se ainda forem bons, aparecem na próxima volta.
 #
-# 16/11/2026: padrão 300 s (pedido do Daniel). No máximo 1 sinal a
+# 16/11/2026: padrão 90 s (pedido do Daniel). No máximo 1 sinal a
 # cada 5 minutos no grupo, mesmo quando o anterior deu WIN direto
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
 )
 
 _ultima_entrada_enviada = 0
