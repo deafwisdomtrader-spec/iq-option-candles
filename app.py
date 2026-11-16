@@ -2664,7 +2664,7 @@ _velas_fechadas_lock = threading.Lock()
 # saía errado no grupo. Pior: ia para a memória e ficava lá.
 #
 # Agora a vela só conta como fechada 3 segundos depois.
-FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "3"))
+FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "0"))
 
 
 def guardar_velas_fechadas(par, velas, agora_ts):
@@ -8353,7 +8353,7 @@ def iniciar_worker_automatico():
 # resto do robô (resultado_sinal), e o banco garante que cada
 # resultado sai uma vez só.
 
-ACOMPANHANTE_INTERVALO = max(2, int(os.getenv("ACOMPANHANTE_INTERVALO", "5")))
+ACOMPANHANTE_INTERVALO = max(1, int(os.getenv("ACOMPANHANTE_INTERVALO", "1")))
 
 
 def _acompanhar_sequencia():
@@ -8386,8 +8386,7 @@ def _acompanhar_sequencia():
     dados = _ler_json_resposta(resposta) or {}
 
     # Só marca como conferida se a conferência rodou de verdade.
-    # Falha de conexão ou vela ainda sem dado: tenta de novo daqui
-    # a 5 segundos.
+    # Falha de conexão ou vela ainda sem dado: tenta de novo no próximo ciclo.
     if "m1" not in dados or dados.get("m1") is None:
         return
 
