@@ -4819,6 +4819,198 @@ def teste_linha():
 
 
 # ============================================================
+# TESTE SILENCIOSO — CANDIDATOS DO FOREX (não manda nada)
+# ============================================================
+#
+# Backtest de 16/11/2026 em 8 pares Forex (mercado aberto, M1,
+# 27/10 a 16/11, 160 mil velas). Três candidatas:
+#   corvos   : 3 velas vermelhas seguidas, cada uma fecha mais baixo,
+#              corpo >= metade da faixa média das 14 velas anteriores
+#              -> CALL na vela seguinte. Backtest: 54,1% (1597).
+#   pavio_m5 : vela de 5 min; no 3º minuto o preço andou >= 2x a faixa
+#              média (14 velas M1) desde a abertura -> entra CONTRA,
+#              expira no fim da vela de 5 min (2 min). Backtest: 53,8% (3633).
+#   ema1450  : EMA14 cruza a EMA50 com as EMAs 5/10/20/50 em ordem a
+#              favor do cruzamento -> CONTRA na vela seguinte.
+#              Backtest: 53,5% (647).
+#   Empate com payout 86% = 53,8%. Testei mais de 250 jeitos, então
+#   alguns passam por sorte: por isso TESTE AO VIVO antes de virar sinal.
+#
+# Só CONTA, a partir de TESTE_FOREX_INICIO, com as velas reais da
+# corretora. Não grava, não manda no Telegram, não muda nenhum sinal.
+# A conta roda em segundo plano (8 pares podem demorar); a rota mostra
+# o último resultado. Uso: /teste-forex
+# ============================================================
+
+TESTE_FOREX_INICIO = int(os.getenv("TESTE_FOREX_INICIO", "1794823200"))  # 16/11/2026 07:00
+TESTE_FOREX_PARES = ["EURUSD", "EURGBP", "EURJPY", "GBPJPY", "GBPUSD", "NZDUSD", "USDCHF", "USDJPY"]
+TESTE_FOREX_NOMES = {
+    "corvos": "3 corvos -> CALL (vela seguinte, 1 min)",
+    "pavio_m5": "pega pavio M5: 3º minuto, movimento forte -> contra (expira no fim da vela de 5 min)",
+    "ema1450": "EMA 14/50 cruza + EMAs 5/10/20/50 a favor -> contra (vela seguinte)",
+}
+_teste_forex_cache = {"quando": 0, "dados": None, "rodando": False}
+
+
+def _ema_lista(valores, periodo):
+    a = 2.0 / (periodo + 1)
+    saida = [valores[0]]
+    for x in valores[1:]:
+        saida.append(a * x + (1 - a) * saida[-1])
+    return saida
+
+
+def _avaliar_candidatos_forex(velas, inicio):
+    n = len(velas)
+    t = [int(v[0]) for v in velas]
+    o = [v[1] for v in velas]; c = [v[2] for v in velas]
+    lo = [v[3] for v in velas]; hi = [v[4] for v in velas]
+    cor = [(1 if c[i] > o[i] else -1 if c[i] < o[i] else 0) for i in range(n)]
+    faixa = [hi[i] - lo[i] for i in range(n)]
+    corpo = [abs(c[i] - o[i]) for i in range(n)]
+    conta = {k: {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0, "ultimos": []}
+             for k in TESTE_FOREX_NOMES}
+
+    def marca(nome, aposta, i_entrada, resultado, resultado_2=None):
+        k = conta[nome]
+        k["sinais"] += 1
+        if resultado == 0:
+            k["empate"] += 1; txt = "EMPATE"
+        elif resultado == aposta:
+            k["win"] += 1; txt = "WIN"
+        else:
+            k["loss"] += 1; txt = "LOSS"
+        if resultado_2:
+            if resultado_2 == aposta:
+                k["win_2"] += 1
+            else:
+                k["loss_2"] += 1
+        k["ultimos"].append([
+            t[i_entrada],
+            datetime.fromtimestamp(t[i_entrada], tz=FUSO_BR).strftime("%d/%m %H:%M"),
+            "CALL" if aposta == 1 else "PUT", txt,
+        ])
+
+    # velas seguidas sem buraco até cada vela (para as médias aquecerem)
+    seguidas = [0] * n
+    for i in range(1, n):
+        seguidas[i] = seguidas[i - 1] + 1 if t[i] - t[i - 1] == 60 else 0
+    e = {p: _ema_lista(c, p) for p in (5, 10, 14, 20, 50)} if n else {}
+
+    def sinal(x):
+        return 1 if x > 0 else -1 if x < 0 else 0
+
+    for i in range(20, n - 1):
+        if t[i] < inicio or t[i + 1] - t[i] != 60:
+            continue
+        r2 = cor[i + 2] if i + 2 < n and t[i + 2] - t[i + 1] == 60 else 0
+
+        # 3 corvos -> CALL
+        if t[i] - t[i - 16] == 16 * 60:
+            media = sum(faixa[i - 14:i]) / 14.0
+            if (media > 0 and faixa[i] > 0 and cor[i - 2] == cor[i - 1] == cor[i] == -1
+                    and c[i] < c[i - 1] < c[i - 2] and min(corpo[i - 2], corpo[i - 1], corpo[i]) >= 0.5 * media):
+                marca("corvos", 1, i + 1, cor[i + 1], r2)
+
+        # EMA 14/50 cruza com 5/10/20/50 a favor -> contra
+        if seguidas[i] >= 400:
+            est = sinal(e[14][i] - e[50][i]); est_ant = sinal(e[14][i - 1] - e[50][i - 1])
+            if est != 0 and est != est_ant:
+                a5, a10, a20, a50 = e[5][i], e[10][i], e[20][i], e[50][i]
+                ordem = 1 if a5 > a10 > a20 > a50 else -1 if a5 < a10 < a20 < a50 else 0
+                if ordem == est:
+                    marca("ema1450", -est, i + 1, cor[i + 1], r2)
+
+    # pega pavio M5: começo de cada vela de 5 min
+    for i in range(14, n - 4):
+        if t[i] < inicio or t[i] % 300 != 0 or t[i + 4] - t[i] != 240 or t[i] - t[i - 14] != 14 * 60:
+            continue
+        media = sum(faixa[i - 14:i]) / 14.0
+        entrada = c[i + 2]; mov = entrada - o[i]; fecha5 = c[i + 4]
+        if media <= 0 or mov == 0 or abs(mov) < 2 * media:
+            continue
+        aposta = -sinal(mov)
+        marca("pavio_m5", aposta, i + 3, sinal(fecha5 - entrada))
+
+    for k in conta.values():
+        k["ultimos"] = k["ultimos"][-10:]
+    return conta
+
+
+def _calcular_teste_forex():
+    try:
+        quantas = int((time.time() - TESTE_FOREX_INICIO) / 60) + 600
+        quantas = max(700, min(20000, quantas))
+        iq = conectar_com_timeout()
+        soma = {k: {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0} for k in TESTE_FOREX_NOMES}
+        ultimos = {k: [] for k in TESTE_FOREX_NOMES}
+        por_par = {}
+        for par in TESTE_FOREX_PARES:
+            try:
+                futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
+                velas = futuro.result(timeout=60)
+                r = _avaliar_candidatos_forex(velas, TESTE_FOREX_INICIO)
+            except Exception as erro:
+                por_par[par] = {"erro": str(erro)[:120]}
+                continue
+            por_par[par] = {k: {x: r[k][x] for x in ("sinais", "win", "loss", "empate")} for k in r}
+            for k in r:
+                for x in ("sinais", "win", "loss", "empate", "win_2", "loss_2"):
+                    soma[k][x] += r[k][x]
+                ultimos[k] = sorted(ultimos[k] + [[u[0], par] + u[1:] for u in r[k]["ultimos"]])[-10:]
+
+        candidatas = {}
+        for k, s in soma.items():
+            dec = s["win"] + s["loss"]; dec2 = s["win_2"] + s["loss_2"]
+            taxa = round(100 * s["win"] / dec, 1) if dec else None
+            taxa2 = round(100 * s["win_2"] / dec2, 1) if dec2 else None
+            if taxa is None:
+                resumo = "Ainda sem sinais desde o começo do teste."
+            else:
+                resumo = (f"{s['sinais']} sinais. Resultado: {taxa}% ({s['win']} WIN x {s['loss']} LOSS). "
+                          + ("ACIMA" if taxa >= 53.8 else "ABAIXO") + " do empate de 53,8%. Precisa de 300+ sinais para confiar.")
+            candidatas[k] = {
+                "teste": TESTE_FOREX_NOMES[k],
+                "resumo": resumo,
+                "taxa": taxa,
+                "taxa_1_vela_depois": taxa2,
+                "total": s,
+                "ultimos": [u[1:] for u in ultimos[k]],
+            }
+        _teste_forex_cache["dados"] = {
+            "ok": True,
+            "mercado": "Forex (mercado aberto), M1",
+            "comecou_em": datetime.fromtimestamp(TESTE_FOREX_INICIO, tz=FUSO_BR).strftime("%d/%m/%Y %H:%M"),
+            "atualizado_em": datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M"),
+            "candidatas": candidatas,
+            "por_par": por_par,
+            "aviso": "Só conta. Não manda sinal e não mexe no grupo.",
+        }
+        _teste_forex_cache["quando"] = time.time()
+    except Exception as erro:
+        _teste_forex_cache["dados"] = {"ok": False, "erro": str(erro)[:200]}
+        _teste_forex_cache["quando"] = time.time() - 240   # tenta de novo em ~1 min
+    finally:
+        _teste_forex_cache["rodando"] = False
+
+
+@app.get("/teste-forex")
+def teste_forex():
+
+    velho = time.time() - _teste_forex_cache["quando"] >= 300
+    if velho and not _teste_forex_cache["rodando"]:
+        _teste_forex_cache["rodando"] = True
+        threading.Thread(target=_calcular_teste_forex, daemon=True).start()
+
+    if _teste_forex_cache["dados"]:
+        dados = dict(_teste_forex_cache["dados"])
+        dados["atualizando_agora"] = _teste_forex_cache["rodando"]
+        return jsonify(dados)
+    return jsonify({"ok": True, "calculando": True,
+                    "resumo": "Calculando o teste do Forex. Abra de novo em 1 ou 2 minutos."})
+
+
+# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
