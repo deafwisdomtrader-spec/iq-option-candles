@@ -4603,6 +4603,74 @@ def ver_historico():
 
 
 # ============================================================
+# VELAS ANTIGAS (só leitura, para TESTAR estratégias)
+# ============================================================
+#
+# Devolve muitas velas M1 do passado de um par (até 5000), em
+# lotes de 1000 pedidos à corretora andando para trás no tempo.
+# Serve para testar indicadores novos (Fibonacci, toque no
+# pavio etc.) em milhares de velas ANTES de ligar no robô.
+# Não grava nada, não manda nada ao Telegram, não mexe em sinal.
+#
+# Uso: /velas-antigas/EURUSD-OTC?n=3000
+# Resposta: velas = [[from, open, close, low, high], ...]
+# ============================================================
+
+def _buscar_velas_antigas(iq, par, quantas):
+    velas = {}
+    try:
+        fim = int(iq.get_server_timestamp())
+    except Exception:
+        fim = int(time.time())
+    for _ in range(8):
+        if len(velas) >= quantas:
+            break
+        lote = iq.get_candles(par, 60, 1000, fim)
+        if not lote:
+            break
+        menor = fim
+        for c in lote:
+            try:
+                v = normalizar_candle(c)
+            except Exception:
+                continue
+            velas[v["from"]] = [
+                v["from"], v["open"], v["close"], v["low"], v["high"],
+            ]
+            menor = min(menor, v["from"])
+        if menor >= fim:
+            break
+        fim = menor - 1
+    return sorted(velas.values())[-quantas:]
+
+
+@app.get("/velas-antigas/<par>")
+def velas_antigas(par):
+
+    par = par.strip().upper()
+
+    try:
+        quantas = max(100, min(5000, int(request.args.get("n", "2000"))))
+    except Exception:
+        quantas = 2000
+
+    try:
+        iq = conectar_com_timeout()
+        futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
+        velas = futuro.result(timeout=45)
+    except Exception as erro:
+        return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
+
+    return jsonify({
+        "ok": True,
+        "par": par,
+        "timeframe": "M1",
+        "quantidade": len(velas),
+        "velas": velas,
+    })
+
+
+# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
