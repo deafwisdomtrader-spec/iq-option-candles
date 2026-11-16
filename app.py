@@ -313,7 +313,10 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
             chat_id=chat_id,
         )
 
-    return estado_texto == ENVIADO
+    # TALVEZ significa: o Telegram recebeu o pedido, mas a resposta
+    # HTTP demorou. Não repetir evita duplicar a mensagem. Para a
+    # máquina de estados, consideramos o cartão entregue.
+    return estado_texto in (ENVIADO, TALVEZ)
 
 
 # Quantos cartoes podem estar esperando na fila.
@@ -1902,6 +1905,11 @@ def iniciar_db():
                 ("resultado_final", "TEXT"),
                 ("etapa_final", "INTEGER"),
                 ("avisado_tg", "INTEGER"),
+                # 1 = o cartão de resultado já foi confirmado pelo Telegram.
+                # Sem esta coluna, um erro temporário depois de gravar
+                # o resultado no banco fazia WIN/G1/G2/LOSS nunca ser
+                # tentado novamente.
+                ("resultado_tg_enviado", "INTEGER"),
             ):
                 try:
                     conexao.execute(
@@ -2176,6 +2184,133 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
 
     except Exception:
 
+        return False
+
+
+# ------------------------------------------------------------
+# RESULTADO CONFIRMADO NO TELEGRAM
+# ------------------------------------------------------------
+# O resultado pode ser gravado no banco ANTES de o Telegram responder.
+# Se o envio falhar, ele precisa continuar pendente e ser tentado de novo.
+
+_RESULTADOS_TG_ENVIANDO = set()
+_LOCK_RESULTADOS_TG = threading.Lock()
+
+
+def _chave_resultado_tg(par, entrada_em, sinal):
+    try:
+        return (str(par).upper(), int(entrada_em), str(sinal).upper())
+    except Exception:
+        return None
+
+
+def marcar_resultado_tg_enviado(par, entrada_em, sinal):
+    chave = _chave_resultado_tg(par, entrada_em, sinal)
+    if chave is not None:
+        with _LOCK_RESULTADOS_TG:
+            _RESULTADOS_TG_ENVIANDO.discard(chave)
+
+    if not _DB_PRONTO:
+        return True
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            conexao.execute(
+                """
+                UPDATE historico_sinais
+                   SET resultado_tg_enviado = 1
+                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                """,
+                (str(par), int(entrada_em), str(sinal)),
+            )
+            conexao.commit()
+            conexao.close()
+        return True
+    except Exception:
+        return False
+
+
+def resultado_tg_foi_enviado(par, entrada_em, sinal):
+    chave = _chave_resultado_tg(par, entrada_em, sinal)
+    if chave is not None:
+        with _LOCK_RESULTADOS_TG:
+            if chave in _RESULTADOS_TG_ENVIANDO:
+                return True
+
+    if not _DB_PRONTO:
+        return False
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linha = conexao.execute(
+                """
+                SELECT resultado_tg_enviado
+                  FROM historico_sinais
+                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                 LIMIT 1
+                """,
+                (str(par), int(entrada_em), str(sinal)),
+            ).fetchone()
+            conexao.close()
+        return bool(linha and linha["resultado_tg_enviado"])
+    except Exception:
+        return False
+
+
+def _enviar_resultado_persistente(par, entrada_em, sinal, final, etapa):
+    """Tenta o resultado até o Telegram confirmar, sem bloquear o worker."""
+
+    if not final or not foi_avisado_telegram(par, entrada_em, sinal):
+        return False
+
+    if resultado_tg_foi_enviado(par, entrada_em, sinal):
+        return True
+
+    chave = _chave_resultado_tg(par, entrada_em, sinal)
+    if chave is None:
+        return False
+
+    with _LOCK_RESULTADOS_TG:
+        if chave in _RESULTADOS_TG_ENVIANDO:
+            return False
+        _RESULTADOS_TG_ENVIANDO.add(chave)
+
+    try:
+        imagem, caption = montar_resultado_gale(
+            par, sinal, entrada_em, final, etapa
+        )
+
+        def _confirmar():
+            try:
+                marcar_resultado_tg_enviado(par, entrada_em, sinal)
+                try:
+                    gratis_ao_enviar_resultado(
+                        par, entrada_em, sinal, final, etapa, imagem, caption
+                    )
+                except Exception as erro:
+                    print("GRATIS: resultado não copiado —", str(erro)[:120])
+                encerrar_sequencia(par, entrada_em)
+            finally:
+                with _LOCK_RESULTADOS_TG:
+                    _RESULTADOS_TG_ENVIANDO.discard(chave)
+
+        aceito = enviar_telegram_foto(
+            imagem, caption, ao_confirmar=_confirmar
+        )
+
+        if not aceito:
+            with _LOCK_RESULTADOS_TG:
+                _RESULTADOS_TG_ENVIANDO.discard(chave)
+            return False
+
+        return True
+
+    except Exception as erro:
+        print("TELEGRAM: falha ao preparar resultado —", str(erro)[:120])
+        with _LOCK_RESULTADOS_TG:
+            _RESULTADOS_TG_ENVIANDO.discard(chave)
         return False
 
 
@@ -5333,102 +5468,44 @@ def resultado_sinal(par):
 
         if resultado_final:
 
-            # Grava a vela da ENTRADA no histórico — é ela que
-            # mede a estratégia. Um "WIN 2G" foi, na origem,
-            # uma leitura errada; contar como acerto ensinaria
-            # o sistema a repetir o erro.
+            # O m1 é o resultado da estratégia para o aprendizado.
+            # Pode já estar gravado de uma tentativa anterior; mesmo
+            # assim o cartão do Telegram precisa continuar sendo tentado
+            # até confirmar.
             try:
-                gravado = registrar_resultado_historico(
+                registrar_resultado_historico(
+                    par, inicio_candle, sinal, m1
+                )
+            except Exception:
+                pass
+
+            try:
+                registrar_final_historico(
                     par,
                     inicio_candle,
                     sinal,
-                    m1,
+                    resultado_final,
+                    etapa_final,
                 )
             except Exception:
-                gravado = False
+                pass
 
-            # Só manda o Telegram na primeira gravação. A rota
-            # é consultada várias vezes pro mesmo sinal.
-            if gravado:
-
-                # Guarda também o resultado que o GRUPO vai ver, com o
-                # gale já considerado. É ele que alimenta o relatório de
-                # sessão — sem isto, um "WIN 1G" apareceria lá como ❌.
-                try:
-                    registrar_final_historico(
-                        par,
-                        inicio_candle,
-                        sinal,
-                        resultado_final,
-                        etapa_final,
-                    )
-                except Exception:
-                    pass
-
-                # SO MANDA O RESULTADO SE A ENTRADA FOI AO GRUPO.
-                #
-                # IMPORTANTE: o próximo sinal NÃO pode ser liberado
-                # enquanto o sticker + texto do resultado ainda estão
-                # na fila do Telegram. Antes, encerrar_sequencia() era
-                # chamado logo depois de colocar o resultado na fila.
-                # Isso permitia que o próximo sinal fosse confirmado
-                # antes do resultado anterior aparecer.
-                if foi_avisado_telegram(par, inicio_candle, sinal):
-                    try:
-                        imagem, caption = montar_resultado_gale(
-                            par,
-                            sinal,
-                            inicio_candle,
-                            resultado_final,
-                            etapa_final,
-                        )
-
-                        def _resultado_confirmado():
-                            # Só depois que o Telegram confirmou o
-                            # cartão inteiro é que o grupo fica livre.
-                            try:
-                                gratis_ao_enviar_resultado(
-                                    par,
-                                    inicio_candle,
-                                    sinal,
-                                    resultado_final,
-                                    etapa_final,
-                                    imagem,
-                                    caption,
-                                )
-                            except Exception as erro:
-                                print(
-                                    "GRATIS: resultado não copiado —",
-                                    str(erro)[:120],
-                                )
-                            finally:
-                                try:
-                                    encerrar_sequencia(par, inicio_candle)
-                                except Exception:
-                                    pass
-
-                        # A função chama _resultado_confirmado SOMENTE
-                        # quando sticker/foto + texto foram confirmados
-                        # pelo Telegram. Assim a ordem fica sempre:
-                        #
-                        # ENTRADA -> RESULTADO -> PRÓXIMA ENTRADA
-                        enviar_telegram_foto(
-                            imagem,
-                            caption,
-                            ao_confirmar=_resultado_confirmado,
-                        )
-
-                    except Exception:
-                        pass
-
-                else:
-                    # A entrada não foi confirmada no Telegram. Não
-                    # existe resultado para anunciar; libera a trava
-                    # para não deixar o grupo preso indefinidamente.
-                    try:
-                        encerrar_sequencia(par, inicio_candle)
-                    except Exception:
-                        pass
+            # IMPORTANTE: não usamos mais "gravado" como trava do Telegram.
+            # Se o banco gravou e o Telegram falhou, a próxima conferência
+            # precisa poder reenviar WIN / WIN 1G / WIN 2G / LOSS.
+            try:
+                _enviar_resultado_persistente(
+                    par,
+                    inicio_candle,
+                    sinal,
+                    resultado_final,
+                    etapa_final,
+                )
+            except Exception as erro:
+                print(
+                    "TELEGRAM: resultado pendente —",
+                    str(erro)[:120],
+                )
 
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
@@ -6764,8 +6841,48 @@ def _buscar_pendentes_worker():
         return []
 
 
+def _processar_resultados_telegram_pendentes():
+    """Reenvia resultados já calculados mas ainda não confirmados."""
+
+    if not _DB_PRONTO:
+        return
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linhas = conexao.execute(
+                """
+                SELECT par, entrada_em, sinal, resultado_final, etapa_final
+                  FROM historico_sinais
+                 WHERE resultado_final IN ('WIN', 'LOSS', 'EMPATE')
+                   AND COALESCE(resultado_tg_enviado, 0) = 0
+                   AND avisado_tg = 1
+              ORDER BY entrada_em ASC
+                 LIMIT 25
+                """
+            ).fetchall()
+            conexao.close()
+    except Exception:
+        return
+
+    for linha in linhas:
+        try:
+            _enviar_resultado_persistente(
+                str(linha["par"]),
+                int(linha["entrada_em"]),
+                str(linha["sinal"]).upper(),
+                str(linha["resultado_final"]),
+                int(linha["etapa_final"] or 0),
+            )
+        except Exception:
+            pass
+
+
 def _processar_resultados_worker():
-    """Fecha automaticamente os sinais pendentes."""
+    """Fecha resultados e reenvia qualquer cartão ainda não confirmado."""
+
+    _processar_resultados_telegram_pendentes()
+
 
     apagados = _expirar_pendentes_velhos()
     if apagados:
@@ -8357,7 +8474,14 @@ ACOMPANHANTE_INTERVALO = max(1, int(os.getenv("ACOMPANHANTE_INTERVALO", "1")))
 
 
 def _acompanhar_sequencia():
-    """Confere a operação aberta no grupo, se uma vela nova fechou."""
+    """Confere a operação aberta e garante o resultado no Telegram."""
+
+    # Primeiro, tenta qualquer resultado que ficou gravado mas ainda
+    # não foi confirmado pelo Telegram. Isso não depende de nova vela.
+    try:
+        _processar_resultados_telegram_pendentes()
+    except Exception:
+        pass
 
     with _lock_espera_entrada:
         aberta = dict(_sequencia_aberta) if _sequencia_aberta else None
