@@ -149,23 +149,17 @@ def _post_telegram(metodo, tentativas=3, **kwargs):
     return FALHOU, None
 
 
-def _enviar_telegram_texto_sync(mensagem, tentativas=3, chat_id=None):
-    """Manda o cartão de texto. Devolve ENVIADO, TALVEZ ou FALHOU.
+def _enviar_telegram_texto_sync(mensagem, tentativas=3):
+    """Manda o cartão de texto. Devolve ENVIADO, TALVEZ ou FALHOU."""
 
-    chat_id: grupo de destino. Sem ele, vai para o grupo principal
-    (TELEGRAM_CHAT_ID). O grupo grátis passa o dele.
-    """
-
-    chat = chat_id or TELEGRAM_CHAT_ID
-
-    if not TELEGRAM_BOT_TOKEN or not chat:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return FALHOU
 
     estado, _ = _post_telegram(
         "sendMessage",
         tentativas=tentativas,
         json={
-            "chat_id": chat,
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": mensagem,
             "parse_mode": "HTML",
         },
@@ -177,16 +171,14 @@ def _enviar_telegram_texto_sync(mensagem, tentativas=3, chat_id=None):
     return estado
 
 
-def _enviar_telegram_sticker_sync(caminho_imagem, chat_id=None):
+def _enviar_telegram_sticker_sync(caminho_imagem):
     """Manda a imagem como STICKER (sem moldura, sem fundo branco).
 
     Devolve (estado, id_da_mensagem). O id serve para apagar o
     sticker se o texto do cartão com certeza não chegar.
     """
 
-    chat = chat_id or TELEGRAM_CHAT_ID
-
-    if not TELEGRAM_BOT_TOKEN or not chat:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return FALHOU, None
 
     if not caminho_imagem or not os.path.isfile(caminho_imagem):
@@ -196,7 +188,7 @@ def _enviar_telegram_sticker_sync(caminho_imagem, chat_id=None):
         with open(caminho_imagem, "rb") as arquivo_imagem:
             estado, dados = _post_telegram(
                 "sendSticker",
-                data={"chat_id": chat},
+                data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"sticker": arquivo_imagem},
             )
     except Exception:
@@ -212,16 +204,14 @@ def _enviar_telegram_sticker_sync(caminho_imagem, chat_id=None):
     return estado, id_msg
 
 
-def _enviar_telegram_photo_sync(caminho_imagem, chat_id=None):
+def _enviar_telegram_photo_sync(caminho_imagem):
     """Reserva: só usado se o arquivo for rejeitado como
     sticker (ex: não bate com o tamanho/tipo exigido pelo
     Telegram). Melhor a imagem chegar com moldura do que não
     chegar de jeito nenhum.
     """
 
-    chat = chat_id or TELEGRAM_CHAT_ID
-
-    if not TELEGRAM_BOT_TOKEN or not chat:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
     try:
@@ -236,7 +226,7 @@ def _enviar_telegram_photo_sync(caminho_imagem, chat_id=None):
 
             resposta = requests.post(
                 url,
-                data={"chat_id": chat},
+                data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"photo": arquivo_imagem},
                 timeout=8,
             )
@@ -248,7 +238,7 @@ def _enviar_telegram_photo_sync(caminho_imagem, chat_id=None):
         return False
 
 
-def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
+def _apagar_mensagem_telegram(id_mensagem):
     """Apaga uma mensagem já enviada ao grupo.
 
     Usado só num caso: o sticker foi entregue mas o cartão de
@@ -257,9 +247,7 @@ def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
     entrar.
     """
 
-    chat = chat_id or TELEGRAM_CHAT_ID
-
-    if not TELEGRAM_BOT_TOKEN or not chat:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
     if not isinstance(id_mensagem, int):
@@ -271,7 +259,7 @@ def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
             + TELEGRAM_BOT_TOKEN
             + "/deleteMessage",
             json={
-                "chat_id": chat,
+                "chat_id": TELEGRAM_CHAT_ID,
                 "message_id": id_mensagem,
             },
             timeout=10,
@@ -282,7 +270,7 @@ def _apagar_mensagem_telegram(id_mensagem, chat_id=None):
         return False
 
 
-def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
+def _enviar_cartao_telegram_sync(caminho_imagem, caption):
     """Ícone (sticker) primeiro, cartão de texto logo depois.
 
     A IMAGEM SÓ VAI UMA VEZ
@@ -298,21 +286,19 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
 
     if caminho_imagem and os.path.isfile(caminho_imagem):
 
-        estado, id_sticker = _enviar_telegram_sticker_sync(
-            caminho_imagem, chat_id=chat_id
-        )
+        estado, id_sticker = _enviar_telegram_sticker_sync(caminho_imagem)
 
         if estado == RECUSADO:
-            _enviar_telegram_photo_sync(caminho_imagem, chat_id=chat_id)
+            _enviar_telegram_photo_sync(caminho_imagem)
 
-    estado_texto = _enviar_telegram_texto_sync(caption, chat_id=chat_id)
+    estado_texto = _enviar_telegram_texto_sync(caption)
 
     # ÍCONE SEM CARTÃO NÃO SERVE PARA NADA — mas só apaga quando é
     # CERTO que o texto não chegou. Se a confirmação só atrasou, o
     # texto provavelmente está no grupo, e apagar o ícone deixaria
     # o cartão sem a imagem.
     if estado_texto == FALHOU and id_sticker:
-        _apagar_mensagem_telegram(id_sticker, chat_id=chat_id)
+        _apagar_mensagem_telegram(id_sticker)
 
 
 # Quantos cartoes podem estar esperando na fila.
@@ -325,15 +311,13 @@ def _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id=None):
 # Com teto, cartao velho demais e descartado em vez de sair
 # atrasado. Melhor nao mandar do que mandar uma entrada que ja
 # passou da hora.
-# Era 4. Com o grupo grátis, um sinal pode virar 3 cartões de uma
-# vez (grupo pago + cabeçalho da lista + grupo grátis).
-_FILA_TELEGRAM_MAXIMA = 7
+_FILA_TELEGRAM_MAXIMA = 4
 
 _fila_telegram = 0
 _lock_fila_telegram = threading.Lock()
 
 
-def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
+def enviar_telegram_foto(caminho_imagem, caption):
     """Dispara o envio (sticker + cartão) em segundo plano,
     sem travar a rota.
     """
@@ -353,7 +337,7 @@ def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
     def _tarefa():
         global _fila_telegram
         try:
-            _enviar_cartao_telegram_sync(caminho_imagem, caption, chat_id)
+            _enviar_cartao_telegram_sync(caminho_imagem, caption)
         finally:
             with _lock_fila_telegram:
                 _fila_telegram -= 1
@@ -363,417 +347,6 @@ def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
     except Exception:
         with _lock_fila_telegram:
             _fila_telegram -= 1
-
-
-# ============================================================
-# GRUPO GRÁTIS — 3 LISTAS DE 5 SINAIS POR DIA
-# ============================================================
-#
-# Um segundo grupo do Telegram, aberto, para atrair alunos.
-# Ele NÃO tem robô próprio: recebe uma CÓPIA dos sinais do grupo
-# pago, mas só os 5 primeiros de cada período:
-#
-#   LISTA DA MANHÃ  -> 5 sinais a partir das 09:00
-#   LISTA DA TARDE  -> 5 sinais a partir das 15:00
-#   LISTA DA NOITE  -> 5 sinais a partir das 20:00
-#
-# Cada sinal leva o resultado (WIN, WIN 1G, WIN 2G, LOSS ou
-# EMPATE), com o mesmo sticker do grupo pago. Quando os 5
-# resultados saem, vai um resumo da lista.
-#
-# Como é uma cópia, vale tudo o que vale no grupo pago: um par
-# por vez, resultado na hora, sem cripto (se ela estiver fora).
-#
-# CONFIGURAÇÃO NO RENDER (Environment)
-#
-#   TELEGRAM_CHAT_ID_GRATIS  -> id do grupo grátis (ex.: -1001234567890)
-#                               Sem ele, nada vai para o grupo grátis.
-#   GRATIS_HORARIOS          -> horas de início (padrão "9,15,20")
-#   GRATIS_POR_LISTA         -> sinais por lista (padrão 5)
-#   GRATIS_JANELA_MIN        -> minutos para juntar os sinais da
-#                               lista (padrão 60). Se em 1 hora não
-#                               saírem 5, a lista fecha com os que
-#                               saíram.
-#
-# O BOT precisa ser ADMINISTRADOR do grupo grátis, com permissão
-# de enviar e apagar mensagens.
-
-TELEGRAM_CHAT_ID_GRATIS = (os.getenv("TELEGRAM_CHAT_ID_GRATIS") or "").strip()
-
-GRATIS_HORARIOS = sorted({
-    int(h) for h in os.getenv("GRATIS_HORARIOS", "9,15,20").split(",")
-    if h.strip().isdigit() and 0 <= int(h) <= 23
-})
-
-GRATIS_POR_LISTA = max(1, int(os.getenv("GRATIS_POR_LISTA", "5")))
-
-GRATIS_JANELA_MIN = max(10, int(os.getenv("GRATIS_JANELA_MIN", "60")))
-
-# Depois que a janela fecha, quanto esperar por um resultado que
-# não veio antes de mandar o resumo assim mesmo.
-GRATIS_ESPERA_RESUMO = 600
-
-_gratis = {}
-_gratis_lock = threading.Lock()
-
-
-def _nome_lista(hora):
-    if hora < 12:
-        return "DA MANHÃ"
-    if hora < 18:
-        return "DA TARDE"
-    return "DA NOITE"
-
-
-def _janela_gratis_atual(agora=None):
-    """(chave, inicio_ts, hora) da lista aberta agora, ou None."""
-
-    if not TELEGRAM_CHAT_ID_GRATIS:
-        return None
-
-    agora_ts = time.time() if agora is None else agora
-    agora_dt = datetime.fromtimestamp(agora_ts, tz=FUSO_BR)
-
-    for hora in GRATIS_HORARIOS:
-        inicio = agora_dt.replace(hour=hora, minute=0, second=0, microsecond=0)
-        passou = agora_ts - inicio.timestamp()
-        if 0 <= passou < GRATIS_JANELA_MIN * 60:
-            chave = inicio.date().isoformat() + "|" + f"{hora:02d}"
-            return chave, int(inicio.timestamp()), hora
-
-    return None
-
-
-def gratis_ao_enviar_sinal(par, analise):
-    """Chamado logo depois que um sinal vai ao grupo pago."""
-
-    # Se o 1º sinal da lista sair antes da volta do worker, o aviso
-    # animado vai na frente dele (a fila do Telegram é uma só).
-    try:
-        gratis_aviso_inicio()
-    except Exception:
-        pass
-
-    janela = _janela_gratis_atual()
-
-    if not janela:
-        return
-
-    chave_j, inicio_ts, hora = janela
-
-    try:
-        chave_s = (str(par), int(analise.get("entrada_em")), str(analise.get("sinal")))
-    except Exception:
-        return
-
-    with _gratis_lock:
-
-        lista = _gratis.setdefault(chave_j, {
-            "inicio": inicio_ts,
-            "hora": hora,
-            "sinais": [],
-            "resultados": {},
-            "resumo": False,
-        })
-
-        if chave_s in lista["sinais"]:
-            return
-
-        if len(lista["sinais"]) >= GRATIS_POR_LISTA:
-            return
-
-        lista["sinais"].append(chave_s)
-        numero = len(lista["sinais"])
-
-    nome = _nome_lista(hora)
-    dia = datetime.fromtimestamp(inicio_ts, tz=FUSO_BR).strftime("%d/%m")
-
-    if numero == 1:
-        enviar_telegram_foto(
-            None,
-            f"📋 <b>LISTA {nome}</b> · {dia}\n"
-            "────────────\n"
-            f"🎁 {GRATIS_POR_LISTA} sinais grátis a partir das {hora:02d}:00\n"
-            "⏱ Duração M1 · Martingale até G2 (opcional)\n"
-            "📌 Cada sinal chega com o horário de entrada, e o\n"
-            "resultado sai logo depois.\n\n"
-            "⚠️ <i>Alerta técnico e educacional.</i>",
-            chat_id=TELEGRAM_CHAT_ID_GRATIS,
-        )
-
-    caption = (
-        montar_caption_sinal(par, analise)
-        + f"\n\n🎁 Lista {nome.lower()} · sinal {numero} de {GRATIS_POR_LISTA}"
-    )
-
-    enviar_telegram_foto(
-        escolher_imagem_sinal(analise.get("sinal")),
-        caption,
-        chat_id=TELEGRAM_CHAT_ID_GRATIS,
-    )
-
-
-def gratis_ao_enviar_resultado(par, entrada_em, sinal, final, etapa, imagem, caption):
-    """Chamado logo depois que um resultado vai ao grupo pago."""
-
-    if not TELEGRAM_CHAT_ID_GRATIS:
-        return
-
-    chave_s = (str(par), int(entrada_em), str(sinal))
-    alvo = None
-
-    with _gratis_lock:
-        for chave_j, lista in _gratis.items():
-            if chave_s in lista["sinais"] and chave_s not in lista["resultados"]:
-                lista["resultados"][chave_s] = (final, int(etapa or 0))
-                alvo = chave_j
-                break
-
-    if not alvo:
-        return
-
-    enviar_telegram_foto(imagem, caption, chat_id=TELEGRAM_CHAT_ID_GRATIS)
-
-    _gratis_talvez_resumo(alvo)
-
-
-def _gratis_talvez_resumo(chave_j):
-    """Manda o resumo da lista quando ela terminou."""
-
-    agora = time.time()
-
-    with _gratis_lock:
-
-        lista = _gratis.get(chave_j)
-
-        if not lista or lista["resumo"] or not lista["sinais"]:
-            return
-
-        enviados = len(lista["sinais"])
-        prontos = len(lista["resultados"])
-        fim_janela = lista["inicio"] + GRATIS_JANELA_MIN * 60
-
-        completa = enviados >= GRATIS_POR_LISTA and prontos >= enviados
-        janela_fechou = agora >= fim_janela and prontos >= enviados
-        desistiu = agora >= fim_janela + GRATIS_ESPERA_RESUMO
-
-        if not (completa or janela_fechou or desistiu):
-            return
-
-        lista["resumo"] = True
-        sinais = list(lista["sinais"])
-        resultados = dict(lista["resultados"])
-        hora = lista["hora"]
-        inicio = lista["inicio"]
-
-    linhas = []
-    wins = losses = 0
-
-    for par, entrada, sinal in sinais:
-
-        final, etapa = resultados.get((par, entrada, sinal), (None, 0))
-        hora_txt = datetime.fromtimestamp(entrada, tz=FUSO_BR).strftime("%H:%M")
-
-        if final == "WIN":
-            marca = "✅" + (f" G{etapa}" if etapa else "")
-            wins += 1
-        elif final == "LOSS":
-            marca = "❌"
-            losses += 1
-        elif final == "EMPATE":
-            marca = "⚪ empate"
-        else:
-            marca = "⏳ sem resultado"
-
-        linhas.append(f"{hora_txt}  {nome_bonito(par)}  {sinal}  {marca}")
-
-    dia = datetime.fromtimestamp(inicio, tz=FUSO_BR).strftime("%d/%m")
-
-    texto = (
-        f"📊 <b>RESULTADO DA LISTA {_nome_lista(hora)}</b> · {dia}\n"
-        "────────────\n"
-        + "\n".join(linhas)
-        + "\n────────────\n"
-        + f"✅ Wins: {wins}   ❌ Losses: {losses}\n\n"
-        "<i>Resultado com gale, do jeito que saiu aqui no grupo. "
-        "Não é garantia de resultado futuro.</i>"
-    )
-
-    enviar_telegram_foto(None, texto, chat_id=TELEGRAM_CHAT_ID_GRATIS)
-
-
-def gratis_fechar_listas():
-    """Chamado pelo worker: fecha listas que acabaram e limpa as velhas."""
-
-    if not TELEGRAM_CHAT_ID_GRATIS:
-        return
-
-    for chave in list(_gratis.keys()):
-        _gratis_talvez_resumo(chave)
-
-    limite = time.time() - 2 * 86400
-    with _gratis_lock:
-        for chave in [c for c, l in _gratis.items() if l["inicio"] < limite]:
-            _gratis.pop(chave, None)
-
-
-# ------------------------------------------------------------
-# AVISOS ANIMADOS DAS LISTAS DO GRUPO GRÁTIS
-# ------------------------------------------------------------
-# Cada lista (09:00, 15:00, 20:00) tem DOIS avisos com vídeo
-# curto (aparece como GIF no Telegram):
-#
-#   1) 15 MIN ANTES (08:45, 14:45, 19:45) — amarelo, "FALTAM 15
-#      MINUTOS!", para o aluno abrir a corretora a tempo.
-#   2) NA HORA (09:00, 15:00, 20:00) — azul/verde, "COMEÇOU
-#      AGORA!", antes do primeiro sinal da lista.
-#
-# Cada aviso sai UMA vez: a marca fica no banco (a mesma tabela
-# do relatório da sessão), então reiniciar o Render não repete.
-#
-# Se o servidor estava fora do ar na hora, só manda se ainda
-# estiver nos primeiros GRATIS_AVISO_MIN minutos. Aviso atrasado
-# só confunde.
-#
-# Arquivos na raiz, ao lado das imagens .webp:
-#   aviso_pre_manha.mp4    aviso_lista_manha.mp4   (lista das 09:00)
-#   aviso_pre_tarde.mp4    aviso_lista_tarde.mp4   (lista das 15:00)
-#   aviso_pre_noite.mp4    aviso_lista_noite.mp4   (lista das 20:00)
-# Sem o arquivo, vai só o texto. Os vídeos "pre" dizem "FALTAM 15
-# MINUTOS" — se GRATIS_PRE_AVISO_MIN for outro número, o aviso
-# antes vai só em texto (para não mostrar o número errado).
-#
-# CONFIGURAÇÃO NO RENDER (Environment)
-#   GRATIS_AVISO          -> "0" desliga OS DOIS avisos (padrão ligado)
-#   GRATIS_PRE_AVISO_MIN  -> minutos antes da lista (padrão 15;
-#                            "0" desliga só o aviso de antes)
-#   GRATIS_AVISO_MIN      -> minutos de tolerância (padrão 5)
-
-GRATIS_AVISO = os.getenv("GRATIS_AVISO", "1").strip() != "0"
-GRATIS_AVISO_MIN = max(1, int(os.getenv("GRATIS_AVISO_MIN", "5")))
-GRATIS_PRE_AVISO_MIN = max(0, int(os.getenv("GRATIS_PRE_AVISO_MIN", "15")))
-
-# Reserva para quando o banco não estiver pronto.
-_gratis_avisos_memoria = set()
-
-
-def _arquivo_aviso_lista(hora, tipo="lista"):
-    """tipo "lista" (na hora) ou "pre" (15 min antes)."""
-    if hora < 12:
-        nome = "manha"
-    elif hora < 18:
-        nome = "tarde"
-    else:
-        nome = "noite"
-    return os.path.join(DIRETORIO_APP, f"aviso_{tipo}_{nome}.mp4")
-
-
-def _enviar_aviso_lista_sync(caminho, legenda):
-    """Manda o vídeo do aviso. Se o vídeo falhar, manda só o texto."""
-
-    if caminho and os.path.isfile(caminho):
-        try:
-            with open(caminho, "rb") as arquivo:
-                estado, _ = _post_telegram(
-                    "sendAnimation",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID_GRATIS,
-                        "caption": legenda,
-                        "parse_mode": "HTML",
-                        "width": 720,
-                        "height": 720,
-                    },
-                    files={
-                        "animation": (
-                            os.path.basename(caminho), arquivo, "video/mp4"
-                        )
-                    },
-                )
-            # TALVEZ = pode ter chegado. Mandar o texto também
-            # arriscaria aviso duplicado no grupo.
-            if estado in (ENVIADO, TALVEZ):
-                return
-        except Exception:
-            pass
-
-    _enviar_telegram_texto_sync(legenda, chat_id=TELEGRAM_CHAT_ID_GRATIS)
-
-
-def _marcar_aviso_lista(chave):
-    """True só na primeira vez que este aviso aparece."""
-
-    if _DB_PRONTO:
-        return _marcar_relatorio_enviado("aviso_gratis|" + chave)
-
-    with _gratis_lock:
-        if chave in _gratis_avisos_memoria:
-            return False
-        _gratis_avisos_memoria.add(chave)
-        if len(_gratis_avisos_memoria) > 60:
-            _gratis_avisos_memoria.clear()
-            _gratis_avisos_memoria.add(chave)
-        return True
-
-
-def gratis_aviso_inicio():
-    """Chamado pelo worker: manda os avisos de antes e da hora da lista."""
-
-    if not TELEGRAM_CHAT_ID_GRATIS or not TELEGRAM_BOT_TOKEN or not GRATIS_AVISO:
-        return
-
-    agora_ts = time.time()
-    agora_dt = datetime.fromtimestamp(agora_ts, tz=FUSO_BR)
-
-    for hora in GRATIS_HORARIOS:
-
-        # Hoje e amanhã: o aviso de antes de uma lista à meia-noite
-        # cairia no dia anterior.
-        for dias in (0, 1):
-
-            inicio = (agora_dt + timedelta(days=dias)).replace(
-                hour=hora, minute=0, second=0, microsecond=0
-            )
-            chave = inicio.date().isoformat() + "|" + f"{hora:02d}"
-            nome = _nome_lista(hora)
-
-            avisos = []
-
-            if GRATIS_PRE_AVISO_MIN:
-                avisos.append((
-                    "pre|" + chave,
-                    inicio.timestamp() - GRATIS_PRE_AVISO_MIN * 60,
-                    _arquivo_aviso_lista(hora, "pre")
-                    if GRATIS_PRE_AVISO_MIN == 15 else None,
-                    f"⏰ <b>FALTAM {GRATIS_PRE_AVISO_MIN} MINUTOS!</b>\n"
-                    f"📋 A lista {nome.lower()} começa às {hora:02d}:00\n"
-                    "📲 Abra a corretora e fique pronto!",
-                ))
-
-            avisos.append((
-                chave,
-                inicio.timestamp(),
-                _arquivo_aviso_lista(hora, "lista"),
-                f"🔔 <b>A LISTA {nome} COMEÇOU!</b>\n"
-                f"🎁 {GRATIS_POR_LISTA} sinais grátis a partir de agora · M1\n"
-                "👀 Fique atento e deixe a corretora aberta!",
-            ))
-
-            for marca, quando, caminho, legenda in avisos:
-
-                passou = agora_ts - quando
-
-                if not (0 <= passou < GRATIS_AVISO_MIN * 60):
-                    continue
-
-                # Marca ANTES de enviar, igual ao relatório: nunca duas vezes.
-                if not _marcar_aviso_lista(marca):
-                    continue
-
-                try:
-                    _executor_telegram.submit(_enviar_aviso_lista_sync, caminho, legenda)
-                    print("GRATIS: aviso", marca, "enviado.")
-                except Exception:
-                    pass
 
 
 # ------------------------------------------------------------
@@ -866,13 +439,9 @@ def montar_caption_sinal(par, analise):
 #
 # Com 3 minutos de espera, só o primeiro passa. Os outros são
 # descartados; se ainda forem bons, aparecem na próxima volta.
-#
-# 16/11/2026: padrão 300 s (pedido do Daniel). No máximo 1 sinal a
-# cada 5 minutos no grupo, mesmo quando o anterior deu WIN direto
-# e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "0")
 )
 
 _ultima_entrada_enviada = 0
@@ -1079,6 +648,23 @@ def encerrar_sequencia(par, entrada_em):
 #
 # Isto vale SÓ para o Telegram. O painel do site continua
 # exatamente como está.
+
+def encerrar_sequencia(par, entrada_em):
+
+    global _sequencia_aberta
+
+    with _lock_espera_entrada:
+
+        aberta = _sequencia_aberta
+
+        if not aberta:
+            return
+
+        if (
+            aberta.get("par") == str(par)
+            and int(aberta.get("entrada_em", 0)) == int(entrada_em)
+        ):
+            _sequencia_aberta = None
 
 VELAS_ANTECEDENCIA = int(
     os.getenv("VELAS_ANTECEDENCIA", "1")
@@ -1477,6 +1063,25 @@ ESTRATEGIA = (
 )
 
 # ============================================================
+# ANTI-LOSS
+# ============================================================
+
+ANTI_LOSS_ATIVO = True
+
+# Diferença mínima entre CALL e PUT para aceitar entrada
+ANTI_LOSS_DIFERENCA = 6
+
+# RSI muito extremo = evitar entrada
+ANTI_LOSS_RSI_CALL_MAX = 70
+ANTI_LOSS_RSI_PUT_MIN = 30
+
+# Exige confirmação da tendência
+ANTI_LOSS_EXIGE_TENDENCIA = True
+
+# Exige MHI na mesma direção
+ANTI_LOSS_EXIGE_MHI = True
+
+# ============================================================
 # APERTO DO FILTRO — QUANTOS SINAIS APARECEM
 # ============================================================
 #
@@ -1525,14 +1130,28 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
     os.getenv("PONTUACAO_MINIMA", "5")
 )))
 
-# 15/11/2026: subiu de 4 para 5, e depois para 6 (pedido do Daniel).
-# Nos 902 sinais conferidos, os de força MÉDIA (diferença 3-4)
-# acertaram só 46,5%, contra 52,8% dos FORTE (5-6) e 54,6% dos
-# MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
-# MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "6")
+    os.getenv("DIFERENCA_MINIMA", "4")
 )))
+
+# ============================================================
+# ANTI-LOSS
+# ============================================================
+
+ANTI_LOSS_ATIVO = True
+
+# Diferença mínima entre CALL e PUT para aceitar entrada
+ANTI_LOSS_DIFERENCA = 6
+
+# RSI muito extremo = evitar entrada
+ANTI_LOSS_RSI_CALL_MAX = 70
+ANTI_LOSS_RSI_PUT_MIN = 30
+
+# Exige confirmação da tendência
+ANTI_LOSS_EXIGE_TENDENCIA = True
+
+# Exige MHI na mesma direção
+ANTI_LOSS_EXIGE_MHI = True
 
 # ============================================================
 # CONEXÃO PERSISTENTE
@@ -3869,6 +3488,103 @@ def analisar_sinal(candles, par=None, tf=None):
     pontos_put_final = max(0, pontos_put + ajuste_put)
 
     # --------------------------------------------------------
+    # ANTI-LOSS
+    # --------------------------------------------------------
+
+    if ANTI_LOSS_ATIVO and direcao_base:
+
+        bloqueios_anti_loss = []
+
+        # 1. DIFERENÇA ENTRE OS LADOS
+        diferenca = abs(
+            pontos_call - pontos_put
+        )
+
+        if diferenca < ANTI_LOSS_DIFERENCA:
+
+            bloqueios_anti_loss.append(
+                "DIFERENCA_FRACA"
+            )
+
+        # 2. TENDÊNCIA
+        if ANTI_LOSS_EXIGE_TENDENCIA:
+
+            if (
+                direcao_base == "CALL"
+                and tendencia != "ALTA"
+            ):
+
+                bloqueios_anti_loss.append(
+                    "CALL_CONTRA_TENDENCIA"
+                )
+
+            elif (
+                direcao_base == "PUT"
+                and tendencia != "BAIXA"
+            ):
+
+                bloqueios_anti_loss.append(
+                    "PUT_CONTRA_TENDENCIA"
+                )
+
+        # 3. RSI
+        if rsi is not None:
+
+            if (
+                direcao_base == "CALL"
+                and rsi >= ANTI_LOSS_RSI_CALL_MAX
+            ):
+
+                bloqueios_anti_loss.append(
+                    "RSI_SOBRECOMPRADO"
+                )
+
+            elif (
+                direcao_base == "PUT"
+                and rsi <= ANTI_LOSS_RSI_PUT_MIN
+            ):
+
+                bloqueios_anti_loss.append(
+                    "RSI_SOBREVENDIDO"
+                )
+
+        # 4. MHI
+        if ANTI_LOSS_EXIGE_MHI:
+
+            if (
+                direcao_base == "CALL"
+                and mhi["direcao"] != "CALL"
+            ):
+
+                bloqueios_anti_loss.append(
+                    "MHI_CONTRA_CALL"
+                )
+
+            elif (
+                direcao_base == "PUT"
+                and mhi["direcao"] != "PUT"
+            ):
+
+                bloqueios_anti_loss.append(
+                    "MHI_CONTRA_PUT"
+                )
+
+        # 5. SE HOUVER QUALQUER BLOQUEIO,
+        # NÃO DEIXA O SINAL CHEGAR NA ENTRADA
+        if bloqueios_anti_loss:
+
+            sinal = "AGUARDANDO"
+
+            status = "ANTI-LOSS — ENTRADA BLOQUEADA"
+
+            confianca = 0
+
+            motivo_filtro = (
+                "ANTI_LOSS:"
+                + "|".join(bloqueios_anti_loss)
+            )
+
+    # --------------------------------------------------------
     # CONFIRMAÇÃO FINAL
     # --------------------------------------------------------
 
@@ -3876,7 +3592,8 @@ def analisar_sinal(candles, par=None, tf=None):
 
         # O ajuste negativo pode derrubar um sinal fraco.
         if (
-            pontos_call_final >= PONTUACAO_MINIMA
+            not bloqueios_anti_loss
+            and pontos_call_final >= PONTUACAO_MINIMA
             and pontos_call_final - pontos_put_final
             >= DIFERENCA_MINIMA
         ):
@@ -3895,7 +3612,8 @@ def analisar_sinal(candles, par=None, tf=None):
     elif direcao_base == "PUT":
 
         if (
-            pontos_put_final >= PONTUACAO_MINIMA
+            not bloqueios_anti_loss
+            and pontos_put_final >= PONTUACAO_MINIMA
             and pontos_put_final - pontos_call_final
             >= DIFERENCA_MINIMA
         ):
@@ -4607,410 +4325,6 @@ def ver_historico():
 
 
 # ============================================================
-# VELAS ANTIGAS (só leitura, para TESTAR estratégias)
-# ============================================================
-#
-# Devolve muitas velas M1 do passado de um par (até 20000), em
-# lotes de 1000 pedidos à corretora andando para trás no tempo.
-# Serve para testar indicadores novos (Fibonacci, toque no
-# pavio etc.) em milhares de velas ANTES de ligar no robô.
-# Não grava nada, não manda nada ao Telegram, não mexe em sinal.
-#
-# Uso: /velas-antigas/EURUSD-OTC?n=3000
-# Resposta: velas = [[from, open, close, low, high], ...]
-# ============================================================
-
-def _buscar_velas_antigas(iq, par, quantas):
-    velas = {}
-    try:
-        fim = int(iq.get_server_timestamp())
-    except Exception:
-        fim = int(time.time())
-    for _ in range(24):
-        if len(velas) >= quantas:
-            break
-        lote = iq.get_candles(par, 60, 1000, fim)
-        if not lote:
-            break
-        menor = fim
-        for c in lote:
-            try:
-                v = normalizar_candle(c)
-            except Exception:
-                continue
-            velas[v["from"]] = [
-                v["from"], v["open"], v["close"], v["low"], v["high"],
-            ]
-            menor = min(menor, v["from"])
-        if menor >= fim:
-            break
-        fim = menor - 1
-    return sorted(velas.values())[-quantas:]
-
-
-@app.get("/velas-antigas/<par>")
-def velas_antigas(par):
-
-    par = par.strip().upper()
-
-    try:
-        quantas = max(100, min(20000, int(request.args.get("n", "2000"))))
-    except Exception:
-        quantas = 2000
-
-    try:
-        iq = conectar_com_timeout()
-        futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
-        velas = futuro.result(timeout=80)
-    except Exception as erro:
-        return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
-
-    return jsonify({
-        "ok": True,
-        "par": par,
-        "timeframe": "M1",
-        "quantidade": len(velas),
-        "velas": velas,
-    })
-
-
-# ============================================================
-# TESTE SILENCIOSO — LINHA HORIZONTAL + PAVIO (não manda nada)
-# ============================================================
-#
-# Estratégia candidata (backtest de 16/11/2026, 8 pares OTC):
-#   - linha horizontal: topo/fundo das últimas 120 velas onde o
-#     preço tocou 3 vezes ou mais (tolerância 0,1 ATR);
-#   - a vela fecha com pavio >= 2x o corpo tocando a linha e
-#     fecha de volta  -> aposta na REVERSÃO na vela seguinte.
-#   Backtest: 57,1% (217) e, em 10 dias novos, 53,7% (661).
-#   Empate com payout 86% = 53,8%. Por isso: TESTE AO VIVO antes
-#   de virar sinal.
-#
-# Esta rota só CONTA, a partir de TESTE_LINHA_INICIO, usando as
-# velas reais da corretora. Não grava, não manda no Telegram,
-# não muda nenhum sinal. Uso: /teste-linha
-# ============================================================
-
-TESTE_LINHA_INICIO = int(os.getenv("TESTE_LINHA_INICIO", "1794816000"))  # 16/11/2026 05:00
-_teste_linha_cache = {"quando": 0, "dados": None}
-
-
-def _avaliar_linha_horizontal(velas, inicio):
-    n = len(velas)
-    t = [int(v[0]) for v in velas]
-    o = [v[1] for v in velas]; c = [v[2] for v in velas]
-    lo = [v[3] for v in velas]; hi = [v[4] for v in velas]
-    cor = [(1 if c[i] > o[i] else -1 if c[i] < o[i] else 0) for i in range(n)]
-    topo = [False] * n; fundo = [False] * n
-    for i in range(2, n - 2):
-        topo[i] = hi[i] >= max(hi[i - 2:i + 3])
-        fundo[i] = lo[i] <= min(lo[i - 2:i + 3])
-    conta = {"sinais": 0, "win": 0, "loss": 0, "empate": 0,
-             "win_2": 0, "loss_2": 0, "ultimos": []}
-    for i in range(130, n - 1):
-        if t[i] < inicio:
-            continue
-        if t[i + 1] - t[i - 125] != 126 * 60:
-            continue
-        faixas = [hi[k] - lo[k] for k in range(i - 14, i)]
-        atr = sum(faixas) / 14.0
-        if atr <= 0:
-            continue
-        corpo = abs(c[i] - o[i]) or atr * 0.05
-        pb = min(o[i], c[i]) - lo[i]
-        pc = hi[i] - max(o[i], c[i])
-        tol = atr * 0.1
-        ini, fim = i - 120, i - 3
-        aposta = 0
-        if pc >= 2 * corpo:
-            niveis = [hi[k] for k in range(ini, fim) if topo[k]]
-            for L in niveis:
-                if abs(hi[i] - L) <= tol and c[i] < L and sum(1 for x in niveis if abs(x - L) <= tol) >= 3:
-                    aposta = -1
-                    break
-        if not aposta and pb >= 2 * corpo:
-            niveis = [lo[k] for k in range(ini, fim) if fundo[k]]
-            for L in niveis:
-                if abs(lo[i] - L) <= tol and c[i] > L and sum(1 for x in niveis if abs(x - L) <= tol) >= 3:
-                    aposta = 1
-                    break
-        if not aposta:
-            continue
-        conta["sinais"] += 1
-        r1 = cor[i + 1]
-        if r1 == 0:
-            conta["empate"] += 1; res = "EMPATE"
-        elif r1 == aposta:
-            conta["win"] += 1; res = "WIN"
-        else:
-            conta["loss"] += 1; res = "LOSS"
-        if i + 2 < n and t[i + 2] - t[i + 1] == 60 and cor[i + 2] != 0:
-            if cor[i + 2] == aposta:
-                conta["win_2"] += 1
-            else:
-                conta["loss_2"] += 1
-        conta["ultimos"].append([
-            datetime.fromtimestamp(t[i + 1], tz=FUSO_BR).strftime("%d/%m %H:%M"),
-            "CALL" if aposta == 1 else "PUT", res,
-        ])
-    conta["ultimos"] = conta["ultimos"][-10:]
-    return conta
-
-
-@app.get("/teste-linha")
-def teste_linha():
-
-    if _teste_linha_cache["dados"] and time.time() - _teste_linha_cache["quando"] < 300:
-        return jsonify(_teste_linha_cache["dados"])
-
-    quantas = int((time.time() - TESTE_LINHA_INICIO) / 60) + 140
-    quantas = max(200, min(20000, quantas))
-
-    por_par = {}
-    soma = {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0}
-
-    try:
-        iq = conectar_com_timeout()
-    except Exception as erro:
-        return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
-
-    for par in PARES:
-        try:
-            futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
-            velas = futuro.result(timeout=40)
-            r = _avaliar_linha_horizontal(velas, TESTE_LINHA_INICIO)
-        except Exception as erro:
-            por_par[par] = {"erro": str(erro)[:120]}
-            continue
-        por_par[par] = r
-        for k in soma:
-            soma[k] += r[k]
-
-    decididos = soma["win"] + soma["loss"]
-    taxa = round(100 * soma["win"] / decididos, 1) if decididos else None
-    dec2 = soma["win_2"] + soma["loss_2"]
-    taxa2 = round(100 * soma["win_2"] / dec2, 1) if dec2 else None
-
-    if taxa is None:
-        resumo = "Ainda sem sinais desde o começo do teste."
-    else:
-        resumo = (
-            f"{soma['sinais']} sinais desde o começo. Vela seguinte: {taxa}% "
-            f"({soma['win']} WIN x {soma['loss']} LOSS). Empate do payout 86% = 53,8%. "
-            + ("ACIMA do empate." if taxa >= 53.8 else "ABAIXO do empate.")
-            + " Precisa de 300+ sinais para confiar."
-        )
-
-    dados = {
-        "ok": True,
-        "teste": "linha horizontal (3 toques, 120 velas) + pavio 2x -> reversão na vela seguinte",
-        "comecou_em": datetime.fromtimestamp(TESTE_LINHA_INICIO, tz=FUSO_BR).strftime("%d/%m/%Y %H:%M"),
-        "resumo": resumo,
-        "taxa_vela_seguinte": taxa,
-        "taxa_1_vela_depois": taxa2,
-        "total": soma,
-        "por_par": por_par,
-        "aviso": "Só conta. Não manda sinal e não mexe no grupo.",
-    }
-    _teste_linha_cache["quando"] = time.time()
-    _teste_linha_cache["dados"] = dados
-    return jsonify(dados)
-
-
-# ============================================================
-# TESTE SILENCIOSO — CANDIDATOS DO FOREX (não manda nada)
-# ============================================================
-#
-# Backtest de 16/11/2026 em 8 pares Forex (mercado aberto, M1,
-# 27/10 a 16/11, 160 mil velas). Três candidatas:
-#   corvos   : 3 velas vermelhas seguidas, cada uma fecha mais baixo,
-#              corpo >= metade da faixa média das 14 velas anteriores
-#              -> CALL na vela seguinte. Backtest: 54,1% (1597).
-#   pavio_m5 : vela de 5 min; no 3º minuto o preço andou >= 2x a faixa
-#              média (14 velas M1) desde a abertura -> entra CONTRA,
-#              expira no fim da vela de 5 min (2 min). Backtest: 53,8% (3633).
-#   ema1450  : EMA14 cruza a EMA50 com as EMAs 5/10/20/50 em ordem a
-#              favor do cruzamento -> CONTRA na vela seguinte.
-#              Backtest: 53,5% (647).
-#   Empate com payout 86% = 53,8%. Testei mais de 250 jeitos, então
-#   alguns passam por sorte: por isso TESTE AO VIVO antes de virar sinal.
-#
-# Só CONTA, a partir de TESTE_FOREX_INICIO, com as velas reais da
-# corretora. Não grava, não manda no Telegram, não muda nenhum sinal.
-# A conta roda em segundo plano (8 pares podem demorar); a rota mostra
-# o último resultado. Uso: /teste-forex
-# ============================================================
-
-TESTE_FOREX_INICIO = int(os.getenv("TESTE_FOREX_INICIO", "1794823200"))  # 16/11/2026 07:00
-TESTE_FOREX_PARES = ["EURUSD", "EURGBP", "EURJPY", "GBPJPY", "GBPUSD", "NZDUSD", "USDCHF", "USDJPY"]
-TESTE_FOREX_NOMES = {
-    "corvos": "3 corvos -> CALL (vela seguinte, 1 min)",
-    "pavio_m5": "pega pavio M5: 3º minuto, movimento forte -> contra (expira no fim da vela de 5 min)",
-    "ema1450": "EMA 14/50 cruza + EMAs 5/10/20/50 a favor -> contra (vela seguinte)",
-}
-_teste_forex_cache = {"quando": 0, "dados": None, "rodando": False}
-
-
-def _ema_lista(valores, periodo):
-    a = 2.0 / (periodo + 1)
-    saida = [valores[0]]
-    for x in valores[1:]:
-        saida.append(a * x + (1 - a) * saida[-1])
-    return saida
-
-
-def _avaliar_candidatos_forex(velas, inicio):
-    n = len(velas)
-    t = [int(v[0]) for v in velas]
-    o = [v[1] for v in velas]; c = [v[2] for v in velas]
-    lo = [v[3] for v in velas]; hi = [v[4] for v in velas]
-    cor = [(1 if c[i] > o[i] else -1 if c[i] < o[i] else 0) for i in range(n)]
-    faixa = [hi[i] - lo[i] for i in range(n)]
-    corpo = [abs(c[i] - o[i]) for i in range(n)]
-    conta = {k: {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0, "ultimos": []}
-             for k in TESTE_FOREX_NOMES}
-
-    def marca(nome, aposta, i_entrada, resultado, resultado_2=None):
-        k = conta[nome]
-        k["sinais"] += 1
-        if resultado == 0:
-            k["empate"] += 1; txt = "EMPATE"
-        elif resultado == aposta:
-            k["win"] += 1; txt = "WIN"
-        else:
-            k["loss"] += 1; txt = "LOSS"
-        if resultado_2:
-            if resultado_2 == aposta:
-                k["win_2"] += 1
-            else:
-                k["loss_2"] += 1
-        k["ultimos"].append([
-            t[i_entrada],
-            datetime.fromtimestamp(t[i_entrada], tz=FUSO_BR).strftime("%d/%m %H:%M"),
-            "CALL" if aposta == 1 else "PUT", txt,
-        ])
-
-    # velas seguidas sem buraco até cada vela (para as médias aquecerem)
-    seguidas = [0] * n
-    for i in range(1, n):
-        seguidas[i] = seguidas[i - 1] + 1 if t[i] - t[i - 1] == 60 else 0
-    e = {p: _ema_lista(c, p) for p in (5, 10, 14, 20, 50)} if n else {}
-
-    def sinal(x):
-        return 1 if x > 0 else -1 if x < 0 else 0
-
-    for i in range(20, n - 1):
-        if t[i] < inicio or t[i + 1] - t[i] != 60:
-            continue
-        r2 = cor[i + 2] if i + 2 < n and t[i + 2] - t[i + 1] == 60 else 0
-
-        # 3 corvos -> CALL
-        if t[i] - t[i - 16] == 16 * 60:
-            media = sum(faixa[i - 14:i]) / 14.0
-            if (media > 0 and faixa[i] > 0 and cor[i - 2] == cor[i - 1] == cor[i] == -1
-                    and c[i] < c[i - 1] < c[i - 2] and min(corpo[i - 2], corpo[i - 1], corpo[i]) >= 0.5 * media):
-                marca("corvos", 1, i + 1, cor[i + 1], r2)
-
-        # EMA 14/50 cruza com 5/10/20/50 a favor -> contra
-        if seguidas[i] >= 400:
-            est = sinal(e[14][i] - e[50][i]); est_ant = sinal(e[14][i - 1] - e[50][i - 1])
-            if est != 0 and est != est_ant:
-                a5, a10, a20, a50 = e[5][i], e[10][i], e[20][i], e[50][i]
-                ordem = 1 if a5 > a10 > a20 > a50 else -1 if a5 < a10 < a20 < a50 else 0
-                if ordem == est:
-                    marca("ema1450", -est, i + 1, cor[i + 1], r2)
-
-    # pega pavio M5: começo de cada vela de 5 min
-    for i in range(14, n - 4):
-        if t[i] < inicio or t[i] % 300 != 0 or t[i + 4] - t[i] != 240 or t[i] - t[i - 14] != 14 * 60:
-            continue
-        media = sum(faixa[i - 14:i]) / 14.0
-        entrada = c[i + 2]; mov = entrada - o[i]; fecha5 = c[i + 4]
-        if media <= 0 or mov == 0 or abs(mov) < 2 * media:
-            continue
-        aposta = -sinal(mov)
-        marca("pavio_m5", aposta, i + 3, sinal(fecha5 - entrada))
-
-    for k in conta.values():
-        k["ultimos"] = k["ultimos"][-10:]
-    return conta
-
-
-def _calcular_teste_forex():
-    try:
-        quantas = int((time.time() - TESTE_FOREX_INICIO) / 60) + 600
-        quantas = max(700, min(20000, quantas))
-        iq = conectar_com_timeout()
-        soma = {k: {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0} for k in TESTE_FOREX_NOMES}
-        ultimos = {k: [] for k in TESTE_FOREX_NOMES}
-        por_par = {}
-        for par in TESTE_FOREX_PARES:
-            try:
-                futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
-                velas = futuro.result(timeout=60)
-                r = _avaliar_candidatos_forex(velas, TESTE_FOREX_INICIO)
-            except Exception as erro:
-                por_par[par] = {"erro": str(erro)[:120]}
-                continue
-            por_par[par] = {k: {x: r[k][x] for x in ("sinais", "win", "loss", "empate")} for k in r}
-            for k in r:
-                for x in ("sinais", "win", "loss", "empate", "win_2", "loss_2"):
-                    soma[k][x] += r[k][x]
-                ultimos[k] = sorted(ultimos[k] + [[u[0], par] + u[1:] for u in r[k]["ultimos"]])[-10:]
-
-        candidatas = {}
-        for k, s in soma.items():
-            dec = s["win"] + s["loss"]; dec2 = s["win_2"] + s["loss_2"]
-            taxa = round(100 * s["win"] / dec, 1) if dec else None
-            taxa2 = round(100 * s["win_2"] / dec2, 1) if dec2 else None
-            if taxa is None:
-                resumo = "Ainda sem sinais desde o começo do teste."
-            else:
-                resumo = (f"{s['sinais']} sinais. Resultado: {taxa}% ({s['win']} WIN x {s['loss']} LOSS). "
-                          + ("ACIMA" if taxa >= 53.8 else "ABAIXO") + " do empate de 53,8%. Precisa de 300+ sinais para confiar.")
-            candidatas[k] = {
-                "teste": TESTE_FOREX_NOMES[k],
-                "resumo": resumo,
-                "taxa": taxa,
-                "taxa_1_vela_depois": taxa2,
-                "total": s,
-                "ultimos": [u[1:] for u in ultimos[k]],
-            }
-        _teste_forex_cache["dados"] = {
-            "ok": True,
-            "mercado": "Forex (mercado aberto), M1",
-            "comecou_em": datetime.fromtimestamp(TESTE_FOREX_INICIO, tz=FUSO_BR).strftime("%d/%m/%Y %H:%M"),
-            "atualizado_em": datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M"),
-            "candidatas": candidatas,
-            "por_par": por_par,
-            "aviso": "Só conta. Não manda sinal e não mexe no grupo.",
-        }
-        _teste_forex_cache["quando"] = time.time()
-    except Exception as erro:
-        _teste_forex_cache["dados"] = {"ok": False, "erro": str(erro)[:200]}
-        _teste_forex_cache["quando"] = time.time() - 240   # tenta de novo em ~1 min
-    finally:
-        _teste_forex_cache["rodando"] = False
-
-
-@app.get("/teste-forex")
-def teste_forex():
-
-    velho = time.time() - _teste_forex_cache["quando"] >= 300
-    if velho and not _teste_forex_cache["rodando"]:
-        _teste_forex_cache["rodando"] = True
-        threading.Thread(target=_calcular_teste_forex, daemon=True).start()
-
-    if _teste_forex_cache["dados"]:
-        dados = dict(_teste_forex_cache["dados"])
-        dados["atualizando_agora"] = _teste_forex_cache["rodando"]
-        return jsonify(dados)
-    return jsonify({"ok": True, "calculando": True,
-                    "resumo": "Calculando o teste do Forex. Abra de novo em 1 ou 2 minutos."})
-
-
-# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
@@ -5360,17 +4674,6 @@ def resultado_sinal(par):
                             etapa_final,
                         )
                         enviar_telegram_foto(imagem, caption)
-
-                        # O mesmo resultado no grupo grátis, se
-                        # este sinal fez parte de uma lista.
-                        try:
-                            gratis_ao_enviar_resultado(
-                                par, inicio_candle, sinal,
-                                resultado_final, etapa_final,
-                                imagem, caption,
-                            )
-                        except Exception as erro:
-                            print("GRATIS: resultado não copiado —", str(erro)[:120])
                     except Exception:
                         pass
 
@@ -6246,13 +5549,6 @@ def candles():
                             analise_tg.get("entrada_em"),
                             analise_tg.get("sinal"),
                         )
-
-                        # Cópia para o grupo grátis, se estiver
-                        # num horário de lista e ela não tiver 5.
-                        try:
-                            gratis_ao_enviar_sinal(par, analise_tg)
-                        except Exception as erro:
-                            print("GRATIS: sinal não copiado —", str(erro)[:120])
                 except Exception:
                     pass
 
@@ -7615,11 +6911,6 @@ def _buscar_operacoes_da_sessao(inicio, fim):
                  WHERE entrada_em >= ?
                    AND entrada_em <  ?
                    AND resultado IN ('WIN', 'LOSS')
-                   -- 16/11/2026: só o que FOI AO GRUPO. Antes entravam
-                   -- também os sinais do painel do site e os que
-                   -- ficaram na fila (o grupo nunca viu), e o
-                   -- relatório mostrava 3 sinais no mesmo minuto.
-                   AND avisado_tg = 1
               ORDER BY entrada_em ASC
                 """,
                 (int(inicio), int(fim)),
@@ -7643,22 +6934,11 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
     linhas = []
     wins = 0
     losses = 0
-    # Conta separada: só a vela de ENTRADA (sem gale). É esta que
-    # diz se a estratégia ganha ou perde dinheiro.
-    entrada_win = 0
-    entrada_total = 0
-    por_etapa = {0: 0, 1: 0, 2: 0}
 
     for op in operacoes:
 
         # O que o grupo viu. Sinal antigo não tem o campo: cai no m1.
         final = op.get("resultado_final") or op.get("resultado")
-
-        m1 = op.get("resultado")
-        if m1 in ("WIN", "LOSS"):
-            entrada_total += 1
-            if m1 == "WIN":
-                entrada_win += 1
 
         # Empate não é vitória nem derrota: fica fora da conta, mas
         # aparece na lista para o aluno reconhecer a operação dele.
@@ -7676,8 +6956,6 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
         selo = ""
         if final == "WIN" and etapa:
             selo = f" G{etapa}"
-        if final == "WIN":
-            por_etapa[min(int(etapa), 2)] = por_etapa.get(min(int(etapa), 2), 0) + 1
 
         hora = datetime.fromtimestamp(
             int(op["entrada_em"]), tz=FUSO_BR
@@ -7717,36 +6995,24 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 
     corpo = "\n".join(linhas)
 
-    # PONTO DE EMPATE — com pagamento de 86%:
-    #   - SEM gale (só a entrada): 53,8%.
-    #   - COM gale até o G2: cada LOSS custa a entrada + G1 + G2
-    #     (1 + 2,16 + 4,68 = quase 8 entradas), e um WIN paga só
-    #     0,86. O empate sobe para ~90%.
-    # Antes a taxa COM gale era comparada com 53,8% e o relatório
-    # dizia "acima do empate" com 80%, quando na verdade era perda.
-    def _veredito(taxa_x, empate_x):
-        return "acima do empate" if taxa_x >= empate_x else "ABAIXO do empate"
-
-    taxa_entrada = (entrada_win / entrada_total * 100) if entrada_total else None
-
-    linha_entrada = (
-        f"🎯 Entrada (sem gale): {taxa_entrada:.1f}% — "
-        f"{_veredito(taxa_entrada, 53.8)} (53,8%)\n"
-        if taxa_entrada is not None else ""
+    # A linha do empate é a diferença entre lucro e prejuízo com
+    # pagamento de 86%. Sem ela, uma taxa de 50% pareceria neutra
+    # quando na verdade é perda.
+    veredito = (
+        "acima do ponto de empate"
+        if taxa >= 53.8
+        else "ABAIXO do ponto de empate"
     )
 
     rodape = (
         "\n────────────\n"
-        f"✅ Wins: {wins}  (direto {por_etapa.get(0, 0)} · "
-        f"G1 {por_etapa.get(1, 0)} · G2 {por_etapa.get(2, 0)})\n"
+        f"✅ Wins: {wins}\n"
         f"❌ Losses: {losses}\n"
-        f"{linha_entrada}"
-        f"🔁 Com gale até G2: {taxa:.1f}% — {_veredito(taxa, 90.0)} (~90%)\n"
+        f"🎯 Taxa: {taxa:.1f}% — {veredito}\n"
         f"📈 Total de operações: {total}\n"
-        "\n<i>Com pagamento de 86%: sem gale o empate é 53,8%. "
-        "Com gale até o G2, cada LOSS custa quase 8 entradas, por "
-        "isso o empate com gale sobe para ~90%. Empate de vela não "
-        "entra na conta.</i>"
+        "\n<i>Conta o resultado com gale, do jeito que saiu aqui no "
+        "grupo. Empate não entra na conta. Com pagamento de 86%, "
+        "53,8% é só o empate.</i>"
     )
 
     return cabecalho + corpo + rodape
@@ -8116,18 +7382,6 @@ def _loop_worker(geracao=0):
         # não impeça o relatório de ser enviado.
         try:
             enviar_relatorio_sessao()
-        except Exception:
-            pass
-
-        # Aviso animado na hora de cada lista do grupo grátis.
-        try:
-            gratis_aviso_inicio()
-        except Exception:
-            pass
-
-        # Fecha as listas do grupo grátis que já terminaram.
-        try:
-            gratis_fechar_listas()
         except Exception:
             pass
 
@@ -8779,15 +8033,6 @@ def _bloco_telegram():
         "linhas": [
             ("Token do bot", "configurado" if tem_token else "FALTANDO"),
             ("Grupo (chat id)", "configurado" if tem_chat else "FALTANDO"),
-            (
-                "Grupo grátis",
-                (
-                    "ligado · listas às "
-                    + ", ".join(f"{h}h" for h in _g("GRATIS_HORARIOS", []))
-                )
-                if _g("TELEGRAM_CHAT_ID_GRATIS")
-                else "desligado (falta TELEGRAM_CHAT_ID_GRATIS)",
-            ),
             ("Imagens faltando", ", ".join(faltando) if faltando else "nenhuma"),
             ("Cartões na fila", str(_g("_fila_telegram", 0))),
             (
@@ -9413,30 +8658,6 @@ try:
 except Exception as _erro_auditor:
     print("AUDITOR: não carregou —", _erro_auditor)
 
-
-# ============================================================
-# MT4 -> TELEGRAM (rota /mt4/sinal)
-# ============================================================
-# O EA DWT_EnviarSinais (MetaTrader 4) manda os sinais dos
-# indicadores DWT para ca, e daqui vao para o Telegram com as
-# mesmas imagens do robo. O codigo fica no mt4.py, ao lado deste.
-# Mesmo esquema do auditor: se o mt4.py faltar ou der erro,
-# o robo continua funcionando normal.
-try:
-    from mt4 import criar_mt4
-
-    app.register_blueprint(
-        criar_mt4(
-            enviar_foto=enviar_telegram_foto,
-            imagens=IMAGENS_TELEGRAM,
-            nome_bonito=nome_bonito,
-            chat_vip=TELEGRAM_CHAT_ID,
-            chat_gratis=TELEGRAM_CHAT_ID_GRATIS,
-        )
-    )
-    print("MT4: ligado em /mt4/sinal")
-except Exception as _erro_mt4:
-    print("MT4: não carregou —", _erro_mt4)
 
 if __name__ == "__main__":
 
