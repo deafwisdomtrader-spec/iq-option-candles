@@ -5367,10 +5367,12 @@ def resultado_sinal(par):
 
                 # SO MANDA O RESULTADO SE A ENTRADA FOI AO GRUPO.
                 #
-                # Antes o resultado saia sempre. Como a trava deixa
-                # uma operacao por vez, varios sinais ficavam so
-                # gravados no banco sem serem anunciados -- e o grupo
-                # recebia WIN/LOSS de entradas que nunca viu.
+                # IMPORTANTE: o próximo sinal NÃO pode ser liberado
+                # enquanto o sticker + texto do resultado ainda estão
+                # na fila do Telegram. Antes, encerrar_sequencia() era
+                # chamado logo depois de colocar o resultado na fila.
+                # Isso permitia que o próximo sinal fosse confirmado
+                # antes do resultado anterior aparecer.
                 if foi_avisado_telegram(par, inicio_candle, sinal):
                     try:
                         imagem, caption = montar_resultado_gale(
@@ -5380,25 +5382,53 @@ def resultado_sinal(par):
                             resultado_final,
                             etapa_final,
                         )
-                        enviar_telegram_foto(imagem, caption)
 
-                        # O mesmo resultado no grupo grátis, se
-                        # este sinal fez parte de uma lista.
-                        try:
-                            gratis_ao_enviar_resultado(
-                                par, inicio_candle, sinal,
-                                resultado_final, etapa_final,
-                                imagem, caption,
-                            )
-                        except Exception as erro:
-                            print("GRATIS: resultado não copiado —", str(erro)[:120])
+                        def _resultado_confirmado():
+                            # Só depois que o Telegram confirmou o
+                            # cartão inteiro é que o grupo fica livre.
+                            try:
+                                gratis_ao_enviar_resultado(
+                                    par,
+                                    inicio_candle,
+                                    sinal,
+                                    resultado_final,
+                                    etapa_final,
+                                    imagem,
+                                    caption,
+                                )
+                            except Exception as erro:
+                                print(
+                                    "GRATIS: resultado não copiado —",
+                                    str(erro)[:120],
+                                )
+                            finally:
+                                try:
+                                    encerrar_sequencia(par, inicio_candle)
+                                except Exception:
+                                    pass
+
+                        # A função chama _resultado_confirmado SOMENTE
+                        # quando sticker/foto + texto foram confirmados
+                        # pelo Telegram. Assim a ordem fica sempre:
+                        #
+                        # ENTRADA -> RESULTADO -> PRÓXIMA ENTRADA
+                        enviar_telegram_foto(
+                            imagem,
+                            caption,
+                            ao_confirmar=_resultado_confirmado,
+                        )
+
                     except Exception:
                         pass
 
-                try:
-                    encerrar_sequencia(par, inicio_candle)
-                except Exception:
-                    pass
+                else:
+                    # A entrada não foi confirmada no Telegram. Não
+                    # existe resultado para anunciar; libera a trava
+                    # para não deixar o grupo preso indefinidamente.
+                    try:
+                        encerrar_sequencia(par, inicio_candle)
+                    except Exception:
+                        pass
 
     # Devolve também os preços usados na conferência, para que
     # o resultado possa ser auditado contra o gráfico da
