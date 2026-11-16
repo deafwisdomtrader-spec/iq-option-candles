@@ -1302,11 +1302,20 @@ def montar_resultado_gale(par, sinal, entrada_em, resultado, etapa):
             titulo = "WIN 1G"
             linha_etapa = "🔁 Recuperado em G1\n"
             rodape = "\n🔥 Recuperado no gale 1."
-        else:
+        elif etapa == 2:
             imagem = IMAGENS_TELEGRAM["win_g2"]
             titulo = "WIN 2G"
             linha_etapa = "🔁 Recuperado em G2\n"
             rodape = "\n🔥 Recuperado no gale 2."
+        else:
+            return IMAGENS_TELEGRAM["loss"], (
+                f"❌ <b>LOSS</b> · {nome_bonito(par)}\n"
+                "────────────\n"
+                f"↩️ Entrada das {hora_entrada}\n"
+                f"📌 Direção {sinal} · M1\n"
+                "🔁 Etapas entrada + G1 + G2\n"
+                "\n⛔ Sequência encerrada."
+            )
 
         caption = (
             f"✅ <b>{titulo}</b> · {nome_bonito(par)}\n"
@@ -2127,25 +2136,12 @@ def registrar_resultado_historico(par, entrada_em, sinal, resultado):
 
 
 def registrar_final_historico(par, entrada_em, sinal, final, etapa):
-    """Guarda o resultado que o GRUPO viu, com o gale considerado.
+    """Guarda o resultado FINAL da mesma sequência e, se ele mudou,
+    libera novamente o cartão para o Telegram.
 
-    POR QUE ISTO EXISTE
-    -------------------
-    A coluna 'resultado' guarda o m1: só a vela de entrada, sem gale.
-    É ela que alimenta o aprendizado, e está certo assim — um "WIN 2G"
-    nasceu de uma leitura errada, e contar como acerto ensinaria o
-    sistema a repetir o erro.
-
-    Mas o grupo não viu isso. O grupo viu "WIN 1G" e entendeu vitória.
-    Um relatório montado só com o m1 mostraria ❌ num sinal que o aluno
-    acompanhou como ganho — e ele reclamaria, com razão.
-
-    Então guardamos os dois. Cada um serve a uma pergunta diferente:
-      resultado       -> a estratégia acertou de primeira?
-      resultado_final -> a operação, com gale, terminou ganhando?
-
-    Função separada de propósito: assim o caminho que já funciona não
-    muda em nada.
+    Regra: o resultado final é sempre derivado da sequência real:
+    M1 -> G1 -> G2. Nunca reaproveita um WIN/LOSS antigo para outro
+    resultado.
     """
 
     if not _DB_PRONTO:
@@ -2155,27 +2151,56 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
         return False
 
     try:
-
         with _db_lock:
-
             conexao = _conectar_db()
-
-            conexao.execute(
+            atual = conexao.execute(
                 """
-                UPDATE historico_sinais
-                   SET resultado_final = ?, etapa_final = ?
-                 WHERE par = ?
-                   AND entrada_em = ?
-                   AND sinal = ?
+                SELECT resultado_final, etapa_final, resultado_tg_enviado
+                  FROM historico_sinais
+                 WHERE par = ? AND entrada_em = ? AND sinal = ?
+                 LIMIT 1
                 """,
-                (
-                    str(final),
-                    int(etapa or 0),
-                    str(par),
-                    int(entrada_em),
-                    str(sinal),
-                ),
+                (str(par), int(entrada_em), str(sinal)),
+            ).fetchone()
+
+            mudou = (
+                not atual
+                or atual["resultado_final"] != str(final)
+                or int(atual["etapa_final"] or 0) != int(etapa or 0)
             )
+
+            if mudou:
+                conexao.execute(
+                    """
+                    UPDATE historico_sinais
+                       SET resultado_final = ?,
+                           etapa_final = ?,
+                           resultado_tg_enviado = 0
+                     WHERE par = ? AND entrada_em = ? AND sinal = ?
+                    """,
+                    (
+                        str(final),
+                        int(etapa or 0),
+                        str(par),
+                        int(entrada_em),
+                        str(sinal),
+                    ),
+                )
+            else:
+                conexao.execute(
+                    """
+                    UPDATE historico_sinais
+                       SET resultado_final = ?, etapa_final = ?
+                     WHERE par = ? AND entrada_em = ? AND sinal = ?
+                    """,
+                    (
+                        str(final),
+                        int(etapa or 0),
+                        str(par),
+                        int(entrada_em),
+                        str(sinal),
+                    ),
+                )
 
             conexao.commit()
             conexao.close()
@@ -2183,7 +2208,6 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
         return True
 
     except Exception:
-
         return False
 
 
@@ -5423,48 +5447,43 @@ def resultado_sinal(par):
         resultado_final = None
         etapa_final = 0
 
+        # REGRA ÚNICA DO RESULTADO FINAL:
+        #
+        # M1 WIN                  -> WIN (sticker win)
+        # M1 LOSS + G1 WIN       -> WIN 1G (sticker gale1)
+        # M1 LOSS + G1 EMPATE    -> EMPATE em G1
+        # M1 LOSS + G1 LOSS + G2 WIN    -> WIN 2G (sticker gale2)
+        # M1 LOSS + G1 LOSS + G2 EMPATE -> EMPATE em G2
+        # M1 LOSS + G1 LOSS + G2 LOSS   -> LOSS (sticker loss)
+        #
+        # Se a vela da próxima etapa ainda não fechou, NÃO inventa
+        # resultado e NÃO manda sticker. Aguarda a vela correta.
+
         if m1 == "WIN":
             resultado_final = "WIN"
             etapa_final = 0
 
         elif m1 == "EMPATE":
-            # Vela de entrada sem movimento: o valor volta para o
-            # aluno, a operação acaba aqui, sem gale.
             resultado_final = "EMPATE"
             etapa_final = 0
 
-        elif g1 == "WIN":
-            resultado_final = "WIN"
-            etapa_final = 1
-
-        elif g1 == "EMPATE":
-            resultado_final = "EMPATE"
-            etapa_final = 1
-
-        elif g1 == "LOSS":
-
-            if g2 == "WIN":
+        elif m1 == "LOSS":
+            if g1 == "WIN":
                 resultado_final = "WIN"
-                etapa_final = 2
-
-            elif g2 == "EMPATE":
+                etapa_final = 1
+            elif g1 == "EMPATE":
                 resultado_final = "EMPATE"
-                etapa_final = 2
-
-            elif g2 == "LOSS":
-                resultado_final = "LOSS"
-                etapa_final = 2
-
-        # Válvula de segurança: se depois de 15 minutos a
-        # sequência ainda não fechou (mercado fechou, vela não
-        # veio), encerra com o que se sabe. Sem isto a linha
-        # ficaria para sempre na fila do worker.
-        if (
-            resultado_final is None
-            and time.time() - inicio_candle > 900
-        ):
-            resultado_final = "LOSS" if m1 == "LOSS" else "WIN"
-            etapa_final = 0
+                etapa_final = 1
+            elif g1 == "LOSS":
+                if g2 == "WIN":
+                    resultado_final = "WIN"
+                    etapa_final = 2
+                elif g2 == "EMPATE":
+                    resultado_final = "EMPATE"
+                    etapa_final = 2
+                elif g2 == "LOSS":
+                    resultado_final = "LOSS"
+                    etapa_final = 2
 
         if resultado_final:
 
