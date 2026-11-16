@@ -1521,11 +1521,13 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
     os.getenv("PONTUACAO_MINIMA", "5")
 )))
 
-# 15/11/2026: subiu de 4 para 5. Nos 902 sinais conferidos, os de
-# força MÉDIA (diferença 3-4) acertaram só 46,5%, contra 52,8% dos
-# FORTE e 54,6% dos MUITO FORTE. Com 5, os MÉDIA não saem mais.
+# 15/11/2026: subiu de 4 para 5, e depois para 6 (pedido do Daniel).
+# Nos 902 sinais conferidos, os de força MÉDIA (diferença 3-4)
+# acertaram só 46,5%, contra 52,8% dos FORTE (5-6) e 54,6% dos
+# MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
+# MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "5")
+    os.getenv("DIFERENCA_MINIMA", "6")
 )))
 
 # ============================================================
