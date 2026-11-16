@@ -866,9 +866,13 @@ def montar_caption_sinal(par, analise):
 #
 # Com 3 minutos de espera, só o primeiro passa. Os outros são
 # descartados; se ainda forem bons, aparecem na próxima volta.
+#
+# 16/11/2026: padrão 300 s (pedido do Daniel). No máximo 1 sinal a
+# cada 5 minutos no grupo, mesmo quando o anterior deu WIN direto
+# e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "0")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
 )
 
 _ultima_entrada_enviada = 0
@@ -7419,6 +7423,11 @@ def _buscar_operacoes_da_sessao(inicio, fim):
                  WHERE entrada_em >= ?
                    AND entrada_em <  ?
                    AND resultado IN ('WIN', 'LOSS')
+                   -- 16/11/2026: só o que FOI AO GRUPO. Antes entravam
+                   -- também os sinais do painel do site e os que
+                   -- ficaram na fila (o grupo nunca viu), e o
+                   -- relatório mostrava 3 sinais no mesmo minuto.
+                   AND avisado_tg = 1
               ORDER BY entrada_em ASC
                 """,
                 (int(inicio), int(fim)),
