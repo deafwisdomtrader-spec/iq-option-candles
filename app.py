@@ -441,7 +441,7 @@ def montar_caption_sinal(par, analise):
 # descartados; se ainda forem bons, aparecem na próxima volta.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "0")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "180")
 )
 
 _ultima_entrada_enviada = 0
