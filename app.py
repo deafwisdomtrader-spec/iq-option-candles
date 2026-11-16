@@ -4671,6 +4671,150 @@ def velas_antigas(par):
 
 
 # ============================================================
+# TESTE SILENCIOSO — LINHA HORIZONTAL + PAVIO (não manda nada)
+# ============================================================
+#
+# Estratégia candidata (backtest de 16/11/2026, 8 pares OTC):
+#   - linha horizontal: topo/fundo das últimas 120 velas onde o
+#     preço tocou 3 vezes ou mais (tolerância 0,1 ATR);
+#   - a vela fecha com pavio >= 2x o corpo tocando a linha e
+#     fecha de volta  -> aposta na REVERSÃO na vela seguinte.
+#   Backtest: 57,1% (217) e, em 10 dias novos, 53,7% (661).
+#   Empate com payout 86% = 53,8%. Por isso: TESTE AO VIVO antes
+#   de virar sinal.
+#
+# Esta rota só CONTA, a partir de TESTE_LINHA_INICIO, usando as
+# velas reais da corretora. Não grava, não manda no Telegram,
+# não muda nenhum sinal. Uso: /teste-linha
+# ============================================================
+
+TESTE_LINHA_INICIO = int(os.getenv("TESTE_LINHA_INICIO", "1794816000"))  # 16/11/2026 05:00
+_teste_linha_cache = {"quando": 0, "dados": None}
+
+
+def _avaliar_linha_horizontal(velas, inicio):
+    n = len(velas)
+    t = [int(v[0]) for v in velas]
+    o = [v[1] for v in velas]; c = [v[2] for v in velas]
+    lo = [v[3] for v in velas]; hi = [v[4] for v in velas]
+    cor = [(1 if c[i] > o[i] else -1 if c[i] < o[i] else 0) for i in range(n)]
+    topo = [False] * n; fundo = [False] * n
+    for i in range(2, n - 2):
+        topo[i] = hi[i] >= max(hi[i - 2:i + 3])
+        fundo[i] = lo[i] <= min(lo[i - 2:i + 3])
+    conta = {"sinais": 0, "win": 0, "loss": 0, "empate": 0,
+             "win_2": 0, "loss_2": 0, "ultimos": []}
+    for i in range(130, n - 1):
+        if t[i] < inicio:
+            continue
+        if t[i + 1] - t[i - 125] != 126 * 60:
+            continue
+        faixas = [hi[k] - lo[k] for k in range(i - 14, i)]
+        atr = sum(faixas) / 14.0
+        if atr <= 0:
+            continue
+        corpo = abs(c[i] - o[i]) or atr * 0.05
+        pb = min(o[i], c[i]) - lo[i]
+        pc = hi[i] - max(o[i], c[i])
+        tol = atr * 0.1
+        ini, fim = i - 120, i - 3
+        aposta = 0
+        if pc >= 2 * corpo:
+            niveis = [hi[k] for k in range(ini, fim) if topo[k]]
+            for L in niveis:
+                if abs(hi[i] - L) <= tol and c[i] < L and sum(1 for x in niveis if abs(x - L) <= tol) >= 3:
+                    aposta = -1
+                    break
+        if not aposta and pb >= 2 * corpo:
+            niveis = [lo[k] for k in range(ini, fim) if fundo[k]]
+            for L in niveis:
+                if abs(lo[i] - L) <= tol and c[i] > L and sum(1 for x in niveis if abs(x - L) <= tol) >= 3:
+                    aposta = 1
+                    break
+        if not aposta:
+            continue
+        conta["sinais"] += 1
+        r1 = cor[i + 1]
+        if r1 == 0:
+            conta["empate"] += 1; res = "EMPATE"
+        elif r1 == aposta:
+            conta["win"] += 1; res = "WIN"
+        else:
+            conta["loss"] += 1; res = "LOSS"
+        if i + 2 < n and t[i + 2] - t[i + 1] == 60 and cor[i + 2] != 0:
+            if cor[i + 2] == aposta:
+                conta["win_2"] += 1
+            else:
+                conta["loss_2"] += 1
+        conta["ultimos"].append([
+            datetime.fromtimestamp(t[i + 1], tz=FUSO_BR).strftime("%d/%m %H:%M"),
+            "CALL" if aposta == 1 else "PUT", res,
+        ])
+    conta["ultimos"] = conta["ultimos"][-10:]
+    return conta
+
+
+@app.get("/teste-linha")
+def teste_linha():
+
+    if _teste_linha_cache["dados"] and time.time() - _teste_linha_cache["quando"] < 300:
+        return jsonify(_teste_linha_cache["dados"])
+
+    quantas = int((time.time() - TESTE_LINHA_INICIO) / 60) + 140
+    quantas = max(200, min(20000, quantas))
+
+    por_par = {}
+    soma = {"sinais": 0, "win": 0, "loss": 0, "empate": 0, "win_2": 0, "loss_2": 0}
+
+    try:
+        iq = conectar_com_timeout()
+    except Exception as erro:
+        return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
+
+    for par in PARES:
+        try:
+            futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
+            velas = futuro.result(timeout=40)
+            r = _avaliar_linha_horizontal(velas, TESTE_LINHA_INICIO)
+        except Exception as erro:
+            por_par[par] = {"erro": str(erro)[:120]}
+            continue
+        por_par[par] = r
+        for k in soma:
+            soma[k] += r[k]
+
+    decididos = soma["win"] + soma["loss"]
+    taxa = round(100 * soma["win"] / decididos, 1) if decididos else None
+    dec2 = soma["win_2"] + soma["loss_2"]
+    taxa2 = round(100 * soma["win_2"] / dec2, 1) if dec2 else None
+
+    if taxa is None:
+        resumo = "Ainda sem sinais desde o começo do teste."
+    else:
+        resumo = (
+            f"{soma['sinais']} sinais desde o começo. Vela seguinte: {taxa}% "
+            f"({soma['win']} WIN x {soma['loss']} LOSS). Empate do payout 86% = 53,8%. "
+            + ("ACIMA do empate." if taxa >= 53.8 else "ABAIXO do empate.")
+            + " Precisa de 300+ sinais para confiar."
+        )
+
+    dados = {
+        "ok": True,
+        "teste": "linha horizontal (3 toques, 120 velas) + pavio 2x -> reversão na vela seguinte",
+        "comecou_em": datetime.fromtimestamp(TESTE_LINHA_INICIO, tz=FUSO_BR).strftime("%d/%m/%Y %H:%M"),
+        "resumo": resumo,
+        "taxa_vela_seguinte": taxa,
+        "taxa_1_vela_depois": taxa2,
+        "total": soma,
+        "por_par": por_par,
+        "aviso": "Só conta. Não manda sinal e não mexe no grupo.",
+    }
+    _teste_linha_cache["quando"] = time.time()
+    _teste_linha_cache["dados"] = dados
+    return jsonify(dados)
+
+
+# ============================================================
 # CONFERIR RESULTADO DE UM SINAL
 # ============================================================
 #
