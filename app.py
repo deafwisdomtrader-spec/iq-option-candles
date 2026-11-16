@@ -7298,11 +7298,22 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
     linhas = []
     wins = 0
     losses = 0
+    # Conta separada: só a vela de ENTRADA (sem gale). É esta que
+    # diz se a estratégia ganha ou perde dinheiro.
+    entrada_win = 0
+    entrada_total = 0
+    por_etapa = {0: 0, 1: 0, 2: 0}
 
     for op in operacoes:
 
         # O que o grupo viu. Sinal antigo não tem o campo: cai no m1.
         final = op.get("resultado_final") or op.get("resultado")
+
+        m1 = op.get("resultado")
+        if m1 in ("WIN", "LOSS"):
+            entrada_total += 1
+            if m1 == "WIN":
+                entrada_win += 1
 
         # Empate não é vitória nem derrota: fica fora da conta, mas
         # aparece na lista para o aluno reconhecer a operação dele.
@@ -7320,6 +7331,8 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
         selo = ""
         if final == "WIN" and etapa:
             selo = f" G{etapa}"
+        if final == "WIN":
+            por_etapa[min(int(etapa), 2)] = por_etapa.get(min(int(etapa), 2), 0) + 1
 
         hora = datetime.fromtimestamp(
             int(op["entrada_em"]), tz=FUSO_BR
@@ -7359,24 +7372,36 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 
     corpo = "\n".join(linhas)
 
-    # A linha do empate é a diferença entre lucro e prejuízo com
-    # pagamento de 86%. Sem ela, uma taxa de 50% pareceria neutra
-    # quando na verdade é perda.
-    veredito = (
-        "acima do ponto de empate"
-        if taxa >= 53.8
-        else "ABAIXO do ponto de empate"
+    # PONTO DE EMPATE — com pagamento de 86%:
+    #   - SEM gale (só a entrada): 53,8%.
+    #   - COM gale até o G2: cada LOSS custa a entrada + G1 + G2
+    #     (1 + 2,16 + 4,68 = quase 8 entradas), e um WIN paga só
+    #     0,86. O empate sobe para ~90%.
+    # Antes a taxa COM gale era comparada com 53,8% e o relatório
+    # dizia "acima do empate" com 80%, quando na verdade era perda.
+    def _veredito(taxa_x, empate_x):
+        return "acima do empate" if taxa_x >= empate_x else "ABAIXO do empate"
+
+    taxa_entrada = (entrada_win / entrada_total * 100) if entrada_total else None
+
+    linha_entrada = (
+        f"🎯 Entrada (sem gale): {taxa_entrada:.1f}% — "
+        f"{_veredito(taxa_entrada, 53.8)} (53,8%)\n"
+        if taxa_entrada is not None else ""
     )
 
     rodape = (
         "\n────────────\n"
-        f"✅ Wins: {wins}\n"
+        f"✅ Wins: {wins}  (direto {por_etapa.get(0, 0)} · "
+        f"G1 {por_etapa.get(1, 0)} · G2 {por_etapa.get(2, 0)})\n"
         f"❌ Losses: {losses}\n"
-        f"🎯 Taxa: {taxa:.1f}% — {veredito}\n"
+        f"{linha_entrada}"
+        f"🔁 Com gale até G2: {taxa:.1f}% — {_veredito(taxa, 90.0)} (~90%)\n"
         f"📈 Total de operações: {total}\n"
-        "\n<i>Conta o resultado com gale, do jeito que saiu aqui no "
-        "grupo. Empate não entra na conta. Com pagamento de 86%, "
-        "53,8% é só o empate.</i>"
+        "\n<i>Com pagamento de 86%: sem gale o empate é 53,8%. "
+        "Com gale até o G2, cada LOSS custa quase 8 entradas, por "
+        "isso o empate com gale sobe para ~90%. Empate de vela não "
+        "entra na conta.</i>"
     )
 
     return cabecalho + corpo + rodape
