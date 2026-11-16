@@ -4606,7 +4606,7 @@ def ver_historico():
 # VELAS ANTIGAS (só leitura, para TESTAR estratégias)
 # ============================================================
 #
-# Devolve muitas velas M1 do passado de um par (até 5000), em
+# Devolve muitas velas M1 do passado de um par (até 20000), em
 # lotes de 1000 pedidos à corretora andando para trás no tempo.
 # Serve para testar indicadores novos (Fibonacci, toque no
 # pavio etc.) em milhares de velas ANTES de ligar no robô.
@@ -4622,7 +4622,7 @@ def _buscar_velas_antigas(iq, par, quantas):
         fim = int(iq.get_server_timestamp())
     except Exception:
         fim = int(time.time())
-    for _ in range(8):
+    for _ in range(24):
         if len(velas) >= quantas:
             break
         lote = iq.get_candles(par, 60, 1000, fim)
@@ -4650,14 +4650,14 @@ def velas_antigas(par):
     par = par.strip().upper()
 
     try:
-        quantas = max(100, min(5000, int(request.args.get("n", "2000"))))
+        quantas = max(100, min(20000, int(request.args.get("n", "2000"))))
     except Exception:
         quantas = 2000
 
     try:
         iq = conectar_com_timeout()
         futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
-        velas = futuro.result(timeout=45)
+        velas = futuro.result(timeout=80)
     except Exception as erro:
         return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
 
