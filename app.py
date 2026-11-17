@@ -20,6 +20,21 @@ from iqoptionapi.stable_api import IQ_Option
 app = Flask(__name__)
 
 # ============================================================
+# CORS — PAINEL DE INDICADORES
+# ============================================================
+# O painel HTML fica em outro domínio e consulta o Flask no
+# Render. Sem este cabeçalho o navegador bloqueia o fetch com
+# "Failed to fetch" mesmo quando /estatisticas funciona ao
+# abrir diretamente no navegador.
+@app.after_request
+def adicionar_cors(resposta):
+    resposta.headers["Access-Control-Allow-Origin"] = "*"
+    resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resposta.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
+    return resposta
+
+
+# ============================================================
 # TELEGRAM — SINAL (IMAGEM + CARTÃO) E RESULTADO (COM GALE)
 # ============================================================
 #
