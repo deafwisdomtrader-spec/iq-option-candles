@@ -19,16 +19,6 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
-# CORS — permite que o painel web leia as respostas do Render.
-@app.after_request
-def adicionar_cors(resposta):
-    resposta.headers["Access-Control-Allow-Origin"] = "*"
-    resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    resposta.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
-    resposta.headers["Cache-Control"] = "no-store"
-    return resposta
-
-
 # ============================================================
 # TELEGRAM — SINAL (IMAGEM + CARTÃO) E RESULTADO (COM GALE)
 # ============================================================
@@ -1369,49 +1359,6 @@ CANDLE_COUNT = 100
 #
 # PRAZO: uma semana. Depois disso, olhe /historico e tire de
 # novo quem continuar abaixo de 53,8% com 30+ operações.
-
-# ============================================================
-# PARES DO PAINEL DE INDICADORES
-# Não altera a lista do robô/Telegram.
-# ============================================================
-PAINEL_PARES_OTC = [
-    "EURUSD-OTC",
-    "GBPUSD-OTC",
-    "EURJPY-OTC",
-    "NZDUSD-OTC",
-    "USDCHF-OTC",
-    "GBPJPY-OTC",
-    "EURGBP-OTC",
-    "USDJPY-OTC",
-    "AUDUSD-OTC",
-    "USDCAD-OTC",
-    "AUDJPY-OTC",
-    "EURCAD-OTC",
-    "GBPAUD-OTC",
-    "CADJPY-OTC",
-    "EURAUD-OTC",
-    "EURCHF-OTC",
-]
-
-PAINEL_PARES_FOREX = [
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "EURJPY",
-    "AUDUSD",
-    "USDCAD",
-    "USDCHF",
-    "AUDJPY",
-    "NZDUSD",
-    "EURCAD",
-    "GBPAUD",
-    "CADJPY",
-    "EURAUD",
-    "EURCHF",
-    "AUDCAD",
-    "GBPCHF",
-]
-
 PARES = [
     "EURUSD-OTC",
     "GBPUSD-OTC",
@@ -1644,9 +1591,9 @@ CADEADO_PERDIDO_SEG = 60
 # e a corretora tem tempo de liberar.
 #
 # Um único sucesso zera a contagem.
-# Não bloquear a conexão por "castigo". O worker já faz uma nova
-# tentativa a cada ciclo (3 min) e isso é suficiente para não martelar
-# a corretora. O diagnóstico continuará mostrando quantas falhas houve.
+# Não bloquear a conexão por castigo longo. Uma falha não pode
+# deixar o robô e o diagnóstico parados por 5 minutos. O worker e
+# o vigia controlam o ritmo das novas tentativas.
 FALHAS_ATE_FREIO = 10**9
 FREIO_SEGUNDOS = 0
 
@@ -2580,7 +2527,7 @@ def conectar():
         )
 
         # Limita as reconexões internas da biblioteca para evitar
-        # uma tempestade de tentativas quando a sessão cai.
+        # tempestade de tentativas quando a sessão cai.
         try:
             cliente.set_max_reconnect(5)
         except Exception:
@@ -2950,8 +2897,8 @@ def conectar_com_timeout(timeout_segundos=None):
     if timeout_segundos is None:
         timeout_segundos = CONEXAO_TIMEOUT
 
-    # O castigo foi desativado: uma falha não bloqueia a próxima
-    # tentativa. O worker controla o intervalo entre as tentativas.
+    # Sem castigo longo: uma falha não bloqueia a próxima tentativa.
+    # O worker e o vigia controlam o intervalo entre reconexões.
 
     # Cadeado travado por uma thread morta? Limpa ANTES de tentar.
     #
@@ -4544,173 +4491,6 @@ def listar_ativos():
 # Uso:  /historico              -> resumo por combinação
 #       /historico?par=EURUSD-OTC
 # ============================================================
-
-# ============================================================
-# PAINEL DE INDICADORES — ESTATÍSTICAS HISTÓRICAS
-# ============================================================
-# O painel web consulta esta rota para montar os cards. Ela usa
-# somente os sinais já gravados em historico_sinais e nunca altera
-# o cálculo do robô nem o Telegram.
-
-@app.get("/estatisticas")
-def estatisticas_painel():
-
-    if not _DB_PRONTO:
-        return jsonify({
-            "ok": False,
-            "erro": "Banco de histórico indisponível.",
-            "indicadores": [],
-        }), 200
-
-    inicio_txt = request.args.get("inicio", "").strip()
-    fim_txt = request.args.get("fim", "").strip()
-    mercado = request.args.get("mercado", "OTC + Forex").strip()
-
-    # Datas chegam como YYYY-MM-DD. O fim é inclusivo para o aluno:
-    # 03/11 até 17/11 inclui todo o dia 17/11.
-    try:
-        inicio_dt = datetime.strptime(inicio_txt, "%Y-%m-%d").replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=FUSO_BR
-        )
-        fim_dt = datetime.strptime(fim_txt, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, microsecond=999999, tzinfo=FUSO_BR
-        )
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "erro": "Período inválido. Use as datas YYYY-MM-DD.",
-            "indicadores": [],
-        }), 400
-
-    if inicio_dt > fim_dt:
-        return jsonify({
-            "ok": False,
-            "erro": "A data inicial não pode ser maior que a data final.",
-            "indicadores": [],
-        }), 400
-
-    inicio_ts = int(inicio_dt.timestamp())
-    fim_ts = int(fim_dt.timestamp())
-
-    mercado_upper = mercado.upper()
-    if mercado_upper in ("OTC", "OTC ONLY"):
-        filtro_mercado = "OTC"
-    elif mercado_upper in ("FOREX", "FOREX ONLY"):
-        filtro_mercado = "FOREX"
-    else:
-        filtro_mercado = "AMBOS"
-
-    try:
-        with _db_lock:
-            conexao = _conectar_db()
-            linhas = conexao.execute(
-                """
-                SELECT par, sinal, pontos_call, pontos_put, diferenca,
-                       forca, tendencia, rsi, mhi, rompimento, pullback,
-                       fibo, pivo, resultado, resultado_final, avisado_tg
-                  FROM historico_sinais
-                 WHERE entrada_em >= ?
-                   AND entrada_em <= ?
-                   AND resultado IN ('WIN','LOSS')
-                 ORDER BY entrada_em ASC
-                """,
-                (inicio_ts, fim_ts),
-            ).fetchall()
-            conexao.close()
-    except Exception as erro:
-        return jsonify({
-            "ok": False,
-            "erro": str(erro)[:250],
-            "indicadores": [],
-        }), 200
-
-    def pertence_ao_mercado(par):
-        nome = str(par or "").upper()
-        if filtro_mercado == "OTC":
-            return nome.endswith("-OTC")
-        if filtro_mercado == "FOREX":
-            return not nome.endswith("-OTC")
-        return True
-
-    dados = [dict(linha) for linha in linhas if pertence_ao_mercado(linha["par"])]
-
-    def pct(registros, campo="resultado"):
-        validos = [r for r in registros if r.get(campo) in ("WIN", "LOSS")]
-        if not validos:
-            return None
-        wins = sum(1 for r in validos if r.get(campo) == "WIN")
-        return round((wins / len(validos)) * 100, 1)
-
-    def card(nome, registros):
-        # "seg_pct" = resultado da entrada M1, sem gale.
-        # "tel_pct" = resultado final da operação quando disponível;
-        # para registros antigos sem resultado_final, usa o M1.
-        seg = pct(registros, "resultado")
-        tel_registros = []
-        for r in registros:
-            final = r.get("resultado_final")
-            if final in ("WIN", "LOSS"):
-                tel_registros.append({"resultado": final})
-            else:
-                tel_registros.append({"resultado": r.get("resultado")})
-        tel = pct(tel_registros, "resultado")
-        return {
-            "indicador": nome,
-            "sinais": len(registros),
-            "seg_pct": seg if seg is not None else 0,
-            "tel_pct": tel if tel is not None else 0,
-        }
-
-    indicadores = []
-
-    # Sempre mostra o robô atual primeiro.
-    indicadores.append(card("Robô atual", dados))
-
-    # Força é o campo realmente calculado pelo app.py.
-    for nome_forca in ("MUITO_FORTE", "FORTE", "MEDIA", "FRACA"):
-        grupo = [r for r in dados if str(r.get("forca") or "").upper() == nome_forca]
-        if grupo:
-            indicadores.append(card("Força " + nome_forca.replace("_", " "), grupo))
-
-    # Indicadores técnicos que o próprio app.py já grava no histórico.
-    campos = [
-        ("Tendência", "tendencia"),
-        ("MHI", "mhi"),
-        ("Rompimento", "rompimento"),
-        ("Pullback", "pullback"),
-        ("Fibonacci", "fibo"),
-        ("Pivô", "pivo"),
-    ]
-
-    for titulo, campo in campos:
-        grupos = {}
-        for r in dados:
-            valor = str(r.get(campo) or "").strip()
-            if not valor or valor in ("--", "None", "NEUTRA"):
-                continue
-            grupos.setdefault(valor, []).append(r)
-
-        for valor, grupo in grupos.items():
-            indicadores.append(card(f"{titulo}: {valor}", grupo))
-
-    # RSI: não inventa um corte quando o banco não tem dados.
-    rsi_alto = [r for r in dados if r.get("rsi") is not None and float(r["rsi"]) >= 70]
-    rsi_baixo = [r for r in dados if r.get("rsi") is not None and float(r["rsi"]) <= 30]
-    if rsi_alto:
-        indicadores.append(card("RSI ≥ 70", rsi_alto))
-    if rsi_baixo:
-        indicadores.append(card("RSI ≤ 30", rsi_baixo))
-
-    return jsonify({
-        "ok": True,
-        "inicio": inicio_txt,
-        "fim": fim_txt,
-        "mercado": filtro_mercado,
-        "meta": 53.8,
-        "total_sinais": len(dados),
-        "indicadores": indicadores,
-    })
-
 
 @app.get("/historico")
 def ver_historico():
@@ -8018,12 +7798,12 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 #
 # AJUSTES NO RENDER (opcional)
 #
-#   SAUDE_LIMITE   -> quanto tempo sem vela é problema (padrão 600 = 10 min)
-#   VIGIA_SEGUNDOS -> intervalo mínimo entre dois consertos (padrão 600)
+#   SAUDE_LIMITE   -> quanto tempo sem vela é problema (padrão 300 = 5 min)
+#   VIGIA_SEGUNDOS -> intervalo mínimo entre dois consertos (padrão 300)
 
-SAUDE_LIMITE = max(300, int(os.getenv("SAUDE_LIMITE", "600")))
+SAUDE_LIMITE = max(300, int(os.getenv("SAUDE_LIMITE", "300")))
 
-VIGIA_SEGUNDOS = max(300, int(os.getenv("VIGIA_SEGUNDOS", "600")))
+VIGIA_SEGUNDOS = max(300, int(os.getenv("VIGIA_SEGUNDOS", "300")))
 
 # Começa na hora em que o servidor sobe. Se começasse em zero,
 # o vigia acharia que o robô está parado desde 1970 e agiria na
@@ -8819,25 +8599,20 @@ def _bloco_corretora():
     elif descansando > 0:
         estado = "espera"
         resumo = (
-            "Parada de castigo. Falhou "
+            "Aguardando nova tentativa após falhas de conexão ("
             + str(falhas)
-            + " vezes seguidas e está esperando "
-            + _tempo_curto(descansando)
-            + " antes de tentar de novo."
+            + ")."
         )
         acao = (
-            "Não precisa fazer nada. O vigia destrava sozinho "
-            "quando o robô passa 10 minutos sem receber vela. "
-            "Testar por cima dele força mais uma conexão numa "
-            "hora em que a corretora já está engasgada."
+            "O vigia reconecta automaticamente. Se precisar, use "
+            "o teste de login do diagnóstico para verificar a conta."
         )
     else:
         estado = "ruim"
         resumo = "Sem conexão. Nenhum sinal sai enquanto isso."
         acao = (
-            "Não precisa fazer nada. O vigia reconecta sozinho "
-            "quando o robô passa 10 minutos sem receber vela. "
-            "Veja a linha 'Última vela recebida' logo abaixo."
+            "O vigia reconecta automaticamente quando fica sem "
+            "vela por alguns minutos. Veja 'Última vela recebida'."
         )
 
     linhas = [
@@ -9661,130 +9436,6 @@ try:
     print("MT4: ligado em /mt4/sinal")
 except Exception as _erro_mt4:
     print("MT4: não carregou —", _erro_mt4)
-
-
-# ============================================================
-# VELAS DO PERÍODO — PAINEL DE INDICADORES
-# Somente leitura. Não grava histórico, não opera e não envia Telegram.
-# ============================================================
-def _buscar_velas_periodo_painel(iq, par, inicio_ts, fim_ts, limite):
-    par = str(par or "").strip().upper()
-    inicio_ts = int(inicio_ts)
-    fim_ts = int(fim_ts)
-    limite = max(100, min(20500, int(limite)))
-
-    velas = {}
-    cursor = fim_ts
-    lotes = 0
-
-    while len(velas) < limite and lotes < 24:
-        lote = iq.get_candles(par, 60, min(1000, limite - len(velas)), cursor)
-        lotes += 1
-        if not lote:
-            break
-
-        menor = cursor
-        for candle in lote:
-            try:
-                v = normalizar_candle(candle)
-            except Exception:
-                continue
-
-            ini = int(v["from"])
-            if inicio_ts <= ini <= fim_ts:
-                velas[ini] = [
-                    ini,
-                    float(v["open"]),
-                    float(v["close"]),
-                    float(v["low"]),
-                    float(v["high"]),
-                ]
-            menor = min(menor, ini)
-
-        if menor >= cursor:
-            break
-
-        cursor = menor - 1
-
-        if menor <= inicio_ts:
-            break
-
-    return [
-        velas[k]
-        for k in sorted(velas)
-    ]
-
-
-@app.get("/velas-periodo/<par>")
-def velas_periodo_painel(par):
-    par = str(par or "").strip().upper()
-
-    inicio_txt = request.args.get("inicio", "").strip()
-    fim_txt = request.args.get("fim", "").strip()
-
-    try:
-        inicio_dt = datetime.strptime(inicio_txt, "%Y-%m-%d").replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=FUSO_BR
-        )
-        fim_dt = datetime.strptime(fim_txt, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, microsecond=999999, tzinfo=FUSO_BR
-        )
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "erro": "Período inválido. Use YYYY-MM-DD.",
-            "velas": [],
-        }), 400
-
-    if inicio_dt > fim_dt:
-        return jsonify({
-            "ok": False,
-            "erro": "A data inicial não pode ser maior que a final.",
-            "velas": [],
-        }), 400
-
-    try:
-        dias = (fim_dt.date() - inicio_dt.date()).days + 1
-        try:
-            warmup = max(100, min(500, int(request.args.get("warmup", "250"))))
-        except Exception:
-            warmup = 250
-
-        limite = min(20500, dias * 1440 + warmup)
-        busca_inicio_ts = int(inicio_dt.timestamp()) - warmup * 60
-        fim_ts = int(fim_dt.timestamp())
-
-        iq = conectar_com_timeout()
-        futuro = _executor_candles.submit(
-            _buscar_velas_periodo_painel,
-            iq,
-            par,
-            busca_inicio_ts,
-            fim_ts,
-            limite,
-        )
-        velas = futuro.result(timeout=90)
-
-        return jsonify({
-            "ok": True,
-            "par": par,
-            "timeframe": "M1",
-            "inicio": inicio_txt,
-            "fim": fim_txt,
-            "warmup": warmup,
-            "quantidade": len(velas),
-            "velas": velas,
-        })
-
-    except Exception as erro:
-        return jsonify({
-            "ok": False,
-            "par": par,
-            "erro": str(erro)[:200],
-            "velas": [],
-        }), 200
-
-
 
 if __name__ == "__main__":
 
