@@ -1535,14 +1535,6 @@ DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
 )))
 
 # ============================================================
-# ANTI-LOSS NÍVEL 2 — SUAVE
-# Mantém o filtro atual para não bloquear os sinais do Telegram.
-# Preserva M1/G1/G2 e o fluxo de resultados/stickers.
-ANTI_LOSS_NIVEL = 2
-ANTI_LOSS_DIFERENCA_NIVEL_2 = DIFERENCA_MINIMA_PADRAO
-
-
-# ============================================================
 # CONEXÃO PERSISTENTE
 # ============================================================
 
@@ -3817,13 +3809,13 @@ def analisar_sinal(candles, par=None, tf=None):
 
     if (
         pontos_call >= PONTUACAO_MINIMA
-        and pontos_call - pontos_put >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
+        and pontos_call - pontos_put >= DIFERENCA_MINIMA
     ):
         direcao_base = "CALL"
 
     elif (
         pontos_put >= PONTUACAO_MINIMA
-        and pontos_put - pontos_call >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
+        and pontos_put - pontos_call >= DIFERENCA_MINIMA
     ):
         direcao_base = "PUT"
 
@@ -3886,7 +3878,7 @@ def analisar_sinal(candles, par=None, tf=None):
         if (
             pontos_call_final >= PONTUACAO_MINIMA
             and pontos_call_final - pontos_put_final
-            >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
+            >= DIFERENCA_MINIMA
         ):
 
             sinal = "CALL"
@@ -3905,7 +3897,7 @@ def analisar_sinal(candles, par=None, tf=None):
         if (
             pontos_put_final >= PONTUACAO_MINIMA
             and pontos_put_final - pontos_call_final
-            >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
+            >= DIFERENCA_MINIMA
         ):
 
             sinal = "PUT"
@@ -4496,6 +4488,173 @@ def listar_ativos():
 #       /historico?par=EURUSD-OTC
 # ============================================================
 
+# ============================================================
+# PAINEL DE INDICADORES — ESTATÍSTICAS HISTÓRICAS
+# ============================================================
+# O painel web consulta esta rota para montar os cards. Ela usa
+# somente os sinais já gravados em historico_sinais e nunca altera
+# o cálculo do robô nem o Telegram.
+
+@app.get("/estatisticas")
+def estatisticas_painel():
+
+    if not _DB_PRONTO:
+        return jsonify({
+            "ok": False,
+            "erro": "Banco de histórico indisponível.",
+            "indicadores": [],
+        }), 200
+
+    inicio_txt = request.args.get("inicio", "").strip()
+    fim_txt = request.args.get("fim", "").strip()
+    mercado = request.args.get("mercado", "OTC + Forex").strip()
+
+    # Datas chegam como YYYY-MM-DD. O fim é inclusivo para o aluno:
+    # 03/11 até 17/11 inclui todo o dia 17/11.
+    try:
+        inicio_dt = datetime.strptime(inicio_txt, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=FUSO_BR
+        )
+        fim_dt = datetime.strptime(fim_txt, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=FUSO_BR
+        )
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "erro": "Período inválido. Use as datas YYYY-MM-DD.",
+            "indicadores": [],
+        }), 400
+
+    if inicio_dt > fim_dt:
+        return jsonify({
+            "ok": False,
+            "erro": "A data inicial não pode ser maior que a data final.",
+            "indicadores": [],
+        }), 400
+
+    inicio_ts = int(inicio_dt.timestamp())
+    fim_ts = int(fim_dt.timestamp())
+
+    mercado_upper = mercado.upper()
+    if mercado_upper in ("OTC", "OTC ONLY"):
+        filtro_mercado = "OTC"
+    elif mercado_upper in ("FOREX", "FOREX ONLY"):
+        filtro_mercado = "FOREX"
+    else:
+        filtro_mercado = "AMBOS"
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linhas = conexao.execute(
+                """
+                SELECT par, sinal, pontos_call, pontos_put, diferenca,
+                       forca, tendencia, rsi, mhi, rompimento, pullback,
+                       fibo, pivo, resultado, resultado_final, avisado_tg
+                  FROM historico_sinais
+                 WHERE entrada_em >= ?
+                   AND entrada_em <= ?
+                   AND resultado IN ('WIN','LOSS')
+                 ORDER BY entrada_em ASC
+                """,
+                (inicio_ts, fim_ts),
+            ).fetchall()
+            conexao.close()
+    except Exception as erro:
+        return jsonify({
+            "ok": False,
+            "erro": str(erro)[:250],
+            "indicadores": [],
+        }), 200
+
+    def pertence_ao_mercado(par):
+        nome = str(par or "").upper()
+        if filtro_mercado == "OTC":
+            return nome.endswith("-OTC")
+        if filtro_mercado == "FOREX":
+            return not nome.endswith("-OTC")
+        return True
+
+    dados = [dict(linha) for linha in linhas if pertence_ao_mercado(linha["par"])]
+
+    def pct(registros, campo="resultado"):
+        validos = [r for r in registros if r.get(campo) in ("WIN", "LOSS")]
+        if not validos:
+            return None
+        wins = sum(1 for r in validos if r.get(campo) == "WIN")
+        return round((wins / len(validos)) * 100, 1)
+
+    def card(nome, registros):
+        # "seg_pct" = resultado da entrada M1, sem gale.
+        # "tel_pct" = resultado final da operação quando disponível;
+        # para registros antigos sem resultado_final, usa o M1.
+        seg = pct(registros, "resultado")
+        tel_registros = []
+        for r in registros:
+            final = r.get("resultado_final")
+            if final in ("WIN", "LOSS"):
+                tel_registros.append({"resultado": final})
+            else:
+                tel_registros.append({"resultado": r.get("resultado")})
+        tel = pct(tel_registros, "resultado")
+        return {
+            "indicador": nome,
+            "sinais": len(registros),
+            "seg_pct": seg if seg is not None else 0,
+            "tel_pct": tel if tel is not None else 0,
+        }
+
+    indicadores = []
+
+    # Sempre mostra o robô atual primeiro.
+    indicadores.append(card("Robô atual", dados))
+
+    # Força é o campo realmente calculado pelo app.py.
+    for nome_forca in ("MUITO_FORTE", "FORTE", "MEDIA", "FRACA"):
+        grupo = [r for r in dados if str(r.get("forca") or "").upper() == nome_forca]
+        if grupo:
+            indicadores.append(card("Força " + nome_forca.replace("_", " "), grupo))
+
+    # Indicadores técnicos que o próprio app.py já grava no histórico.
+    campos = [
+        ("Tendência", "tendencia"),
+        ("MHI", "mhi"),
+        ("Rompimento", "rompimento"),
+        ("Pullback", "pullback"),
+        ("Fibonacci", "fibo"),
+        ("Pivô", "pivo"),
+    ]
+
+    for titulo, campo in campos:
+        grupos = {}
+        for r in dados:
+            valor = str(r.get(campo) or "").strip()
+            if not valor or valor in ("--", "None", "NEUTRA"):
+                continue
+            grupos.setdefault(valor, []).append(r)
+
+        for valor, grupo in grupos.items():
+            indicadores.append(card(f"{titulo}: {valor}", grupo))
+
+    # RSI: não inventa um corte quando o banco não tem dados.
+    rsi_alto = [r for r in dados if r.get("rsi") is not None and float(r["rsi"]) >= 70]
+    rsi_baixo = [r for r in dados if r.get("rsi") is not None and float(r["rsi"]) <= 30]
+    if rsi_alto:
+        indicadores.append(card("RSI ≥ 70", rsi_alto))
+    if rsi_baixo:
+        indicadores.append(card("RSI ≤ 30", rsi_baixo))
+
+    return jsonify({
+        "ok": True,
+        "inicio": inicio_txt,
+        "fim": fim_txt,
+        "mercado": filtro_mercado,
+        "meta": 53.8,
+        "total_sinais": len(dados),
+        "indicadores": indicadores,
+    })
+
+
 @app.get("/historico")
 def ver_historico():
 
@@ -4655,386 +4814,6 @@ def _buscar_velas_antigas(iq, par, quantas):
         fim = menor - 1
     return sorted(velas.values())[-quantas:]
 
-# ============================================================
-# ESTATÍSTICAS DO PAINEL WEB
-# ============================================================
-# IMPORTANTE:
-# - Não altera o robô
-# - Não altera o Telegram
-# - Não grava sinais
-# - Não altera resultados
-# - Apenas lê historico_sinais
-# ============================================================
-
-@app.get("/estatisticas")
-def estatisticas():
-    """
-    Estatísticas históricas para o painel web.
-
-    Parâmetros:
-        inicio=AAAA-MM-DD
-        fim=AAAA-MM-DD
-        mercado=ambos|otc|forex
-
-    Retorna:
-        indicadores[]
-    """
-
-    inicio_txt = (request.args.get("inicio") or "").strip()
-    fim_txt = (request.args.get("fim") or "").strip()
-    mercado = (request.args.get("mercado") or "ambos").strip().lower()
-
-    # --------------------------------------------------------
-    # DATAS
-    # --------------------------------------------------------
-
-    try:
-        if inicio_txt:
-            inicio_dt = datetime.strptime(
-                inicio_txt,
-                "%Y-%m-%d",
-            ).replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-                tzinfo=FUSO_BR,
-            )
-        else:
-            inicio_dt = datetime.now(
-                tz=FUSO_BR
-            ).replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-
-        if fim_txt:
-            fim_dt = datetime.strptime(
-                fim_txt,
-                "%Y-%m-%d",
-            ).replace(
-                hour=23,
-                minute=59,
-                second=59,
-                microsecond=999999,
-                tzinfo=FUSO_BR,
-            )
-        else:
-            fim_dt = datetime.now(
-                tz=FUSO_BR
-            )
-
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "erro": "Data inválida. Use AAAA-MM-DD.",
-        }), 400
-
-    if inicio_dt > fim_dt:
-        return jsonify({
-            "ok": False,
-            "erro": "A data inicial não pode ser maior que a final.",
-        }), 400
-
-    # --------------------------------------------------------
-    # MERCADO
-    # --------------------------------------------------------
-
-    if mercado not in (
-        "ambos",
-        "otc",
-        "forex",
-    ):
-        mercado = "ambos"
-
-    # --------------------------------------------------------
-    # BANCO
-    # --------------------------------------------------------
-
-    if not _DB_PRONTO:
-        return jsonify({
-            "ok": False,
-            "erro": "Banco de histórico indisponível.",
-        }), 503
-
-    inicio_ts = int(inicio_dt.timestamp())
-    fim_ts = int(fim_dt.timestamp()) + 1
-
-    try:
-
-        with _db_lock:
-
-            conexao = _conectar_db()
-
-            sql = """
-                SELECT
-                    par,
-                    entrada_em,
-                    sinal,
-                    tendencia,
-                    rsi,
-                    mhi,
-                    rompimento,
-                    pullback,
-                    fibo,
-                    pivo,
-                    resultado,
-                    resultado_final,
-                    avisado_tg
-                FROM historico_sinais
-                WHERE entrada_em >= ?
-                  AND entrada_em < ?
-                  AND resultado IN ('WIN', 'LOSS')
-            """
-
-            parametros = [
-                inicio_ts,
-                fim_ts,
-            ]
-
-            # ------------------------------------------------
-            # FILTRO OTC / FOREX
-            # ------------------------------------------------
-
-            if mercado == "otc":
-
-                condicoes = [
-                    str(par).upper().endswith("-OTC")
-                    for par in []
-                ]
-
-                sql += """
-                    AND UPPER(par) LIKE '%-OTC'
-                """
-
-            elif mercado == "forex":
-
-                sql += """
-                    AND UPPER(par) NOT LIKE '%-OTC'
-                """
-
-            sql += """
-                ORDER BY entrada_em ASC
-            """
-
-            linhas = conexao.execute(
-                sql,
-                parametros,
-            ).fetchall()
-
-            conexao.close()
-
-    except Exception as erro:
-
-        return jsonify({
-            "ok": False,
-            "erro": (
-                "Erro ao consultar histórico: "
-                + str(erro)[:180]
-            ),
-        }), 500
-
-    # ========================================================
-    # FUNÇÃO INTERNA
-    # ========================================================
-
-    def calcular(lista):
-
-        sinais = len(lista)
-
-        if sinais == 0:
-            return {
-                "sinais": 0,
-                "seg_pct": 0.0,
-                "tel_pct": 0.0,
-            }
-
-        wins_seg = sum(
-            1
-            for item in lista
-            if item["resultado"] == "WIN"
-        )
-
-        total_seg = sum(
-            1
-            for item in lista
-            if item["resultado"] in ("WIN", "LOSS")
-        )
-
-        # ----------------------------------------------------
-        # Telegram
-        #
-        # Só considera aquilo que realmente foi anunciado.
-        # resultado_final = resultado que o grupo recebeu.
-        # ----------------------------------------------------
-
-        telegram = [
-            item
-            for item in lista
-            if item["avisado_tg"] == 1
-            and item["resultado_final"] in (
-                "WIN",
-                "LOSS",
-            )
-        ]
-
-        wins_tel = sum(
-            1
-            for item in telegram
-            if item["resultado_final"] == "WIN"
-        )
-
-        total_tel = len(telegram)
-
-        seg_pct = (
-            round(
-                wins_seg / total_seg * 100,
-                1,
-            )
-            if total_seg
-            else 0.0
-        )
-
-        tel_pct = (
-            round(
-                wins_tel / total_tel * 100,
-                1,
-            )
-            if total_tel
-            else 0.0
-        )
-
-        return {
-            "sinais": sinais,
-            "seg_pct": seg_pct,
-            "tel_pct": tel_pct,
-        }
-
-    # ========================================================
-    # CONVERTER SQLITE PARA LISTA
-    # ========================================================
-
-    registros = [
-        dict(linha)
-        for linha in linhas
-    ]
-
-    indicadores = []
-
-    # ========================================================
-    # INDICADORES BASEADOS NO QUE O APP JÁ GUARDA
-    # ========================================================
-
-    catalogo = [
-        (
-            "Tendência de alta",
-            lambda x: str(
-                x["tendencia"] or ""
-            ).upper() == "ALTA",
-        ),
-        (
-            "Tendência de baixa",
-            lambda x: str(
-                x["tendencia"] or ""
-            ).upper() == "BAIXA",
-        ),
-        (
-            "RSI",
-            lambda x: x["rsi"] is not None,
-        ),
-        (
-            "MHI CALL",
-            lambda x: str(
-                x["mhi"] or ""
-            ).upper() == "CALL",
-        ),
-        (
-            "MHI PUT",
-            lambda x: str(
-                x["mhi"] or ""
-            ).upper() == "PUT",
-        ),
-        (
-            "Rompimento CALL",
-            lambda x: str(
-                x["rompimento"] or ""
-            ).upper() == "ALTA",
-        ),
-        (
-            "Rompimento PUT",
-            lambda x: str(
-                x["rompimento"] or ""
-            ).upper() == "BAIXA",
-        ),
-        (
-            "Pullback",
-            lambda x: str(
-                x["pullback"] or ""
-            ).upper() == "SIM",
-        ),
-        (
-            "Fibonacci",
-            lambda x: (
-                str(x["fibo"] or "")
-                .strip()
-                and str(x["fibo"] or "").upper()
-                not in ("NÃO", "NAO", "")
-            ),
-        ),
-        (
-            "Pivô",
-            lambda x: (
-                str(x["pivo"] or "")
-                .upper()
-                not in ("", "NEUTRO", "NÃO", "NAO")
-            ),
-        ),
-    ]
-
-    # ========================================================
-    # MONTAGEM DOS CARDS
-    # ========================================================
-
-    for nome, teste in catalogo:
-
-        selecionados = []
-
-        for registro in registros:
-
-            try:
-                if teste(registro):
-                    selecionados.append(registro)
-            except Exception:
-                continue
-
-        dados = calcular(
-            selecionados
-        )
-
-        if dados["sinais"] == 0:
-            continue
-
-        indicadores.append({
-            "indicador": nome,
-            "sinais": dados["sinais"],
-            "seg_pct": dados["seg_pct"],
-            "tel_pct": dados["tel_pct"],
-        })
-
-    # ========================================================
-    # RESULTADO
-    # ========================================================
-
-    return jsonify({
-        "ok": True,
-        "inicio": inicio_txt,
-        "fim": fim_txt,
-        "mercado": mercado,
-        "total_registros": len(registros),
-        "indicadores": indicadores,
-    })
 
 @app.get("/velas-antigas/<par>")
 def velas_antigas(par):
