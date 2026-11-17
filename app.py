@@ -1535,12 +1535,12 @@ DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
 )))
 
 # ============================================================
-# ANTI-LOSS NÍVEL 2
-# ============================================================
-# Sobe só um degrau na confirmação final: exige 7 pontos de
-# vantagem entre os lados. Não altera M1/G1/G2 nem resultados.
+# ANTI-LOSS NÍVEL 2 — SUAVE
+# Mantém o filtro atual para não bloquear os sinais do Telegram.
+# Preserva M1/G1/G2 e o fluxo de resultados/stickers.
 ANTI_LOSS_NIVEL = 2
-ANTI_LOSS_DIFERENCA_NIVEL_2 = 7
+ANTI_LOSS_DIFERENCA_NIVEL_2 = DIFERENCA_MINIMA_PADRAO
+
 
 # ============================================================
 # CONEXÃO PERSISTENTE
@@ -3817,13 +3817,13 @@ def analisar_sinal(candles, par=None, tf=None):
 
     if (
         pontos_call >= PONTUACAO_MINIMA
-        and pontos_call - pontos_put >= DIFERENCA_MINIMA
+        and pontos_call - pontos_put >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
     ):
         direcao_base = "CALL"
 
     elif (
         pontos_put >= PONTUACAO_MINIMA
-        and pontos_put - pontos_call >= DIFERENCA_MINIMA
+        and pontos_put - pontos_call >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
     ):
         direcao_base = "PUT"
 
@@ -9445,131 +9445,6 @@ try:
     print("MT4: ligado em /mt4/sinal")
 except Exception as _erro_mt4:
     print("MT4: não carregou —", _erro_mt4)
-
-# =========================================================
-# ROTA /estatisticas  — recálculo por período (Opção B1)
-# Cole antes do if __name__ == "__main__":
-# =========================================================
-from flask import jsonify, request
-from datetime import datetime, timedelta
-import pandas as pd
-
-# ---- 1. Busca de velas do período -------------------------
-def _buscar_velas_periodo(par, inicio, fim):
-    """
-    Retorna DataFrame com colunas: time, open, high, low, close.
-    Aqui usamos o cache/velas-antigas do próprio app.
-    Ajuste para a função real que você já usa (ex: get_candles).
-    """
-    # Exemplo genérico — troque pela sua fonte real:
-    velas = get_candles_historicas(par, inicio, fim)  # <-- sua função
-    df = pd.DataFrame(velas)
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.sort_values("time").reset_index(drop=True)
-    return df
-
-# ---- 2. Motor de indicadores (Núcleo + Médio) -------------
-def _avaliar_vela(df, i):
-    """
-    Recebe o DataFrame e o índice i da vela de sinal.
-    Devolve dict: {nome_indicador: "CALL"/"PUT"/None}
-    Reaproveite suas funções reais de indicador aqui.
-    """
-    sinais = {}
-    janela = df.iloc[:i+1]
-
-    # --- Núcleo ---
-    sinais["Robô atual"]        = sinal_robo(janela)          # sua função
-    sinais["EMA 12/26"]         = sinal_ema_cross(janela, 12, 26, "segue")
-    sinais["EMA 14/21"]         = sinal_ema_cross(janela, 14, 21, "segue")
-    sinais["RSI 70/30"]         = sinal_rsi(janela, 70, 30)
-    sinais["MHI"]               = sinal_mhi(janela)
-    sinais["Fibonacci"]         = sinal_fibonacci(janela)
-    sinais["Tendência"]         = sinal_tendencia(janela)
-    sinais["Rompimento"]        = sinal_rompimento(janela)
-    sinais["Pullback"]          = sinal_pullback(janela)
-
-    # --- Médio ---
-    sinais["3 corvos"]          = sinal_3_corvos(janela)
-    sinais["Martelo"]           = sinal_martelo(janela)
-    sinais["Engolfo alta"]      = sinal_engolfo(janela, "alta")
-    sinais["Engolfo baixa"]     = sinal_engolfo(janela, "baixa")
-    sinais["Estrela cadente"]   = sinal_estrela_cadente(janela)
-    sinais["Estrela da manhã"]  = sinal_estrela_manha(janela)
-    sinais["Harami alta"]       = sinal_harami(janela, "alta")
-    sinais["Piercing"]          = sinal_piercing(janela)
-    sinais["3 velas iguais"]    = sinal_sequencia(janela, 3)
-    sinais["4 velas iguais"]    = sinal_sequencia(janela, 4)
-    sinais["5 velas iguais"]    = sinal_sequencia(janela, 5)
-    sinais["Pavio 3x"]          = sinal_pavio_3x(janela)
-
-    return {k: v for k, v in sinais.items() if v in ("CALL", "PUT")}
-
-# ---- 3. Rota ----------------------------------------------
-@app.route("/estatisticas")
-def estatisticas():
-    inicio = request.args.get("inicio")
-    fim    = request.args.get("fim")
-    mercado = request.args.get("mercado", "ambos")
-
-    if not inicio or not fim:
-        return jsonify({"erro": "Informe inicio e fim (YYYY-MM-DD)"}), 400
-
-    pares = PARES_OTC if mercado == "otc" else (
-            PARES_FOREX if mercado == "forex" else PARES_OTC + PARES_FOREX)
-
-    # acumuladores: {indicador: {"seg": [wins, total], "tel": [wins, total]}}
-    acc = {}
-
-    for par in pares:
-        df = _buscar_velas_periodo(par, inicio, fim)
-        if len(df) < 60:
-            continue
-
-        for i in range(50, len(df) - 2):
-            sinais = _avaliar_vela(df, i)
-            if not sinais:
-                continue
-
-            close_sinal = df["close"].iloc[i]
-            close_seg   = df["close"].iloc[i + 1]   # vela seguinte
-            close_tel   = df["close"].iloc[i + 2]   # vela do Telegram
-
-            for nome, direcao in sinais.items():
-                acc.setdefault(nome, {"seg": [0, 0], "tel": [0, 0]})
-
-                # vela seguinte
-                win_seg = (close_seg > close_sinal) if direcao == "CALL" \
-                          else (close_seg < close_sinal)
-                acc[nome]["seg"][1] += 1
-                acc[nome]["seg"][0] += int(win_seg)
-
-                # vela Telegram
-                win_tel = (close_tel > close_sinal) if direcao == "CALL" \
-                          else (close_tel < close_sinal)
-                acc[nome]["tel"][1] += 1
-                acc[nome]["tel"][0] += int(win_tel)
-
-    # monta resposta
-    resultado = []
-    for nome, v in acc.items():
-        seg_w, seg_t = v["seg"]
-        tel_w, tel_t = v["tel"]
-        resultado.append({
-            "indicador": nome,
-            "seg_pct": round(100 * seg_w / seg_t, 1) if seg_t else 0,
-            "tel_pct": round(100 * tel_w / tel_t, 1) if tel_t else 0,
-            "sinais": seg_t,
-        })
-
-    resultado.sort(key=lambda x: x["seg_pct"], reverse=True)
-
-    return jsonify({
-        "periodo": {"inicio": inicio, "fim": fim},
-        "mercado": mercado,
-        "meta": 53.8,
-        "indicadores": resultado,
-    })
 
 if __name__ == "__main__":
 
