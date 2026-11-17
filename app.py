@@ -1644,8 +1644,11 @@ CADEADO_PERDIDO_SEG = 60
 # e a corretora tem tempo de liberar.
 #
 # Um único sucesso zera a contagem.
-FALHAS_ATE_FREIO = int(os.getenv("FALHAS_ATE_FREIO", "3"))
-FREIO_SEGUNDOS = int(os.getenv("FREIO_SEGUNDOS", "300"))
+# Não bloquear a conexão por "castigo". O worker já faz uma nova
+# tentativa a cada ciclo (3 min) e isso é suficiente para não martelar
+# a corretora. O diagnóstico continuará mostrando quantas falhas houve.
+FALHAS_ATE_FREIO = 10**9
+FREIO_SEGUNDOS = 0
 
 _falhas_seguidas = 0
 _freio_ate = 0
@@ -2576,6 +2579,13 @@ def conectar():
             password
         )
 
+        # Limita as reconexões internas da biblioteca para evitar
+        # uma tempestade de tentativas quando a sessão cai.
+        try:
+            cliente.set_max_reconnect(5)
+        except Exception:
+            pass
+
         inicio = time.time()
 
         conectado, motivo = cliente.connect()
@@ -2846,8 +2856,8 @@ MAX_WORKERS_POOL = 12
 #
 # Teto de 25: o gunicorn mata o worker por volta dos 30 segundos.
 CONEXAO_TIMEOUT = max(
-    5,
-    min(25, int(os.getenv("CONEXAO_TIMEOUT", "20")))
+    8,
+    min(25, int(os.getenv("CONEXAO_TIMEOUT", "25")))
 )
 
 # Quantas threads podem ficar penduradas antes de reciclar.
@@ -2940,14 +2950,8 @@ def conectar_com_timeout(timeout_segundos=None):
     if timeout_segundos is None:
         timeout_segundos = CONEXAO_TIMEOUT
 
-    # No freio: nem tenta. Cada tentativa nesse estado só deixaria
-    # mais uma thread pendurada e mais um pedido na corretora.
-    if _no_freio():
-        falta = int(_freio_ate - time.time())
-        raise RuntimeError(
-            "A corretora recusou várias conexões seguidas. "
-            f"Nova tentativa em {falta}s."
-        )
+    # O castigo foi desativado: uma falha não bloqueia a próxima
+    # tentativa. O worker controla o intervalo entre as tentativas.
 
     # Cadeado travado por uma thread morta? Limpa ANTES de tentar.
     #
