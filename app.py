@@ -1541,7 +1541,7 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
 # MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
 # MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "6")
+    os.getenv("DIFERENCA_MINIMA", "5")
 )))
 
 # ============================================================
