@@ -872,7 +872,7 @@ def montar_caption_sinal(par, analise):
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
 )
 
 _ultima_entrada_enviada = 0
@@ -1535,6 +1535,14 @@ DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
 )))
 
 # ============================================================
+# ANTI-LOSS NÍVEL 2
+# ============================================================
+# Sobe só um degrau na confirmação final: exige 7 pontos de
+# vantagem entre os lados. Não altera M1/G1/G2 nem resultados.
+ANTI_LOSS_NIVEL = 2
+ANTI_LOSS_DIFERENCA_NIVEL_2 = 7
+
+# ============================================================
 # CONEXÃO PERSISTENTE
 # ============================================================
 
@@ -1881,7 +1889,6 @@ def iniciar_db():
                 ("resultado_final", "TEXT"),
                 ("etapa_final", "INTEGER"),
                 ("avisado_tg", "INTEGER"),
-                ("resultado_tg_enviado", "INTEGER"),
             ):
                 try:
                     conexao.execute(
@@ -2135,7 +2142,7 @@ def registrar_final_historico(par, entrada_em, sinal, final, etapa):
             conexao.execute(
                 """
                 UPDATE historico_sinais
-                   SET resultado_final = ?, etapa_final = ?, resultado_tg_enviado = 0
+                   SET resultado_final = ?, etapa_final = ?
                  WHERE par = ?
                    AND entrada_em = ?
                    AND sinal = ?
@@ -3879,7 +3886,7 @@ def analisar_sinal(candles, par=None, tf=None):
         if (
             pontos_call_final >= PONTUACAO_MINIMA
             and pontos_call_final - pontos_put_final
-            >= DIFERENCA_MINIMA
+            >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
         ):
 
             sinal = "CALL"
@@ -3898,7 +3905,7 @@ def analisar_sinal(candles, par=None, tf=None):
         if (
             pontos_put_final >= PONTUACAO_MINIMA
             and pontos_put_final - pontos_call_final
-            >= DIFERENCA_MINIMA
+            >= max(DIFERENCA_MINIMA, ANTI_LOSS_DIFERENCA_NIVEL_2)
         ):
 
             sinal = "PUT"
@@ -5300,6 +5307,16 @@ def resultado_sinal(par):
                 resultado_final = "LOSS"
                 etapa_final = 2
 
+        # Válvula de segurança: se depois de 15 minutos a
+        # sequência ainda não fechou (mercado fechou, vela não
+        # veio), encerra com o que se sabe. Sem isto a linha
+        # ficaria para sempre na fila do worker.
+        if (
+            resultado_final is None
+            and time.time() - inicio_candle > 900
+        ):
+            resultado_final = "LOSS" if m1 == "LOSS" else "WIN"
+            etapa_final = 0
 
         if resultado_final:
 
@@ -5317,70 +5334,53 @@ def resultado_sinal(par):
             except Exception:
                 gravado = False
 
-            # O resultado final não depende de `gravado`: a linha M1 pode
-            # já ter sido gravada em uma consulta anterior.
-            if resultado_final:
+            # Só manda o Telegram na primeira gravação. A rota
+            # é consultada várias vezes pro mesmo sinal.
+            if gravado:
 
+                # Guarda também o resultado que o GRUPO vai ver, com o
+                # gale já considerado. É ele que alimenta o relatório de
+                # sessão — sem isto, um "WIN 1G" apareceria lá como ❌.
                 try:
                     registrar_final_historico(
-                        par, inicio_candle, sinal,
-                        resultado_final, etapa_final,
+                        par,
+                        inicio_candle,
+                        sinal,
+                        resultado_final,
+                        etapa_final,
                     )
                 except Exception:
                     pass
 
-                # Só envia se a entrada realmente foi anunciada.
-                # `resultado_tg_enviado` impede duplicação e permite
-                # nova tentativa se o primeiro envio falhar.
+                # SO MANDA O RESULTADO SE A ENTRADA FOI AO GRUPO.
+                #
+                # Antes o resultado saia sempre. Como a trava deixa
+                # uma operacao por vez, varios sinais ficavam so
+                # gravados no banco sem serem anunciados -- e o grupo
+                # recebia WIN/LOSS de entradas que nunca viu.
                 if foi_avisado_telegram(par, inicio_candle, sinal):
-                    enviar_resultado = True
-                    if _DB_PRONTO:
-                        try:
-                            with _db_lock:
-                                conexao = _conectar_db()
-                                linha = conexao.execute(
-                                    "SELECT resultado_tg_enviado FROM historico_sinais "
-                                    "WHERE par = ? AND entrada_em = ? AND sinal = ? LIMIT 1",
-                                    (str(par), int(inicio_candle), str(sinal)),
-                                ).fetchone()
-                                conexao.close()
-                            enviar_resultado = not bool(linha and linha["resultado_tg_enviado"])
-                        except Exception:
-                            enviar_resultado = True
+                    try:
+                        imagem, caption = montar_resultado_gale(
+                            par,
+                            sinal,
+                            inicio_candle,
+                            resultado_final,
+                            etapa_final,
+                        )
+                        enviar_telegram_foto(imagem, caption)
 
-                    if enviar_resultado:
+                        # O mesmo resultado no grupo grátis, se
+                        # este sinal fez parte de uma lista.
                         try:
-                            imagem, caption = montar_resultado_gale(
-                                par, sinal, inicio_candle,
+                            gratis_ao_enviar_resultado(
+                                par, inicio_candle, sinal,
                                 resultado_final, etapa_final,
+                                imagem, caption,
                             )
-                            enviar_telegram_foto(imagem, caption)
-
-                            if _DB_PRONTO:
-                                try:
-                                    with _db_lock:
-                                        conexao = _conectar_db()
-                                        conexao.execute(
-                                            "UPDATE historico_sinais SET resultado_tg_enviado = 1 "
-                                            "WHERE par = ? AND entrada_em = ? AND sinal = ?",
-                                            (str(par), int(inicio_candle), str(sinal)),
-                                        )
-                                        conexao.commit()
-                                        conexao.close()
-                                except Exception:
-                                    pass
-
-                            try:
-                                gratis_ao_enviar_resultado(
-                                    par, inicio_candle, sinal,
-                                    resultado_final, etapa_final,
-                                    imagem, caption,
-                                )
-                            except Exception as erro:
-                                print("GRATIS: resultado não copiado —", str(erro)[:120])
-
                         except Exception as erro:
-                            print("TELEGRAM: resultado não enviado —", str(erro)[:160])
+                            print("GRATIS: resultado não copiado —", str(erro)[:120])
+                    except Exception:
+                        pass
 
                 try:
                     encerrar_sequencia(par, inicio_candle)
