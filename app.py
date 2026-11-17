@@ -4655,6 +4655,386 @@ def _buscar_velas_antigas(iq, par, quantas):
         fim = menor - 1
     return sorted(velas.values())[-quantas:]
 
+# ============================================================
+# ESTATÍSTICAS DO PAINEL WEB
+# ============================================================
+# IMPORTANTE:
+# - Não altera o robô
+# - Não altera o Telegram
+# - Não grava sinais
+# - Não altera resultados
+# - Apenas lê historico_sinais
+# ============================================================
+
+@app.get("/estatisticas")
+def estatisticas():
+    """
+    Estatísticas históricas para o painel web.
+
+    Parâmetros:
+        inicio=AAAA-MM-DD
+        fim=AAAA-MM-DD
+        mercado=ambos|otc|forex
+
+    Retorna:
+        indicadores[]
+    """
+
+    inicio_txt = (request.args.get("inicio") or "").strip()
+    fim_txt = (request.args.get("fim") or "").strip()
+    mercado = (request.args.get("mercado") or "ambos").strip().lower()
+
+    # --------------------------------------------------------
+    # DATAS
+    # --------------------------------------------------------
+
+    try:
+        if inicio_txt:
+            inicio_dt = datetime.strptime(
+                inicio_txt,
+                "%Y-%m-%d",
+            ).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+                tzinfo=FUSO_BR,
+            )
+        else:
+            inicio_dt = datetime.now(
+                tz=FUSO_BR
+            ).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+
+        if fim_txt:
+            fim_dt = datetime.strptime(
+                fim_txt,
+                "%Y-%m-%d",
+            ).replace(
+                hour=23,
+                minute=59,
+                second=59,
+                microsecond=999999,
+                tzinfo=FUSO_BR,
+            )
+        else:
+            fim_dt = datetime.now(
+                tz=FUSO_BR
+            )
+
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use AAAA-MM-DD.",
+        }), 400
+
+    if inicio_dt > fim_dt:
+        return jsonify({
+            "ok": False,
+            "erro": "A data inicial não pode ser maior que a final.",
+        }), 400
+
+    # --------------------------------------------------------
+    # MERCADO
+    # --------------------------------------------------------
+
+    if mercado not in (
+        "ambos",
+        "otc",
+        "forex",
+    ):
+        mercado = "ambos"
+
+    # --------------------------------------------------------
+    # BANCO
+    # --------------------------------------------------------
+
+    if not _DB_PRONTO:
+        return jsonify({
+            "ok": False,
+            "erro": "Banco de histórico indisponível.",
+        }), 503
+
+    inicio_ts = int(inicio_dt.timestamp())
+    fim_ts = int(fim_dt.timestamp()) + 1
+
+    try:
+
+        with _db_lock:
+
+            conexao = _conectar_db()
+
+            sql = """
+                SELECT
+                    par,
+                    entrada_em,
+                    sinal,
+                    tendencia,
+                    rsi,
+                    mhi,
+                    rompimento,
+                    pullback,
+                    fibo,
+                    pivo,
+                    resultado,
+                    resultado_final,
+                    avisado_tg
+                FROM historico_sinais
+                WHERE entrada_em >= ?
+                  AND entrada_em < ?
+                  AND resultado IN ('WIN', 'LOSS')
+            """
+
+            parametros = [
+                inicio_ts,
+                fim_ts,
+            ]
+
+            # ------------------------------------------------
+            # FILTRO OTC / FOREX
+            # ------------------------------------------------
+
+            if mercado == "otc":
+
+                condicoes = [
+                    str(par).upper().endswith("-OTC")
+                    for par in []
+                ]
+
+                sql += """
+                    AND UPPER(par) LIKE '%-OTC'
+                """
+
+            elif mercado == "forex":
+
+                sql += """
+                    AND UPPER(par) NOT LIKE '%-OTC'
+                """
+
+            sql += """
+                ORDER BY entrada_em ASC
+            """
+
+            linhas = conexao.execute(
+                sql,
+                parametros,
+            ).fetchall()
+
+            conexao.close()
+
+    except Exception as erro:
+
+        return jsonify({
+            "ok": False,
+            "erro": (
+                "Erro ao consultar histórico: "
+                + str(erro)[:180]
+            ),
+        }), 500
+
+    # ========================================================
+    # FUNÇÃO INTERNA
+    # ========================================================
+
+    def calcular(lista):
+
+        sinais = len(lista)
+
+        if sinais == 0:
+            return {
+                "sinais": 0,
+                "seg_pct": 0.0,
+                "tel_pct": 0.0,
+            }
+
+        wins_seg = sum(
+            1
+            for item in lista
+            if item["resultado"] == "WIN"
+        )
+
+        total_seg = sum(
+            1
+            for item in lista
+            if item["resultado"] in ("WIN", "LOSS")
+        )
+
+        # ----------------------------------------------------
+        # Telegram
+        #
+        # Só considera aquilo que realmente foi anunciado.
+        # resultado_final = resultado que o grupo recebeu.
+        # ----------------------------------------------------
+
+        telegram = [
+            item
+            for item in lista
+            if item["avisado_tg"] == 1
+            and item["resultado_final"] in (
+                "WIN",
+                "LOSS",
+            )
+        ]
+
+        wins_tel = sum(
+            1
+            for item in telegram
+            if item["resultado_final"] == "WIN"
+        )
+
+        total_tel = len(telegram)
+
+        seg_pct = (
+            round(
+                wins_seg / total_seg * 100,
+                1,
+            )
+            if total_seg
+            else 0.0
+        )
+
+        tel_pct = (
+            round(
+                wins_tel / total_tel * 100,
+                1,
+            )
+            if total_tel
+            else 0.0
+        )
+
+        return {
+            "sinais": sinais,
+            "seg_pct": seg_pct,
+            "tel_pct": tel_pct,
+        }
+
+    # ========================================================
+    # CONVERTER SQLITE PARA LISTA
+    # ========================================================
+
+    registros = [
+        dict(linha)
+        for linha in linhas
+    ]
+
+    indicadores = []
+
+    # ========================================================
+    # INDICADORES BASEADOS NO QUE O APP JÁ GUARDA
+    # ========================================================
+
+    catalogo = [
+        (
+            "Tendência de alta",
+            lambda x: str(
+                x["tendencia"] or ""
+            ).upper() == "ALTA",
+        ),
+        (
+            "Tendência de baixa",
+            lambda x: str(
+                x["tendencia"] or ""
+            ).upper() == "BAIXA",
+        ),
+        (
+            "RSI",
+            lambda x: x["rsi"] is not None,
+        ),
+        (
+            "MHI CALL",
+            lambda x: str(
+                x["mhi"] or ""
+            ).upper() == "CALL",
+        ),
+        (
+            "MHI PUT",
+            lambda x: str(
+                x["mhi"] or ""
+            ).upper() == "PUT",
+        ),
+        (
+            "Rompimento CALL",
+            lambda x: str(
+                x["rompimento"] or ""
+            ).upper() == "ALTA",
+        ),
+        (
+            "Rompimento PUT",
+            lambda x: str(
+                x["rompimento"] or ""
+            ).upper() == "BAIXA",
+        ),
+        (
+            "Pullback",
+            lambda x: str(
+                x["pullback"] or ""
+            ).upper() == "SIM",
+        ),
+        (
+            "Fibonacci",
+            lambda x: (
+                str(x["fibo"] or "")
+                .strip()
+                and str(x["fibo"] or "").upper()
+                not in ("NÃO", "NAO", "")
+            ),
+        ),
+        (
+            "Pivô",
+            lambda x: (
+                str(x["pivo"] or "")
+                .upper()
+                not in ("", "NEUTRO", "NÃO", "NAO")
+            ),
+        ),
+    ]
+
+    # ========================================================
+    # MONTAGEM DOS CARDS
+    # ========================================================
+
+    for nome, teste in catalogo:
+
+        selecionados = []
+
+        for registro in registros:
+
+            try:
+                if teste(registro):
+                    selecionados.append(registro)
+            except Exception:
+                continue
+
+        dados = calcular(
+            selecionados
+        )
+
+        if dados["sinais"] == 0:
+            continue
+
+        indicadores.append({
+            "indicador": nome,
+            "sinais": dados["sinais"],
+            "seg_pct": dados["seg_pct"],
+            "tel_pct": dados["tel_pct"],
+        })
+
+    # ========================================================
+    # RESULTADO
+    # ========================================================
+
+    return jsonify({
+        "ok": True,
+        "inicio": inicio_txt,
+        "fim": fim_txt,
+        "mercado": mercado,
+        "total_registros": len(registros),
+        "indicadores": indicadores,
+    })
 
 @app.get("/velas-antigas/<par>")
 def velas_antigas(par):
