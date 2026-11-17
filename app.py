@@ -872,7 +872,7 @@ def montar_caption_sinal(par, analise):
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
 )
 
 _ultima_entrada_enviada = 0
@@ -1522,7 +1522,7 @@ ESTRATEGIA = (
 # estiverem perdendo, afrouxar só aumenta a perda — e o aluno
 # que leva três seguidas sai do grupo.
 PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("PONTUACAO_MINIMA", "6")
+    os.getenv("PONTUACAO_MINIMA", "5")
 )))
 
 # 15/11/2026: subiu de 4 para 5, e depois para 6 (pedido do Daniel).
@@ -1531,7 +1531,7 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
 # MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
 # MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "7")
+    os.getenv("DIFERENCA_MINIMA", "6")
 )))
 
 # ============================================================
@@ -1591,11 +1591,8 @@ CADEADO_PERDIDO_SEG = 60
 # e a corretora tem tempo de liberar.
 #
 # Um único sucesso zera a contagem.
-# Não bloquear a conexão por castigo longo. Uma falha não pode
-# deixar o robô e o diagnóstico parados por 5 minutos. O worker e
-# o vigia controlam o ritmo das novas tentativas.
-FALHAS_ATE_FREIO = 10**9
-FREIO_SEGUNDOS = 0
+FALHAS_ATE_FREIO = int(os.getenv("FALHAS_ATE_FREIO", "3"))
+FREIO_SEGUNDOS = int(os.getenv("FREIO_SEGUNDOS", "300"))
 
 _falhas_seguidas = 0
 _freio_ate = 0
@@ -2526,13 +2523,6 @@ def conectar():
             password
         )
 
-        # Limita as reconexões internas da biblioteca para evitar
-        # tempestade de tentativas quando a sessão cai.
-        try:
-            cliente.set_max_reconnect(5)
-        except Exception:
-            pass
-
         inicio = time.time()
 
         conectado, motivo = cliente.connect()
@@ -2803,8 +2793,8 @@ MAX_WORKERS_POOL = 12
 #
 # Teto de 25: o gunicorn mata o worker por volta dos 30 segundos.
 CONEXAO_TIMEOUT = max(
-    8,
-    min(25, int(os.getenv("CONEXAO_TIMEOUT", "25")))
+    5,
+    min(25, int(os.getenv("CONEXAO_TIMEOUT", "20")))
 )
 
 # Quantas threads podem ficar penduradas antes de reciclar.
@@ -2897,8 +2887,14 @@ def conectar_com_timeout(timeout_segundos=None):
     if timeout_segundos is None:
         timeout_segundos = CONEXAO_TIMEOUT
 
-    # Sem castigo longo: uma falha não bloqueia a próxima tentativa.
-    # O worker e o vigia controlam o intervalo entre reconexões.
+    # No freio: nem tenta. Cada tentativa nesse estado só deixaria
+    # mais uma thread pendurada e mais um pedido na corretora.
+    if _no_freio():
+        falta = int(_freio_ate - time.time())
+        raise RuntimeError(
+            "A corretora recusou várias conexões seguidas. "
+            f"Nova tentativa em {falta}s."
+        )
 
     # Cadeado travado por uma thread morta? Limpa ANTES de tentar.
     #
@@ -7798,12 +7794,12 @@ def montar_relatorio_sessao(operacoes, nome, inicio, fim):
 #
 # AJUSTES NO RENDER (opcional)
 #
-#   SAUDE_LIMITE   -> quanto tempo sem vela é problema (padrão 300 = 5 min)
-#   VIGIA_SEGUNDOS -> intervalo mínimo entre dois consertos (padrão 300)
+#   SAUDE_LIMITE   -> quanto tempo sem vela é problema (padrão 600 = 10 min)
+#   VIGIA_SEGUNDOS -> intervalo mínimo entre dois consertos (padrão 600)
 
-SAUDE_LIMITE = max(300, int(os.getenv("SAUDE_LIMITE", "300")))
+SAUDE_LIMITE = max(300, int(os.getenv("SAUDE_LIMITE", "600")))
 
-VIGIA_SEGUNDOS = max(300, int(os.getenv("VIGIA_SEGUNDOS", "300")))
+VIGIA_SEGUNDOS = max(300, int(os.getenv("VIGIA_SEGUNDOS", "600")))
 
 # Começa na hora em que o servidor sobe. Se começasse em zero,
 # o vigia acharia que o robô está parado desde 1970 e agiria na
@@ -8599,20 +8595,25 @@ def _bloco_corretora():
     elif descansando > 0:
         estado = "espera"
         resumo = (
-            "Aguardando nova tentativa após falhas de conexão ("
+            "Parada de castigo. Falhou "
             + str(falhas)
-            + ")."
+            + " vezes seguidas e está esperando "
+            + _tempo_curto(descansando)
+            + " antes de tentar de novo."
         )
         acao = (
-            "O vigia reconecta automaticamente. Se precisar, use "
-            "o teste de login do diagnóstico para verificar a conta."
+            "Não precisa fazer nada. O vigia destrava sozinho "
+            "quando o robô passa 10 minutos sem receber vela. "
+            "Testar por cima dele força mais uma conexão numa "
+            "hora em que a corretora já está engasgada."
         )
     else:
         estado = "ruim"
         resumo = "Sem conexão. Nenhum sinal sai enquanto isso."
         acao = (
-            "O vigia reconecta automaticamente quando fica sem "
-            "vela por alguns minutos. Veja 'Última vela recebida'."
+            "Não precisa fazer nada. O vigia reconecta sozinho "
+            "quando o robô passa 10 minutos sem receber vela. "
+            "Veja a linha 'Última vela recebida' logo abaixo."
         )
 
     linhas = [
