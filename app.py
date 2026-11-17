@@ -1575,7 +1575,7 @@ ESTRATEGIA = (
 # estiverem perdendo, afrouxar só aumenta a perda — e o aluno
 # que leva três seguidas sai do grupo.
 PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("PONTUACAO_MINIMA", "5")
+    os.getenv("PONTUACAO_MINIMA", "6")
 )))
 
 # 15/11/2026: subiu de 4 para 5, e depois para 6 (pedido do Daniel).
@@ -1584,7 +1584,7 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
 # MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
 # MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "6")
+    os.getenv("DIFERENCA_MINIMA", "7")
 )))
 
 # ============================================================
