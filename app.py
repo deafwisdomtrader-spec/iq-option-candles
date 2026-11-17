@@ -19,6 +19,16 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
+
+@app.after_request
+def adicionar_cors(resposta):
+    """Permite que o painel web consulte esta API a partir de outro domínio."""
+    resposta.headers["Access-Control-Allow-Origin"] = "*"
+    resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resposta.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
+    resposta.headers["Cache-Control"] = "no-store"
+    return resposta
+
 # ============================================================
 # TELEGRAM — SINAL (IMAGEM + CARTÃO) E RESULTADO (COM GALE)
 # ============================================================
@@ -872,7 +882,7 @@ def montar_caption_sinal(par, analise):
 # e liberou a trava cedo. Menos sinais = menos dinheiro em risco.
 
 TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
-    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "300")
+    os.getenv("TELEGRAM_ESPERA_ENTRE_ENTRADAS", "90")
 )
 
 _ultima_entrada_enviada = 0
@@ -1522,7 +1532,7 @@ ESTRATEGIA = (
 # estiverem perdendo, afrouxar só aumenta a perda — e o aluno
 # que leva três seguidas sai do grupo.
 PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("PONTUACAO_MINIMA", "5")
+    os.getenv("PONTUACAO_MINIMA", "6")
 )))
 
 # 15/11/2026: subiu de 4 para 5, e depois para 6 (pedido do Daniel).
@@ -1531,7 +1541,7 @@ PONTUACAO_MINIMA_PADRAO = max(1, min(8, int(
 # MUITO FORTE (7+). Com 6, saem só os FORTE de diferença 6 e os
 # MUITO FORTE. Conferir de novo em 29/11 com /historico.
 DIFERENCA_MINIMA_PADRAO = max(1, min(8, int(
-    os.getenv("DIFERENCA_MINIMA", "6")
+    os.getenv("DIFERENCA_MINIMA", "7")
 )))
 
 # ============================================================
@@ -1592,7 +1602,7 @@ CADEADO_PERDIDO_SEG = 60
 #
 # Um único sucesso zera a contagem.
 FALHAS_ATE_FREIO = int(os.getenv("FALHAS_ATE_FREIO", "3"))
-FREIO_SEGUNDOS = int(os.getenv("FREIO_SEGUNDOS", "300"))
+FREIO_SEGUNDOS = int(os.getenv("FREIO_SEGUNDOS", "60"))
 
 _falhas_seguidas = 0
 _freio_ate = 0
@@ -8097,13 +8107,13 @@ def _loop_worker(geracao=0):
             # conta própria.
             try:
                 conectar_com_timeout()
-            except Exception:
-                pass
+            except Exception as erro:
+                print("WORKER: conexão IQ Option falhou —", type(erro).__name__, str(erro)[:200])
 
             _processar_resultados_worker()
             _processar_sinais_worker()
-        except Exception:
-            pass
+        except Exception as erro:
+            print("WORKER: erro no ciclo —", type(erro).__name__, str(erro)[:250])
 
         # O relatório é tentado a cada volta, mas só sai UMA vez por
         # sessão — quem garante isso é a chave gravada no banco.
