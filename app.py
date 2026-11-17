@@ -19,13 +19,6 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
-# ============================================================
-# CORS — PAINEL DE INDICADORES
-# ============================================================
-# O painel HTML fica em outro domínio e consulta o Flask no
-# Render. Sem este cabeçalho o navegador bloqueia o fetch com
-# "Failed to fetch" mesmo quando /estatisticas funciona ao
-# abrir diretamente no navegador.
 @app.after_request
 def adicionar_cors(resposta):
     resposta.headers["Access-Control-Allow-Origin"] = "*"
@@ -4619,6 +4612,75 @@ def estatisticas_painel():
             "tel_pct": tel if tel is not None else 0,
         }
 
+    # Catálogo completo usado pelo painel web.
+    catalogo_indicadores = [
+        'Robô atual',
+        'Robô diferença 6+',
+        'Robô muito forte 7+',
+        'Fibonacci zona de ouro',
+        'RSI acima de 70 (CALL)',
+        'EMA 12/26 cruza segue',
+        'EMA 14/21 cruza segue',
+        'EMA 14/50 cruza contra',
+        'EMA 5/10 cruza contra',
+        'EMA 9/21 cruza segue',
+        'EMA 21/50 segue',
+        'Preço cruza EMA 20 contra',
+        'Leque 10 médias segue',
+        'Leque alinhou contra',
+        '5 velas iguais reverte',
+        '4 velas iguais continua',
+        '3 velas iguais reverte',
+        '2 velas iguais reverte',
+        'MHI maioria',
+        'MHI minoria',
+        'Repete a cor',
+        'Pavio 3x embaixo (CALL)',
+        'Pavio 3x em cima (PUT)',
+        '3 corvos (CALL)',
+        'Estrela cadente',
+        'Estrela da manhã',
+        'Martelo',
+        'Enforcado',
+        'Piercing',
+        'Harami de alta',
+        'Engolfo de alta',
+        'Engolfo de baixa',
+        'Doji',
+        'OCO rompe pescoço (PUT)',
+        'OCO invertido (CALL)',
+        'Triângulo p/ cima (CALL)',
+        'Triângulo p/ baixo (PUT)',
+        'Topo duplo (PUT)',
+        'Fundo duplo (CALL)',
+        'Rompe canal 20 velas',
+        'Bandeira de baixa (PUT)',
+        'Bandeira de alta (CALL)',
+        'Ichimoku Tenkan/Kijun',
+        'MACD cruza zero segue',
+        'MACD cruza sinal contra',
+        'Parabolic SAR vira contra',
+        'Bollinger fora contra',
+        'Bollinger + RSI contra',
+        'RSI 2 (10/90)',
+        'SuperTrend vira segue',
+        'Heikin Ashi muda cor',
+        'CCI 100',
+        'ADX 25',
+        'Estocástico 20/80',
+        'Williams %R',
+        'Keltner',
+        'Pião depois de 3 baixas',
+        'Pião depois de 3 altas',
+        'Pião segue a cor',
+        'Pião no topo 20 velas',
+        'Pega pavio M5 3min forte',
+        'Pega pavio M5 1min',
+        'Pega pavio M5 3min',
+        'Movimento forte segue',
+        'Movimento parado segue',
+    ]
+
     indicadores = []
 
     # Sempre mostra o robô atual primeiro.
@@ -4658,6 +4720,22 @@ def estatisticas_painel():
         indicadores.append(card("RSI ≥ 70", rsi_alto))
     if rsi_baixo:
         indicadores.append(card("RSI ≤ 30", rsi_baixo))
+
+
+    # Mostra todos os indicadores do catálogo.
+    # Indicador sem sinal no período = 0 sinais / 0,0% (sem amostra).
+    por_nome = {item["indicador"]: item for item in indicadores}
+
+    for nome in catalogo_indicadores:
+        if nome not in por_nome:
+            por_nome[nome] = {
+                "indicador": nome,
+                "sinais": 0,
+                "seg_pct": 0,
+                "tel_pct": 0,
+            }
+
+    indicadores = [por_nome[nome] for nome in catalogo_indicadores]
 
     return jsonify({
         "ok": True,
