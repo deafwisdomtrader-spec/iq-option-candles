@@ -19,11 +19,13 @@ from iqoptionapi.stable_api import IQ_Option
 
 app = Flask(__name__)
 
+# CORS — permite que o painel web leia as respostas do Render.
 @app.after_request
 def adicionar_cors(resposta):
     resposta.headers["Access-Control-Allow-Origin"] = "*"
     resposta.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     resposta.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
+    resposta.headers["Cache-Control"] = "no-store"
     return resposta
 
 
@@ -1367,6 +1369,49 @@ CANDLE_COUNT = 100
 #
 # PRAZO: uma semana. Depois disso, olhe /historico e tire de
 # novo quem continuar abaixo de 53,8% com 30+ operações.
+
+# ============================================================
+# PARES DO PAINEL DE INDICADORES
+# Não altera a lista do robô/Telegram.
+# ============================================================
+PAINEL_PARES_OTC = [
+    "EURUSD-OTC",
+    "GBPUSD-OTC",
+    "EURJPY-OTC",
+    "NZDUSD-OTC",
+    "USDCHF-OTC",
+    "GBPJPY-OTC",
+    "EURGBP-OTC",
+    "USDJPY-OTC",
+    "AUDUSD-OTC",
+    "USDCAD-OTC",
+    "AUDJPY-OTC",
+    "EURCAD-OTC",
+    "GBPAUD-OTC",
+    "CADJPY-OTC",
+    "EURAUD-OTC",
+    "EURCHF-OTC",
+]
+
+PAINEL_PARES_FOREX = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "EURJPY",
+    "AUDUSD",
+    "USDCAD",
+    "USDCHF",
+    "AUDJPY",
+    "NZDUSD",
+    "EURCAD",
+    "GBPAUD",
+    "CADJPY",
+    "EURAUD",
+    "EURCHF",
+    "AUDCAD",
+    "GBPCHF",
+]
+
 PARES = [
     "EURUSD-OTC",
     "GBPUSD-OTC",
@@ -4612,75 +4657,6 @@ def estatisticas_painel():
             "tel_pct": tel if tel is not None else 0,
         }
 
-    # Catálogo completo usado pelo painel web.
-    catalogo_indicadores = [
-        'Robô atual',
-        'Robô diferença 6+',
-        'Robô muito forte 7+',
-        'Fibonacci zona de ouro',
-        'RSI acima de 70 (CALL)',
-        'EMA 12/26 cruza segue',
-        'EMA 14/21 cruza segue',
-        'EMA 14/50 cruza contra',
-        'EMA 5/10 cruza contra',
-        'EMA 9/21 cruza segue',
-        'EMA 21/50 segue',
-        'Preço cruza EMA 20 contra',
-        'Leque 10 médias segue',
-        'Leque alinhou contra',
-        '5 velas iguais reverte',
-        '4 velas iguais continua',
-        '3 velas iguais reverte',
-        '2 velas iguais reverte',
-        'MHI maioria',
-        'MHI minoria',
-        'Repete a cor',
-        'Pavio 3x embaixo (CALL)',
-        'Pavio 3x em cima (PUT)',
-        '3 corvos (CALL)',
-        'Estrela cadente',
-        'Estrela da manhã',
-        'Martelo',
-        'Enforcado',
-        'Piercing',
-        'Harami de alta',
-        'Engolfo de alta',
-        'Engolfo de baixa',
-        'Doji',
-        'OCO rompe pescoço (PUT)',
-        'OCO invertido (CALL)',
-        'Triângulo p/ cima (CALL)',
-        'Triângulo p/ baixo (PUT)',
-        'Topo duplo (PUT)',
-        'Fundo duplo (CALL)',
-        'Rompe canal 20 velas',
-        'Bandeira de baixa (PUT)',
-        'Bandeira de alta (CALL)',
-        'Ichimoku Tenkan/Kijun',
-        'MACD cruza zero segue',
-        'MACD cruza sinal contra',
-        'Parabolic SAR vira contra',
-        'Bollinger fora contra',
-        'Bollinger + RSI contra',
-        'RSI 2 (10/90)',
-        'SuperTrend vira segue',
-        'Heikin Ashi muda cor',
-        'CCI 100',
-        'ADX 25',
-        'Estocástico 20/80',
-        'Williams %R',
-        'Keltner',
-        'Pião depois de 3 baixas',
-        'Pião depois de 3 altas',
-        'Pião segue a cor',
-        'Pião no topo 20 velas',
-        'Pega pavio M5 3min forte',
-        'Pega pavio M5 1min',
-        'Pega pavio M5 3min',
-        'Movimento forte segue',
-        'Movimento parado segue',
-    ]
-
     indicadores = []
 
     # Sempre mostra o robô atual primeiro.
@@ -4720,22 +4696,6 @@ def estatisticas_painel():
         indicadores.append(card("RSI ≥ 70", rsi_alto))
     if rsi_baixo:
         indicadores.append(card("RSI ≤ 30", rsi_baixo))
-
-
-    # Mostra todos os indicadores do catálogo.
-    # Indicador sem sinal no período = 0 sinais / 0,0% (sem amostra).
-    por_nome = {item["indicador"]: item for item in indicadores}
-
-    for nome in catalogo_indicadores:
-        if nome not in por_nome:
-            por_nome[nome] = {
-                "indicador": nome,
-                "sinais": 0,
-                "seg_pct": 0,
-                "tel_pct": 0,
-            }
-
-    indicadores = [por_nome[nome] for nome in catalogo_indicadores]
 
     return jsonify({
         "ok": True,
@@ -9697,6 +9657,130 @@ try:
     print("MT4: ligado em /mt4/sinal")
 except Exception as _erro_mt4:
     print("MT4: não carregou —", _erro_mt4)
+
+
+# ============================================================
+# VELAS DO PERÍODO — PAINEL DE INDICADORES
+# Somente leitura. Não grava histórico, não opera e não envia Telegram.
+# ============================================================
+def _buscar_velas_periodo_painel(iq, par, inicio_ts, fim_ts, limite):
+    par = str(par or "").strip().upper()
+    inicio_ts = int(inicio_ts)
+    fim_ts = int(fim_ts)
+    limite = max(100, min(20500, int(limite)))
+
+    velas = {}
+    cursor = fim_ts
+    lotes = 0
+
+    while len(velas) < limite and lotes < 24:
+        lote = iq.get_candles(par, 60, min(1000, limite - len(velas)), cursor)
+        lotes += 1
+        if not lote:
+            break
+
+        menor = cursor
+        for candle in lote:
+            try:
+                v = normalizar_candle(candle)
+            except Exception:
+                continue
+
+            ini = int(v["from"])
+            if inicio_ts <= ini <= fim_ts:
+                velas[ini] = [
+                    ini,
+                    float(v["open"]),
+                    float(v["close"]),
+                    float(v["low"]),
+                    float(v["high"]),
+                ]
+            menor = min(menor, ini)
+
+        if menor >= cursor:
+            break
+
+        cursor = menor - 1
+
+        if menor <= inicio_ts:
+            break
+
+    return [
+        velas[k]
+        for k in sorted(velas)
+    ]
+
+
+@app.get("/velas-periodo/<par>")
+def velas_periodo_painel(par):
+    par = str(par or "").strip().upper()
+
+    inicio_txt = request.args.get("inicio", "").strip()
+    fim_txt = request.args.get("fim", "").strip()
+
+    try:
+        inicio_dt = datetime.strptime(inicio_txt, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=FUSO_BR
+        )
+        fim_dt = datetime.strptime(fim_txt, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=FUSO_BR
+        )
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "erro": "Período inválido. Use YYYY-MM-DD.",
+            "velas": [],
+        }), 400
+
+    if inicio_dt > fim_dt:
+        return jsonify({
+            "ok": False,
+            "erro": "A data inicial não pode ser maior que a final.",
+            "velas": [],
+        }), 400
+
+    try:
+        dias = (fim_dt.date() - inicio_dt.date()).days + 1
+        try:
+            warmup = max(100, min(500, int(request.args.get("warmup", "250"))))
+        except Exception:
+            warmup = 250
+
+        limite = min(20500, dias * 1440 + warmup)
+        busca_inicio_ts = int(inicio_dt.timestamp()) - warmup * 60
+        fim_ts = int(fim_dt.timestamp())
+
+        iq = conectar_com_timeout()
+        futuro = _executor_candles.submit(
+            _buscar_velas_periodo_painel,
+            iq,
+            par,
+            busca_inicio_ts,
+            fim_ts,
+            limite,
+        )
+        velas = futuro.result(timeout=90)
+
+        return jsonify({
+            "ok": True,
+            "par": par,
+            "timeframe": "M1",
+            "inicio": inicio_txt,
+            "fim": fim_txt,
+            "warmup": warmup,
+            "quantidade": len(velas),
+            "velas": velas,
+        })
+
+    except Exception as erro:
+        return jsonify({
+            "ok": False,
+            "par": par,
+            "erro": str(erro)[:200],
+            "velas": [],
+        }), 200
+
+
 
 if __name__ == "__main__":
 
