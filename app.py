@@ -976,6 +976,116 @@ def _entrada_da_tempo(entrada_em):
         return False
 
 
+# ------------------------------------------------------------
+# ANTI-LOSS (PROTEÇÃO DO DIA)
+# ------------------------------------------------------------
+# Só conta o LOSS FINAL: perdeu a entrada, o G1 e o G2 de um sinal
+# que foi MESMO para o grupo. Quem decide é o banco (resultado_final
+# + avisado_tg), então reiniciar o robô não zera a proteção.
+#
+#   PAUSA: depois de 1 LOSS final, o robô fica calado por
+#          ANTI_LOSS_PAUSA_MIN minutos (padrão 10), contados a
+#          partir do fim da sequência que perdeu.
+#   STOP:  com ANTI_LOSS_STOP_DIA LOSS finais no dia (padrão 3), o
+#          robô para de mandar sinal até meia-noite (Brasília) e
+#          avisa o grupo uma vez.
+#
+# Para desligar: ANTI_LOSS_PAUSA_MIN=0 e ANTI_LOSS_STOP_DIA=0 no Render.
+
+ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "10"))
+ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "3"))
+
+_anti_loss_avisado_dia = ""
+
+
+def anti_loss_estado():
+    """Diz se o robô deve ficar calado agora.
+
+    Devolve {"bloqueado", "motivo" ("PAUSA"/"STOP"/None), "ate" (timestamp),
+    "loss_hoje"}. Em qualquer erro, libera (nunca trava o grupo por defeito).
+    """
+
+    livre = {"bloqueado": False, "motivo": None, "ate": 0, "loss_hoje": 0}
+
+    if (ANTI_LOSS_PAUSA_MIN <= 0 and ANTI_LOSS_STOP_DIA <= 0) or not _DB_PRONTO:
+        return livre
+
+    agora = datetime.now(FUSO_BR)
+    inicio_dia = int(
+        agora.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+
+    try:
+        with _db_lock:
+            conexao = _conectar_db()
+            linhas = conexao.execute(
+                """
+                SELECT entrada_em FROM historico_sinais
+                 WHERE avisado_tg = 1
+                   AND resultado_final = 'LOSS'
+                   AND entrada_em >= ?
+              ORDER BY entrada_em DESC
+                """,
+                (inicio_dia,),
+            ).fetchall()
+            conexao.close()
+    except Exception:
+        return livre
+
+    n = len(linhas)
+
+    if not n:
+        return livre
+
+    livre["loss_hoje"] = n
+
+    if ANTI_LOSS_STOP_DIA > 0 and n >= ANTI_LOSS_STOP_DIA:
+        livre.update(bloqueado=True, motivo="STOP", ate=inicio_dia + 86400)
+        return livre
+
+    if ANTI_LOSS_PAUSA_MIN > 0:
+        # A sequência (entrada + G1 + G2) termina 3 velas depois da entrada.
+        fim = int(linhas[0]["entrada_em"]) + 3 * TIMEFRAME
+        ate = fim + ANTI_LOSS_PAUSA_MIN * 60
+        if time.time() < ate:
+            livre.update(bloqueado=True, motivo="PAUSA", ate=ate)
+
+    return livre
+
+
+def _anti_loss_avisar_stop(estado):
+    """Avisa o grupo UMA vez por dia que o robô parou."""
+
+    global _anti_loss_avisado_dia
+
+    if estado.get("motivo") != "STOP":
+        return
+
+    hoje = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
+
+    if _anti_loss_avisado_dia == hoje:
+        return
+
+    _anti_loss_avisado_dia = hoje
+
+    texto = (
+        "🛑 <b>STOP DO DIA</b>\n"
+        "────────────\n"
+        f"❌ {estado.get('loss_hoje')} LOSS hoje.\n"
+        "Proteção da banca: sem mais sinais até amanhã.\n"
+        "Descanse e volte com a cabeça fria. 💙"
+    )
+
+    try:
+        threading.Thread(
+            target=_enviar_telegram_texto_sync,
+            args=(texto,),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+
+
 def pode_enviar_sinal_agora(par=None, entrada_em=None, sinal=None):
     """True só se não houver sequência aberta e a espera
     mínima já tiver passado.
@@ -983,6 +1093,13 @@ def pode_enviar_sinal_agora(par=None, entrada_em=None, sinal=None):
 
     global _ultima_entrada_enviada
     global _sequencia_aberta
+
+    # Anti-loss primeiro, fora do cadeado (usa o banco).
+    estado_al = anti_loss_estado()
+
+    if estado_al["bloqueado"]:
+        _anti_loss_avisar_stop(estado_al)
+        return False
 
     agora = time.time()
 
@@ -8748,6 +8865,22 @@ def _bloco_worker():
     }
 
 
+def _texto_anti_loss():
+    try:
+        e = anti_loss_estado()
+    except Exception:
+        return "erro ao ler"
+    regra = (
+        "pausa " + str(ANTI_LOSS_PAUSA_MIN) + " min após LOSS · stop com "
+        + str(ANTI_LOSS_STOP_DIA) + " LOSS/dia"
+    )
+    if e["bloqueado"]:
+        hora = datetime.fromtimestamp(e["ate"], tz=FUSO_BR).strftime("%H:%M")
+        return ("🛑 STOP DO DIA" if e["motivo"] == "STOP" else "⏳ PAUSA") + \
+            " até " + hora + " · LOSS hoje: " + str(e["loss_hoje"]) + " · " + regra
+    return "ligado · LOSS hoje: " + str(e["loss_hoje"]) + " · " + regra
+
+
 def _bloco_telegram():
 
     tem_token = bool(_g("TELEGRAM_BOT_TOKEN"))
@@ -8808,6 +8941,7 @@ def _bloco_telegram():
                 "Antecedência do aviso",
                 str(_g("VELAS_ANTECEDENCIA", 0)) + " vela(s)",
             ),
+            ("Anti-loss", _texto_anti_loss()),
         ],
         "acao": acao,
     }
