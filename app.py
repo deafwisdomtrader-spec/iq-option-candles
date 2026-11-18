@@ -984,7 +984,7 @@ def _entrada_da_tempo(entrada_em):
 # + avisado_tg), então reiniciar o robô não zera a proteção.
 #
 #   PAUSA: depois de 1 LOSS final, o robô fica calado por
-#          ANTI_LOSS_PAUSA_MIN minutos (padrão 10), contados a
+#          ANTI_LOSS_PAUSA_MIN minutos (padrão 5), contados a
 #          partir do fim da sequência que perdeu.
 #   STOP:  com ANTI_LOSS_STOP_DIA LOSS finais no dia (padrão 3), o
 #          robô para de mandar sinal até meia-noite (Brasília) e
@@ -992,7 +992,7 @@ def _entrada_da_tempo(entrada_em):
 #
 # Para desligar: ANTI_LOSS_PAUSA_MIN=0 e ANTI_LOSS_STOP_DIA=0 no Render.
 
-ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "10"))
+ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "5"))
 ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "3"))
 
 _anti_loss_avisado_dia = ""
