@@ -985,8 +985,13 @@ def _entrada_da_tempo(entrada_em):
 # + avisado_tg), então reiniciar o robô não zera a proteção.
 #
 #   PAUSA: depois de 1 LOSS final, o robô fica calado por
-#          ANTI_LOSS_PAUSA_MIN minutos (padrão 15), contados a
-#          partir do fim da sequência que perdeu.
+#          ANTI_LOSS_PAUSA_MIN minutos (padrão 5), contados a
+#          partir do fim da sequência que perdeu. Sem aviso.
+#   PAUSA DE 3 LOSS: no 3º, 6º, 9º... LOSS final do dia a pausa é de
+#          ANTI_LOSS_PAUSA_GRANDE_MIN minutos (padrão 15) e o grupo
+#          recebe um aviso com a hora em que os sinais voltam.
+#          Depois volta normal. A cada quantos LOSS: ANTI_LOSS_A_CADA
+#          (padrão 3). Para desligar: ANTI_LOSS_A_CADA=0.
 #   STOP:  DESLIGADO (padrão 0). Se um dia quiser de volta, coloque
 #          ANTI_LOSS_STOP_DIA=3 no Render: com 3 LOSS finais no dia o
 #          robô para até meia-noite (Brasília) e avisa o grupo uma vez.
@@ -995,8 +1000,12 @@ def _entrada_da_tempo(entrada_em):
 #
 # Para desligar a pausa: ANTI_LOSS_PAUSA_MIN=0 no Render.
 
-ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "15"))
+ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "5"))
+ANTI_LOSS_A_CADA = int(os.getenv("ANTI_LOSS_A_CADA", "3"))
+ANTI_LOSS_PAUSA_GRANDE_MIN = int(os.getenv("ANTI_LOSS_PAUSA_GRANDE_MIN", "15"))
 ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "0"))
+
+_anti_loss_pausa_avisada = 0
 
 _anti_loss_avisado_dia = ""
 
@@ -1004,13 +1013,16 @@ _anti_loss_avisado_dia = ""
 def anti_loss_estado():
     """Diz se o robô deve ficar calado agora.
 
-    Devolve {"bloqueado", "motivo" ("PAUSA"/"STOP"/None), "ate" (timestamp),
-    "loss_hoje"}. Em qualquer erro, libera (nunca trava o grupo por defeito).
+    Devolve {"bloqueado", "motivo" ("PAUSA"/"PAUSA3"/"STOP"/None), "ate"
+    (timestamp), "loss_hoje", "ultimo_loss"}. Em qualquer erro, libera
+    (nunca trava o grupo por defeito).
     """
 
-    livre = {"bloqueado": False, "motivo": None, "ate": 0, "loss_hoje": 0}
+    livre = {"bloqueado": False, "motivo": None, "ate": 0, "loss_hoje": 0, "ultimo_loss": 0}
 
-    if (ANTI_LOSS_PAUSA_MIN <= 0 and ANTI_LOSS_STOP_DIA <= 0) or not _DB_PRONTO:
+    tem_grande = ANTI_LOSS_A_CADA > 0 and ANTI_LOSS_PAUSA_GRANDE_MIN > 0
+
+    if (ANTI_LOSS_PAUSA_MIN <= 0 and ANTI_LOSS_STOP_DIA <= 0 and not tem_grande) or not _DB_PRONTO:
         return livre
 
     agora = datetime.now(FUSO_BR)
@@ -1046,14 +1058,57 @@ def anti_loss_estado():
         livre.update(bloqueado=True, motivo="STOP", ate=inicio_dia + 86400)
         return livre
 
-    if ANTI_LOSS_PAUSA_MIN > 0:
+    # O último LOSS foi o 3º, 6º, 9º... do dia? Então a pausa é a grande.
+    grande = tem_grande and n % ANTI_LOSS_A_CADA == 0
+    minutos = ANTI_LOSS_PAUSA_GRANDE_MIN if grande else ANTI_LOSS_PAUSA_MIN
+    livre["ultimo_loss"] = int(linhas[0]["entrada_em"])
+
+    if minutos > 0:
         # A sequência (entrada + G1 + G2) termina 3 velas depois da entrada.
         fim = int(linhas[0]["entrada_em"]) + 3 * TIMEFRAME
-        ate = fim + ANTI_LOSS_PAUSA_MIN * 60
+        ate = fim + minutos * 60
         if time.time() < ate:
-            livre.update(bloqueado=True, motivo="PAUSA", ate=ate)
+            livre.update(bloqueado=True, motivo="PAUSA3" if grande else "PAUSA", ate=ate)
 
     return livre
+
+
+def anti_loss_avisar_pausa():
+    """Chamado logo depois que um LOSS final vai ao grupo.
+
+    Se esse LOSS foi o 3º (6º, 9º...) do dia, avisa o grupo da pausa e da
+    hora da volta. Vai pela mesma fila do Telegram, então chega DEPOIS do
+    cartão de LOSS. Cada pausa é avisada uma vez só.
+    """
+
+    global _anti_loss_pausa_avisada
+
+    estado = anti_loss_estado()
+
+    if estado.get("motivo") != "PAUSA3":
+        return
+
+    chave = estado.get("ultimo_loss") or 0
+
+    if not chave or chave == _anti_loss_pausa_avisada:
+        return
+
+    _anti_loss_pausa_avisada = chave
+
+    hora = datetime.fromtimestamp(estado["ate"], tz=FUSO_BR).strftime("%H:%M")
+
+    texto = (
+        f"🛑 <b>{estado.get('loss_hoje')} LOSS HOJE</b>\n"
+        "────────────\n"
+        f"⏸ Pausa de {ANTI_LOSS_PAUSA_GRANDE_MIN} minutos para proteger a banca.\n"
+        f"⏰ Os sinais voltam às {hora}.\n"
+        "Respire e volte com a cabeça fria. 💙"
+    )
+
+    try:
+        _executor_telegram.submit(_enviar_telegram_texto_sync, texto)
+    except Exception:
+        pass
 
 
 def _anti_loss_avisar_stop(estado):
@@ -5491,6 +5546,13 @@ def resultado_sinal(par):
                         )
                         enviar_telegram_foto(imagem, caption)
 
+                        # 3º LOSS do dia (6º, 9º...): aviso da pausa de 15 min.
+                        if resultado_final == "LOSS":
+                            try:
+                                anti_loss_avisar_pausa()
+                            except Exception:
+                                pass
+
                         # O mesmo resultado no grupo grátis, se
                         # este sinal fez parte de uma lista.
                         try:
@@ -8875,12 +8937,15 @@ def _texto_anti_loss():
         return "erro ao ler"
     regra = (
         "pausa " + str(ANTI_LOSS_PAUSA_MIN) + " min após LOSS · "
+        + (str(ANTI_LOSS_PAUSA_GRANDE_MIN) + " min a cada " + str(ANTI_LOSS_A_CADA)
+           + " LOSS (com aviso) · " if ANTI_LOSS_A_CADA > 0 and ANTI_LOSS_PAUSA_GRANDE_MIN > 0 else "")
         + ("stop com " + str(ANTI_LOSS_STOP_DIA) + " LOSS/dia"
            if ANTI_LOSS_STOP_DIA > 0 else "stop do dia desligado")
     )
     if e["bloqueado"]:
         hora = datetime.fromtimestamp(e["ate"], tz=FUSO_BR).strftime("%H:%M")
-        return ("🛑 STOP DO DIA" if e["motivo"] == "STOP" else "⏳ PAUSA") + \
+        nome = {"STOP": "🛑 STOP DO DIA", "PAUSA3": "⏸ PAUSA DE " + str(ANTI_LOSS_A_CADA) + " LOSS"}
+        return nome.get(e["motivo"], "⏳ PAUSA") + \
             " até " + hora + " · LOSS hoje: " + str(e["loss_hoje"]) + " · " + regra
     return "ligado · LOSS hoje: " + str(e["loss_hoje"]) + " · " + regra
 
