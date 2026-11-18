@@ -986,14 +986,16 @@ def _entrada_da_tempo(entrada_em):
 #   PAUSA: depois de 1 LOSS final, o robô fica calado por
 #          ANTI_LOSS_PAUSA_MIN minutos (padrão 5), contados a
 #          partir do fim da sequência que perdeu.
-#   STOP:  com ANTI_LOSS_STOP_DIA LOSS finais no dia (padrão 3), o
-#          robô para de mandar sinal até meia-noite (Brasília) e
-#          avisa o grupo uma vez.
+#   STOP:  DESLIGADO (padrão 0). Se um dia quiser de volta, coloque
+#          ANTI_LOSS_STOP_DIA=3 no Render: com 3 LOSS finais no dia o
+#          robô para até meia-noite (Brasília) e avisa o grupo uma vez.
+#          Com o stop ligado o grupo grátis também fica sem sinal,
+#          porque ele só copia os sinais do grupo pago.
 #
-# Para desligar: ANTI_LOSS_PAUSA_MIN=0 e ANTI_LOSS_STOP_DIA=0 no Render.
+# Para desligar a pausa: ANTI_LOSS_PAUSA_MIN=0 no Render.
 
 ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "5"))
-ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "3"))
+ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "0"))
 
 _anti_loss_avisado_dia = ""
 
@@ -8871,8 +8873,9 @@ def _texto_anti_loss():
     except Exception:
         return "erro ao ler"
     regra = (
-        "pausa " + str(ANTI_LOSS_PAUSA_MIN) + " min após LOSS · stop com "
-        + str(ANTI_LOSS_STOP_DIA) + " LOSS/dia"
+        "pausa " + str(ANTI_LOSS_PAUSA_MIN) + " min após LOSS · "
+        + ("stop com " + str(ANTI_LOSS_STOP_DIA) + " LOSS/dia"
+           if ANTI_LOSS_STOP_DIA > 0 else "stop do dia desligado")
     )
     if e["bloqueado"]:
         hora = datetime.fromtimestamp(e["ate"], tz=FUSO_BR).strftime("%H:%M")
