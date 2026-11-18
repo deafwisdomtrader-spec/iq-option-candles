@@ -401,9 +401,10 @@ def enviar_telegram_foto(caminho_imagem, caption, chat_id=None):
 #   GRATIS_HORARIOS          -> horas de início (padrão "9,15,20")
 #   GRATIS_POR_LISTA         -> sinais por lista (padrão 5)
 #   GRATIS_JANELA_MIN        -> minutos para juntar os sinais da
-#                               lista (padrão 60). Se em 1 hora não
+#                               lista (padrão 90). Se em 1h30 não
 #                               saírem 5, a lista fecha com os que
-#                               saíram.
+#                               saíram. (90 e não 60 por causa da
+#                               pausa de 15 min depois de um LOSS.)
 #
 # O BOT precisa ser ADMINISTRADOR do grupo grátis, com permissão
 # de enviar e apagar mensagens.
@@ -417,7 +418,7 @@ GRATIS_HORARIOS = sorted({
 
 GRATIS_POR_LISTA = max(1, int(os.getenv("GRATIS_POR_LISTA", "5")))
 
-GRATIS_JANELA_MIN = max(10, int(os.getenv("GRATIS_JANELA_MIN", "60")))
+GRATIS_JANELA_MIN = max(10, int(os.getenv("GRATIS_JANELA_MIN", "90")))
 
 # Depois que a janela fecha, quanto esperar por um resultado que
 # não veio antes de mandar o resumo assim mesmo.
@@ -984,7 +985,7 @@ def _entrada_da_tempo(entrada_em):
 # + avisado_tg), então reiniciar o robô não zera a proteção.
 #
 #   PAUSA: depois de 1 LOSS final, o robô fica calado por
-#          ANTI_LOSS_PAUSA_MIN minutos (padrão 5), contados a
+#          ANTI_LOSS_PAUSA_MIN minutos (padrão 15), contados a
 #          partir do fim da sequência que perdeu.
 #   STOP:  DESLIGADO (padrão 0). Se um dia quiser de volta, coloque
 #          ANTI_LOSS_STOP_DIA=3 no Render: com 3 LOSS finais no dia o
@@ -994,7 +995,7 @@ def _entrada_da_tempo(entrada_em):
 #
 # Para desligar a pausa: ANTI_LOSS_PAUSA_MIN=0 no Render.
 
-ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "5"))
+ANTI_LOSS_PAUSA_MIN = int(os.getenv("ANTI_LOSS_PAUSA_MIN", "15"))
 ANTI_LOSS_STOP_DIA = int(os.getenv("ANTI_LOSS_STOP_DIA", "0"))
 
 _anti_loss_avisado_dia = ""
