@@ -4805,32 +4805,100 @@ def ver_historico():
 # Resposta: velas = [[from, open, close, low, high], ...]
 # ============================================================
 
-def _buscar_velas_antigas(iq, par, quantas):
+# ------------------------------------------------------------
+# VELAS ANTIGAS (Laboratório e testes) — SEM MISTURAR PEDIDOS
+# ------------------------------------------------------------
+# A biblioteca da corretora guarda a resposta de get_candles num
+# lugar SÓ, para todos. Quando dois pedidos rodam ao mesmo tempo
+# (o Laboratório busca 3 pares juntos, e o robô busca os dele),
+# um pode receber as velas do outro. Foi isso que deixou o
+# Laboratório com 1.000 ou 2.000 velas em vez de 6.000, com
+# buracos e com pedaços de dias errados.
+#
+# Agora:
+#   1. um pedido de velas antigas por vez (cadeado próprio);
+#   2. cada lote de 1.000 é conferido com uma busca pequena
+#      separada, no mesmo horário: as duas têm que bater. Se não
+#      batem, uma delas veio de outro pedido: busca de novo
+#      (até 3 vezes);
+#   3. quando não tem buraco entre um lote e o seguinte, o
+#      fechamento da última vela tem que ser quase igual à
+#      abertura da próxima (outro par teria outro preço).
+#   Buraco de verdade (mercado fechado no fim de semana) passa,
+#   porque as duas buscas mostram o mesmo buraco.
+
+_lock_velas_antigas = threading.Lock()
+
+
+def _lote_normalizado(lote):
     velas = {}
+    for c in lote or []:
+        try:
+            v = normalizar_candle(c)
+        except Exception:
+            continue
+        if v["from"] > 0:
+            velas[v["from"]] = [v["from"], v["open"], v["close"], v["low"], v["high"]]
+    return [velas[k] for k in sorted(velas)]
+
+
+def _lote_confere(iq, par, lote, fim, tem_vela_aberta):
+    """Busca pequena separada no mesmo horário: tem que bater com o lote."""
+    if len(lote) < 50 or lote[-1][0] > fim + 60:
+        return False
+    confere = _lote_normalizado(iq.get_candles(par, 60, 5, fim))
+    if not confere or confere[-1][0] != lote[-1][0]:
+        return False
+    mapa = {v[0]: v[2] for v in lote}
+    fechadas = confere[:-1] if tem_vela_aberta else confere
+    return bool(fechadas) and all(mapa.get(v[0]) == v[2] for v in fechadas)
+
+
+def _lote_encaixa(lote, seguinte):
+    """Sem buraco entre os lotes, o preço tem que continuar o mesmo."""
+    if not seguinte or seguinte[0][0] - lote[-1][0] != 60:
+        return True
+    fecha, abre = lote[-1][2], seguinte[0][1]
+    if fecha <= 0 or abre <= 0:
+        return False
+    return abs(fecha - abre) / abre <= 0.002
+
+
+def _buscar_velas_antigas(iq, par, quantas):
+    velas = []
     try:
         fim = int(iq.get_server_timestamp())
     except Exception:
         fim = int(time.time())
-    for _ in range(24):
-        if len(velas) >= quantas:
-            break
-        lote = iq.get_candles(par, 60, 1000, fim)
-        if not lote:
-            break
-        menor = fim
-        for c in lote:
-            try:
-                v = normalizar_candle(c)
-            except Exception:
-                continue
-            velas[v["from"]] = [
-                v["from"], v["open"], v["close"], v["low"], v["high"],
-            ]
-            menor = min(menor, v["from"])
-        if menor >= fim:
-            break
-        fim = menor - 1
-    return sorted(velas.values())[-quantas:]
+
+    with _lock_velas_antigas:
+
+        for numero in range(24):
+
+            if len(velas) >= quantas:
+                break
+
+            lote = []
+            for tentativa in range(3):
+                lote = _lote_normalizado(iq.get_candles(par, 60, 1000, fim))
+                if _lote_confere(iq, par, lote, fim, numero == 0) and _lote_encaixa(lote, velas):
+                    break
+                print("VELAS-ANTIGAS:", par, "lote", numero, "não bateu, buscando de novo")
+                time.sleep(0.4)
+                lote = []
+
+            if not lote:
+                break
+
+            # junta sem repetir vela
+            if velas:
+                lote = [v for v in lote if v[0] < velas[0][0]]
+                if not lote:
+                    break
+            velas = lote + velas
+            fim = velas[0][0] - 1
+
+    return velas[-quantas:]
 
 
 @app.get("/velas-antigas/<par>")
