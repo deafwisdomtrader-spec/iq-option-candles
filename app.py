@@ -4842,11 +4842,11 @@ def _lote_normalizado(lote):
     return [velas[k] for k in sorted(velas)]
 
 
-def _lote_confere(iq, par, lote, fim, tem_vela_aberta):
+def _lote_confere(iq, par, lote, fim, tem_vela_aberta, tf=60):
     """Busca pequena separada no mesmo horário: tem que bater com o lote."""
-    if len(lote) < 50 or lote[-1][0] > fim + 60:
+    if len(lote) < 50 or lote[-1][0] > fim + tf:
         return False
-    confere = _lote_normalizado(iq.get_candles(par, 60, 5, fim))
+    confere = _lote_normalizado(iq.get_candles(par, tf, 5, fim))
     if not confere or confere[-1][0] != lote[-1][0]:
         return False
     mapa = {v[0]: v[2] for v in lote}
@@ -4854,9 +4854,9 @@ def _lote_confere(iq, par, lote, fim, tem_vela_aberta):
     return bool(fechadas) and all(mapa.get(v[0]) == v[2] for v in fechadas)
 
 
-def _lote_encaixa(lote, seguinte):
+def _lote_encaixa(lote, seguinte, tf=60):
     """Sem buraco entre os lotes, o preço tem que continuar o mesmo."""
-    if not seguinte or seguinte[0][0] - lote[-1][0] != 60:
+    if not seguinte or seguinte[0][0] - lote[-1][0] != tf:
         return True
     fecha, abre = lote[-1][2], seguinte[0][1]
     if fecha <= 0 or abre <= 0:
@@ -4864,7 +4864,7 @@ def _lote_encaixa(lote, seguinte):
     return abs(fecha - abre) / abre <= 0.002
 
 
-def _buscar_velas_antigas(iq, par, quantas):
+def _buscar_velas_antigas(iq, par, quantas, tf=60):
     velas = []
     try:
         fim = int(iq.get_server_timestamp())
@@ -4880,8 +4880,8 @@ def _buscar_velas_antigas(iq, par, quantas):
 
             lote = []
             for tentativa in range(3):
-                lote = _lote_normalizado(iq.get_candles(par, 60, 1000, fim))
-                if _lote_confere(iq, par, lote, fim, numero == 0) and _lote_encaixa(lote, velas):
+                lote = _lote_normalizado(iq.get_candles(par, tf, 1000, fim))
+                if _lote_confere(iq, par, lote, fim, numero == 0, tf) and _lote_encaixa(lote, velas, tf):
                     break
                 print("VELAS-ANTIGAS:", par, "lote", numero, "não bateu, buscando de novo")
                 time.sleep(0.4)
@@ -4911,9 +4911,17 @@ def velas_antigas(par):
     except Exception:
         quantas = 2000
 
+    # tf em segundos: 60 = M1 (padrão), 300 = M5, 900 = M15
+    try:
+        tf = int(request.args.get("tf", "60"))
+    except Exception:
+        tf = 60
+    if tf not in (60, 300, 900):
+        tf = 60
+
     try:
         iq = conectar_com_timeout()
-        futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas)
+        futuro = _executor_candles.submit(_buscar_velas_antigas, iq, par, quantas, tf)
         velas = futuro.result(timeout=80)
     except Exception as erro:
         return jsonify({"ok": False, "erro": str(erro)[:200]}), 200
@@ -4921,7 +4929,7 @@ def velas_antigas(par):
     return jsonify({
         "ok": True,
         "par": par,
-        "timeframe": "M1",
+        "timeframe": "M" + str(tf // 60),
         "quantidade": len(velas),
         "velas": velas,
     })
