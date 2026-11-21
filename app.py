@@ -889,6 +889,14 @@ TELEGRAM_ESPERA_ENTRE_ENTRADAS = int(
 _ultima_entrada_enviada = 0
 _lock_espera_entrada = threading.Lock()
 
+# RESPIRO DEPOIS DO RESULTADO
+# Sinal novo não sai colado no resultado do anterior: espera pelo
+# menos estes segundos depois que o resultado foi anunciado. Assim
+# o aluno não recebe dois stickers juntos (o WIN/LOSS e o sinal
+# novo) e não confunde as operações.
+TELEGRAM_RESPIRO_RESULTADO = max(0, int(os.getenv("TELEGRAM_RESPIRO_RESULTADO", "30")))
+_ultimo_resultado_em = 0
+
 # ------------------------------------------------------------
 # UMA OPERAÇÃO POR VEZ
 # ------------------------------------------------------------
@@ -946,6 +954,16 @@ _contexto_tg = threading.local()
 
 def _chamada_do_worker():
     return bool(getattr(_contexto_tg, "worker", False))
+
+
+def _worker_da_geracao_atual():
+    """False se esta thread é de um worker VELHO (tinha travado e
+    um novo assumiu). Worker velho não fala mais no grupo — era um
+    jeito de o mesmo sinal sair duas vezes."""
+    geracao = getattr(_contexto_tg, "geracao", None)
+    if geracao is None:
+        return True
+    return geracao == _WORKER_GERACAO
 
 
 # ------------------------------------------------------------
@@ -1198,7 +1216,14 @@ def pode_enviar_sinal_agora(par=None, entrada_em=None, sinal=None):
             )
             _sequencia_aberta = None
 
-        # 2) Espera mínima entre entradas.
+        # 2) Respiro depois do último resultado.
+        if (
+            _ultimo_resultado_em
+            and agora - _ultimo_resultado_em < TELEGRAM_RESPIRO_RESULTADO
+        ):
+            return False
+
+        # 3) Espera mínima entre entradas.
         if (
             _ultima_entrada_enviada
             and agora - _ultima_entrada_enviada
@@ -1230,6 +1255,7 @@ def encerrar_sequencia(par, entrada_em):
     """
 
     global _sequencia_aberta
+    global _ultimo_resultado_em
 
     with _lock_espera_entrada:
 
@@ -1243,6 +1269,7 @@ def encerrar_sequencia(par, entrada_em):
             and int(aberta.get("entrada_em", 0)) == int(entrada_em)
         ):
             _sequencia_aberta = None
+            _ultimo_resultado_em = time.time()
 
 
 # ------------------------------------------------------------
@@ -2410,6 +2437,55 @@ def marcar_avisado_telegram(par, entrada_em, sinal):
     return True
 
 
+_reserva_aviso_lock = threading.Lock()
+
+
+def reservar_aviso_telegram(par, entrada_em, sinal):
+    """Reserva o anúncio deste sinal ANTES de mandar.
+
+    Só quem consegue a reserva manda. Mesmo que duas voltas do
+    robô cheguem juntas no mesmo sinal, só uma manda — o mesmo
+    sticker não cai duas vezes no grupo.
+    """
+    chave = _chave_aviso(par, entrada_em, sinal)
+    if chave is None:
+        return False
+
+    with _reserva_aviso_lock:
+        if chave in _AVISADOS_TG:
+            return False
+
+        if _DB_PRONTO:
+            try:
+                with _db_lock:
+                    conexao = _conectar_db()
+                    cursor = conexao.execute(
+                        """
+                        UPDATE historico_sinais
+                           SET avisado_tg = 1
+                         WHERE par = ? AND entrada_em = ? AND sinal = ?
+                           AND COALESCE(avisado_tg, 0) = 0
+                        """,
+                        (str(par), int(entrada_em), str(sinal)),
+                    )
+                    conexao.commit()
+                    mudou = cursor.rowcount
+                    # A linha nem existe (banco falhou ao gravar o
+                    # sinal)? Então vale a lista da memória.
+                    existe = conexao.execute(
+                        "SELECT 1 FROM historico_sinais WHERE par = ? AND entrada_em = ? AND sinal = ? LIMIT 1",
+                        (str(par), int(entrada_em), str(sinal)),
+                    ).fetchone()
+                    conexao.close()
+                if existe and mudou == 0:
+                    return False
+            except Exception:
+                pass
+
+        _AVISADOS_TG.add(chave)
+        return True
+
+
 def foi_avisado_telegram(par, entrada_em, sinal):
     """True so se a ENTRADA deste sinal foi ao grupo."""
 
@@ -2642,6 +2718,12 @@ def invalidar_conexao():
             except RuntimeError:
                 pass
 
+    # Conexão nova = memória de velas nova (limpeza automática).
+    try:
+        limpar_cache_velas(tudo=True, motivo="conexão trocada")
+    except Exception:
+        pass
+
     if not pegou:
         print(
             "CONEXAO: cadeado ocupado — sessao invalidada mesmo assim."
@@ -2831,20 +2913,98 @@ _velas_fechadas_lock = threading.Lock()
 FOLGA_FECHAMENTO = int(os.getenv("FOLGA_FECHAMENTO", "3"))
 
 
+# ------------------------------------------------------------
+# LIMPEZA AUTOMÁTICA DO CACHE DE VELAS
+# ------------------------------------------------------------
+# O resultado só precisa das velas dos últimos minutos (entrada,
+# G1 e G2). Guardar horas de velas não ajuda em nada e, se uma
+# vela errada entrar na memória, ela fica lá enganando o robô.
+#
+# Agora a memória guarda só os últimos CACHE_VELAS_MINUTOS
+# (padrão 40) e é limpa sozinha:
+#   - a cada volta do robô (3 em 3 minutos);
+#   - quando a conexão com a corretora é trocada;
+#   - quando uma vela nova não bate com a que já estava guardada
+#     (aí apaga a memória daquele par e busca de novo).
+CACHE_VELAS_MINUTOS = max(10, int(os.getenv("CACHE_VELAS_MINUTOS", "40")))
+
+_velas_limpeza = {"ultima": 0.0, "apagadas": 0, "conflitos": 0}
+
+
+def _mesmo_preco(a, b):
+    """Duas leituras da MESMA vela fechada têm que ter o mesmo preço.
+    Outro par teria outro preço (diferença muito maior que esta)."""
+    try:
+        a = float(a)
+        b = float(b)
+    except (TypeError, ValueError):
+        return False
+    return abs(a - b) <= max(1e-9, abs(b) * 0.0003)
+
+
+def limpar_cache_velas(tudo=False, motivo=""):
+    """Tira da memória as velas velhas (ou todas, com tudo=True)."""
+    agora_ts = time.time()
+    limite = agora_ts - CACHE_VELAS_MINUTOS * 60
+    with _velas_fechadas_lock:
+        if tudo:
+            apagadas = len(_velas_fechadas)
+            _velas_fechadas.clear()
+        else:
+            velhas = [k for k in _velas_fechadas if k[1] < limite]
+            for chave in velhas:
+                _velas_fechadas.pop(chave, None)
+            apagadas = len(velhas)
+        _velas_limpeza["ultima"] = agora_ts
+        _velas_limpeza["apagadas"] += apagadas
+    try:
+        with _velas_recentes_lock:
+            if tudo:
+                _velas_recentes.clear()
+            else:
+                for chave in [k for k, (t, _) in _velas_recentes.items() if agora_ts - t > 120]:
+                    _velas_recentes.pop(chave, None)
+    except Exception:
+        pass
+    if tudo and motivo:
+        print("CACHE: memória de velas limpa —", motivo, "(", apagadas, "velas )")
+    return apagadas
+
+
 def guardar_velas_fechadas(par, velas, agora_ts):
+    """Guarda as velas que já fecharam. Devolve False se alguma
+    vela NÃO BATE com a mesma vela já guardada (sinal de que veio
+    de outro par): aí a memória do par é apagada e nada é guardado."""
     par = str(par or "").strip().upper()
     if not par or not velas:
-        return
+        return True
     with _velas_fechadas_lock:
+        # CONFERÊNCIA: a mesma vela fechada não muda de preço.
+        for v in velas:
+            ini = v.get("from")
+            if not ini:
+                continue
+            antiga = _velas_fechadas.get((par, int(ini)))
+            if antiga is not None and not (
+                _mesmo_preco(antiga.get("open"), v.get("open"))
+                and _mesmo_preco(antiga.get("close"), v.get("close"))
+            ):
+                for chave in [k for k in _velas_fechadas if k[0] == par]:
+                    _velas_fechadas.pop(chave, None)
+                _velas_limpeza["conflitos"] += 1
+                print("CACHE:", par, "vela das", int(ini), "não bateu — memória do par apagada")
+                return False
         for v in velas:
             ini = v.get("from")
             if ini and ini + 60 + FOLGA_FECHAMENTO <= agora_ts:
                 _velas_fechadas[(par, int(ini))] = v
-        # limpeza: guarda só as últimas ~3 horas
-        if len(_velas_fechadas) > 30000:
-            limite = agora_ts - 3 * 3600
-            for chave in [k for k in _velas_fechadas if k[1] < limite]:
-                _velas_fechadas.pop(chave, None)
+    # limpeza automática (no máximo a cada 60 s)
+    if time.time() - _velas_limpeza["ultima"] > 60:
+        try:
+            limpar_cache_velas()
+        except Exception:
+            pass
+    return True
 
 
 def velas_da_memoria(par, inicio, quantas=3):
@@ -2866,32 +3026,126 @@ def velas_da_memoria(par, inicio, quantas=3):
     return lista or None
 
 
+# ------------------------------------------------------------
+# UM PEDIDO DE VELAS POR VEZ (as velas não se misturam mais)
+# ------------------------------------------------------------
+# A biblioteca da corretora guarda a resposta de get_candles num
+# lugar SÓ. Quando o robô, o acompanhante, o Auditor e os painéis
+# dos alunos pediam velas ao mesmo tempo, um pedido podia receber
+# as velas de OUTRO PAR. Aí:
+#   - o resultado (WIN/LOSS) era calculado com o preço errado;
+#   - o sinal era analisado com o gráfico errado;
+#   - a vela errada ainda ficava guardada na memória.
+#
+# Agora cada conexão tem um cadeado: um pedido de velas por vez.
+# Se um pedido travar dentro da biblioteca, os próximos esperam
+# no máximo o tempo deles e desistem; depois de 3 desistências o
+# robô troca a conexão (e a conexão nova tem cadeado novo).
+TRAVA_VELAS_ESPERA = max(3, int(os.getenv("TRAVA_VELAS_ESPERA", "15")))
+_trava_velas_criar = threading.Lock()
+_trava_velas_reserva = threading.Lock()
+
+
+def _trava_velas_da_conexao(iq):
+    trava = getattr(iq, "_dw_trava_velas", None)
+    if trava is not None:
+        return trava
+    with _trava_velas_criar:
+        trava = getattr(iq, "_dw_trava_velas", None)
+        if trava is None:
+            trava = threading.Lock()
+            try:
+                setattr(iq, "_dw_trava_velas", trava)
+            except Exception:
+                trava = _trava_velas_reserva
+        return trava
+
+
+def pedir_velas(iq, par, tf, quantidade, fim, prazo=None):
+    """iq.get_candles, mas um pedido por vez nesta conexão."""
+    trava = _trava_velas_da_conexao(iq)
+    espera = TRAVA_VELAS_ESPERA if prazo is None else max(0.2, prazo - time.time())
+    if not trava.acquire(timeout=espera):
+        raise TimeoutError("fila de velas ocupada (" + str(par) + ")")
+    try:
+        # Quem pediu já desistiu? Então nem pergunta à corretora.
+        if prazo is not None and time.time() > prazo:
+            raise TimeoutError("pedido de velas vencido (" + str(par) + ")")
+        return iq.get_candles(par, tf, quantidade, fim)
+    finally:
+        trava.release()
+
+
+# CACHE CURTINHO (RAJADA)
+# Quando vários alunos abrem o painel no mesmo minuto, todos pedem
+# as mesmas velas. Com um pedido por vez, a fila cresceria. Então a
+# MESMA busca feita há poucos segundos é reaproveitada — mas só se
+# foi feita neste mesmo minuto, depois que a vela anterior fechou
+# (assim nenhuma vela "pela metade" é usada como fechada).
+CACHE_RAJADA_SEG = max(0, int(os.getenv("CACHE_RAJADA_SEG", "8")))
+_velas_recentes = {}
+_velas_recentes_lock = threading.Lock()
+
+
+def _velas_da_rajada(par, tf, quantidade):
+    if CACHE_RAJADA_SEG <= 0:
+        return None
+    agora_ts = time.time()
+    with _velas_recentes_lock:
+        item = _velas_recentes.get((par, tf))
+    if not item:
+        return None
+    quando, lista = item
+    if agora_ts - quando > CACHE_RAJADA_SEG:
+        return None
+    if int(quando // tf) != int(agora_ts // tf) or (quando % tf) < FOLGA_FECHAMENTO:
+        return None
+    if len(lista) < quantidade:
+        return None
+    return [dict(v) for v in lista[-quantidade:]]
+
+
 def buscar_candles(
     iq,
     par,
     quantidade=CANDLE_COUNT,
-    tf=None
+    tf=None,
+    prazo=None
 ):
     # tf = tamanho da vela em segundos (60 = M1, 300 = M5, 900 = M15).
     # Sem tf, continua M1 como sempre.
+    par = str(par or "").strip().upper()
+    tf_real = tf or TIMEFRAME
+
+    pronto = _velas_da_rajada(par, tf_real, quantidade)
+    if pronto is not None:
+        return pronto
 
     try:
 
-        timestamp = (
+        timestamp = float(
             iq.get_server_timestamp()
         )
 
     except Exception:
 
-        timestamp = int(
-            time.time()
-        )
+        timestamp = 0
 
-    candles = iq.get_candles(
+    # Relógio da corretora parado (conexão "meio morta")? Usa o do
+    # servidor. Com o relógio velho a busca trazia velas antigas: o
+    # G1 e o G2 "não existiam" e o resultado atrasava.
+    agora_local = time.time()
+    if not timestamp or abs(timestamp - agora_local) > 20:
+        timestamp = agora_local
+    timestamp = max(timestamp, agora_local)
+
+    candles = pedir_velas(
+        iq,
         par,
-        tf or TIMEFRAME,
+        tf_real,
         quantidade,
-        timestamp
+        int(timestamp),
+        prazo=prazo
     )
 
     if not candles:
@@ -2919,11 +3173,19 @@ def buscar_candles(
     )
 
     # Guarda as velas M1 já fechadas (resultado rápido).
-    if (tf or TIMEFRAME) == 60:
+    # Se a busca NÃO BATE com a memória, desconfia dela: não usa.
+    if tf_real == 60:
+        bateu = True
         try:
-            guardar_velas_fechadas(par, resultado, float(timestamp))
+            bateu = guardar_velas_fechadas(par, resultado, float(timestamp))
         except Exception:
-            pass
+            bateu = True
+        if not bateu:
+            raise RuntimeError("velas de " + par + " não conferem — buscando de novo")
+
+    if resultado:
+        with _velas_recentes_lock:
+            _velas_recentes[(par, tf_real)] = (time.time(), [dict(v) for v in resultado])
 
     # BATIMENTO DE SAÚDE
     #
@@ -3134,7 +3396,8 @@ def buscar_candles_com_timeout(
         iq,
         par,
         quantidade,
-        tf
+        tf,
+        time.time() + timeout_segundos
     )
 
     try:
@@ -4846,7 +5109,7 @@ def _lote_confere(iq, par, lote, fim, tem_vela_aberta, tf=60):
     """Busca pequena separada no mesmo horário: tem que bater com o lote."""
     if len(lote) < 50 or lote[-1][0] > fim + tf:
         return False
-    confere = _lote_normalizado(iq.get_candles(par, tf, 5, fim))
+    confere = _lote_normalizado(pedir_velas(iq, par, tf, 5, fim))
     if not confere or confere[-1][0] != lote[-1][0]:
         return False
     mapa = {v[0]: v[2] for v in lote}
@@ -4880,7 +5143,7 @@ def _buscar_velas_antigas(iq, par, quantas, tf=60):
 
             lote = []
             for tentativa in range(3):
-                lote = _lote_normalizado(iq.get_candles(par, tf, 1000, fim))
+                lote = _lote_normalizado(pedir_velas(iq, par, tf, 1000, fim))
                 if _lote_confere(iq, par, lote, fim, numero == 0, tf) and _lote_encaixa(lote, velas, tf):
                     break
                 print("VELAS-ANTIGAS:", par, "lote", numero, "não bateu, buscando de novo")
@@ -5501,6 +5764,9 @@ def resultado_sinal(par):
     #   - um resultado antigo nunca é alterado;
     #   - o resultado não cai no sinal errado.
     gravado = False
+    resultado_final = None
+    etapa_final = 0
+    sem_confirmacao = False
 
     # EMPATE NA ENTRADA
     #
@@ -5564,12 +5830,40 @@ def resultado_sinal(par):
         # sequência ainda não fechou (mercado fechou, vela não
         # veio), encerra com o que se sabe. Sem isto a linha
         # ficaria para sempre na fila do worker.
+        #
+        # NÃO CHUTA MAIS O RESULTADO. Antes, sem a vela do gale,
+        # mandava "LOSS" (ou "WIN") no escuro — e às vezes o G1
+        # tinha ganhado. Agora fecha a sequência SEM inventar: o
+        # grupo recebe "resultado sem confirmação" e o anti-loss
+        # não conta isso como LOSS.
         if (
             resultado_final is None
             and time.time() - inicio_candle > 900
         ):
-            resultado_final = "LOSS" if m1 == "LOSS" else "WIN"
-            etapa_final = 0
+            sem_confirmacao = True
+            try:
+                gravado_sc = registrar_resultado_historico(par, inicio_candle, sinal, m1)
+            except Exception:
+                gravado_sc = False
+            if gravado_sc:
+                print("RESULTADO:", par, inicio_candle, "sem vela do gale — fechado sem confirmação")
+                if foi_avisado_telegram(par, inicio_candle, sinal):
+                    try:
+                        hora_sc = datetime.fromtimestamp(int(inicio_candle), tz=FUSO_BR).strftime("%H:%M")
+                        enviar_telegram_foto(
+                            None,
+                            f"⚠️ <b>RESULTADO SEM CONFIRMAÇÃO</b> · {nome_bonito(par)}\n"
+                            "────────────\n"
+                            f"🔁 Entrada das {hora_sc}\n"
+                            "A corretora não entregou a vela do gale.\n"
+                            "Confira no gráfico da sua corretora.",
+                        )
+                    except Exception:
+                        pass
+                try:
+                    encerrar_sequencia(par, inicio_candle)
+                except Exception:
+                    pass
 
         if resultado_final:
 
@@ -5666,6 +5960,13 @@ def resultado_sinal(par):
         "candle_ate": alvo["to"],
         "inicio": inicio_candle,
         "historico_gravado": gravado,
+        # Etapas do gale: o acompanhante usa para saber se a vela
+        # daquela etapa foi conferida DE VERDADE.
+        "g1": g1,
+        "g2": g2,
+        "final": resultado_final,
+        "etapa": etapa_final,
+        "sem_confirmacao": sem_confirmacao,
     })
 
 
@@ -6491,6 +6792,7 @@ def candles():
                     # worker ainda pode anunciá-lo.
                     if (
                         _chamada_do_worker()
+                        and _worker_da_geracao_atual()
                         and _aquecido()
                         and analise_tg.get("sinal") in ("CALL", "PUT")
                         and _entrada_da_tempo(analise_tg.get("entrada_em"))
@@ -6500,6 +6802,11 @@ def candles():
                             analise_tg.get("sinal"),
                         )
                         and pode_enviar_sinal_agora(
+                            par,
+                            analise_tg.get("entrada_em"),
+                            analise_tg.get("sinal"),
+                        )
+                        and reservar_aviso_telegram(
                             par,
                             analise_tg.get("entrada_em"),
                             analise_tg.get("sinal"),
@@ -8337,6 +8644,11 @@ def _loop_worker(geracao=0):
         _WORKER_ATIVO = True
         _WORKER_GERACAO = geracao
 
+    # Esta thread sabe de qual geração ela é (ver
+    # _worker_da_geracao_atual): se travar e um worker novo assumir,
+    # ela não manda mais nada para o grupo.
+    _contexto_tg.geracao = geracao
+
     while True:
 
         # Um worker mais novo assumiu (este tinha travado): sai.
@@ -8402,6 +8714,12 @@ def _loop_worker(geracao=0):
         # Vigia: roda a cada volta, mas só age de hora em hora.
         try:
             vigia_hora_em_hora()
+        except Exception:
+            pass
+
+        # Limpeza automática do cache de velas (a cada volta).
+        try:
+            limpar_cache_velas()
         except Exception:
             pass
 
@@ -8564,6 +8882,26 @@ def _acompanhar_sequencia():
     if "m1" not in dados or dados.get("m1") is None:
         return
 
+    # QUANTAS ETAPAS FORAM CONFERIDAS DE VERDADE
+    # Antes marcava todas as velas fechadas como conferidas assim
+    # que a vela de ENTRADA era lida — mesmo quando a vela do G1
+    # (ou do G2) ainda não tinha chegado. Aí o acompanhante parava
+    # de olhar, e o WIN 1G / LOSS só saía na volta seguinte do
+    # robô: até 3 minutos atrasado, junto com o sinal novo.
+    m1 = dados.get("m1")
+    g1 = dados.get("g1")
+    g2 = dados.get("g2")
+    if m1 != "LOSS":
+        prontas = 3                     # WIN ou EMPATE na entrada: acabou
+    elif g1 is None:
+        prontas = 1
+    elif g1 != "LOSS":
+        prontas = 3                     # G1 ganhou (ou empatou): acabou
+    elif g2 is None:
+        prontas = 2
+    else:
+        prontas = 3
+
     with _lock_espera_entrada:
         atual = _sequencia_aberta
         if (
@@ -8571,7 +8909,7 @@ def _acompanhar_sequencia():
             and atual.get("par") == par
             and int(atual.get("entrada_em") or 0) == entrada
         ):
-            atual["conferidas"] = fechadas
+            atual["conferidas"] = min(fechadas, prontas)
 
 
 def _loop_acompanhante():
